@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "gov-ai-service"
+version = "1.0.0"
+description = "面向政企场景的大模型智能体安全关键技术研究 - AI服务"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.27",
+    "pydantic>=2.6",
+    "pydantic-settings>=2.1",
+    "python-multipart>=0.0.6",
+    "aiofiles>=23.0",
+    "langgraph>=0.2",
+    "langchain>=0.3",
+    "langchain-community>=0.3",
+    "langchain-openai>=0.2",
+    "python-dotenv>=1.0",
+    "Pillow>=10.0",
+    "pytesseract>=0.3",
+]
+
+[project.scripts]
+gov-ai-service = "main:app"
+
+[tool.setuptools.packages.find]
+where = ["."]

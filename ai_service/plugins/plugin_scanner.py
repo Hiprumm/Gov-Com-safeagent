@@ -159,11 +159,13 @@ class PluginScanner:
 
     def scan(self, request: PluginScanRequest) -> PluginScanResult:
         code = request.code_content
+        name = request.plugin_name or request.filename or "unknown"
+        version = request.plugin_version or "1.0.0"
         
         if not code:
             return PluginScanResult(
-                plugin_name=request.plugin_name,
-                plugin_version=request.plugin_version,
+                plugin_name=name,
+                plugin_version=version,
                 safety_score=0,
                 vulnerabilities=[],
                 is_safe=False,
@@ -188,8 +190,8 @@ class PluginScanner:
         }
         
         return PluginScanResult(
-            plugin_name=request.plugin_name,
-            plugin_version=request.plugin_version,
+            plugin_name=name,
+            plugin_version=version,
             safety_score=safety_score,
             vulnerabilities=all_vulnerabilities,
             is_safe=is_safe,

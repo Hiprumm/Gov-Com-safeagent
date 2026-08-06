@@ -2,6 +2,28 @@
 import { ref, onMounted } from 'vue'
 import axios from 'axios'
 
+// ======== 全局 axios 拦截器 ========
+axios.interceptors.request.use((config) => {
+  const apiKey = localStorage.getItem('x_api_key') || ''
+  if (apiKey) {
+    config.headers['X-API-Key'] = apiKey
+  }
+  return config
+})
+
+axios.interceptors.response.use(
+  (response) => response,
+  (error) => {
+    const msg = error.response?.status === 401
+      ? '认证失败,请在设置中配置 API Key'
+      : error.response?.status === 429
+      ? '请求过于频繁,请稍后再试'
+      : error.response?.data?.detail || error.message || '网络错误'
+    console.error(`[${error.response?.status || 'NET'}] ${msg}`)
+    return Promise.reject(error)
+  }
+)
+
 interface Message {
   id: number
   content: string
@@ -13,19 +35,19 @@ interface Message {
   imageUrl?: string
 }
 
+// 对齐 SQLite 返回格式
 interface SessionItem {
   session_id: string
+  title: string | null
+  created_at: string
+  updated_at: string
   message_count: number
-  first_message: string
-  last_message: string
-  last_timestamp: string
-  first_timestamp: string
 }
 
 const messages = ref<Message[]>([
   {
     id: 1,
-    content: '您好！我是面向政企场景的安全智能体。请问有什么可以帮助您的？',
+    content: '您好！我是面向政企场景的大模型智能体安全平台。\n\n发送消息即可开始体验安全检测流程，您的每条输入都会经过多层安全引擎扫描。',
     role: 'assistant',
     timestamp: new Date(),
     riskLevel: 'none',
@@ -348,7 +370,7 @@ const switchSession = async (sessionItem: SessionItem) => {
 }
 
 onMounted(() => {
-  createNewSession()
+  // 不在加载时自动创建会话，首次发送消息时才创建
 })
 </script>
 
@@ -398,15 +420,19 @@ onMounted(() => {
                 : 'hover:bg-gray-50 border border-transparent'
             ]"
           >
-            <div class="font-medium text-gray-800 text-sm truncate" :title="session.first_message">
-              {{ session.first_message }}
+            <div class="font-medium text-gray-800 text-sm truncate">
+              {{ session.title || '会话 ' + session.session_id.slice(0, 8) }}
             </div>
-            <div class="text-xs text-gray-500 mt-1 truncate" :title="session.last_message">
-              {{ session.last_message }}
+            <div class="text-xs text-gray-500 mt-1">
+              {{ session.message_count }} 条消息
             </div>
             <div class="flex items-center justify-between mt-2">
-              <span class="text-xs text-gray-400">{{ session.message_count }} 条消息</span>
-              <span class="text-xs text-gray-400">{{ session.last_timestamp ? session.last_timestamp.slice(11, 16) : '' }}</span>
+              <span class="text-xs text-gray-400">
+                {{ session.updated_at ? session.updated_at.slice(0, 10) : '' }}
+              </span>
+              <span class="text-xs text-gray-400">
+                {{ session.updated_at ? session.updated_at.slice(11, 16) : '' }}
+              </span>
             </div>
           </button>
         </div>

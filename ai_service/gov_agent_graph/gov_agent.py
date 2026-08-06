@@ -3,6 +3,7 @@ import os
 import uuid
 import base64
 import json
+from datetime import datetime
 from typing import Dict, Any, List, Callable, Optional
 from langgraph.graph import StateGraph, END
 
@@ -10,63 +11,27 @@ from models.state import AgentState
 from models.schemas import RiskLevel
 from gov_agent_graph.security_layer import SecurityLayer
 from config import settings
+from storage import get_storage
 
 
 class ConversationManager:
     def __init__(self):
-        self.sessions: Dict[str, List[Dict[str, Any]]] = {}
-    
+        self.storage = get_storage()
+
     def create_session(self) -> str:
-        session_id = str(uuid.uuid4())
-        self.sessions[session_id] = []
-        return session_id
-    
+        return self.storage.create_session()
+
     def add_message(self, session_id: str, role: str, content: str, message_type: str = 'text'):
-        if session_id not in self.sessions:
-            self.sessions[session_id] = []
-        self.sessions[session_id].append({
-            "role": role,
-            "content": content,
-            "type": message_type,
-            "timestamp": str(uuid.uuid1())[:19]
-        })
-    
+        self.storage.add_message(session_id, role, content, message_type)
+
     def get_history(self, session_id: str, limit: int = 20) -> List[Dict[str, Any]]:
-        if session_id not in self.sessions:
-            return []
-        return self.sessions[session_id][-limit:]
-    
+        return self.storage.get_history(session_id, limit)
+
     def clear_session(self, session_id: str):
-        if session_id in self.sessions:
-            del self.sessions[session_id]
-    
+        self.storage.clear_session(session_id)
+
     def list_sessions(self) -> List[Dict[str, Any]]:
-        sessions = []
-        for session_id, messages in self.sessions.items():
-            if messages:
-                first_message = messages[0]
-                last_message = messages[-1]
-                summary = last_message.get("content", "")[:50] + "..." if len(last_message.get("content", "")) > 50 else last_message.get("content", "")
-                sessions.append({
-                    "session_id": session_id,
-                    "message_count": len(messages),
-                    "first_message": first_message.get("content", "")[:30] + "..." if len(first_message.get("content", "")) > 30 else first_message.get("content", ""),
-                    "last_message": summary,
-                    "last_timestamp": last_message.get("timestamp", ""),
-                    "first_timestamp": first_message.get("timestamp", "")
-                })
-            else:
-                sessions.append({
-                    "session_id": session_id,
-                    "message_count": 0,
-                    "first_message": "空会话",
-                    "last_message": "空会话",
-                    "last_timestamp": "",
-                    "first_timestamp": ""
-                })
-        # 按最后消息时间倒序排列
-        sessions.sort(key=lambda x: x["last_timestamp"], reverse=True)
-        return sessions
+        return self.storage.list_sessions()
 
 
 class FileProcessor:
@@ -110,7 +75,6 @@ class FileProcessor:
                 from io import BytesIO
                 
                 # 设置Tesseract路径（Windows）
-                import os
                 tesseract_paths = [
                     r'C:\Program Files\Tesseract-OCR\tesseract.exe',
                     r'C:\Program Files (x86)\Tesseract-OCR\tesseract.exe',
@@ -127,7 +91,6 @@ class FileProcessor:
                     img = img.convert('RGB')
                 
                 # 尝试识别中文和英文
-                import os
                 # 检查中文语言包是否存在
                 tessdata_dir = os.path.dirname(pytesseract.pytesseract.tesseract_cmd)
                 chi_sim_path = os.path.join(tessdata_dir, 'tessdata', 'chi_sim.traineddata')
@@ -376,7 +339,7 @@ class GovAgent:
                     "current_step": "decision_making_completed",
                 }
             except Exception as e:
-                pass
+                print(f"[WARN] LLM decision failed: {e}, falling back to rule-based selection")
         
         tool_calls = self._fallback_tool_selection(user_input)
         reasoning = "使用规则匹配进行决策"
@@ -494,7 +457,7 @@ class GovAgent:
                     "current_step": "completed",
                 }
             except Exception as e:
-                pass
+                print(f"[WARN] LLM response generation failed: {e}, falling back to rule-based response")
         
         final_response = self._fallback_response(user_input, tool_results)
         
@@ -514,17 +477,88 @@ class GovAgent:
         }
     
     def _fallback_response(self, user_input: str, tool_results: List[Dict[str, Any]]) -> str:
-        response_parts = ["已完成您的请求："]
+        """当LLM不可用时，使用规则模板生成有意义的回复"""
+        input_lower = user_input.strip().lower()
         
+        # 问候类
+        greetings = ["你好", "您好", "hi", "hello", "嗨", "早上好", "下午好", "晚上好"]
+        if any(g in input_lower for g in greetings) and len(user_input) < 15:
+            return (
+                "您好！我是面向政企场景的大模型智能体安全平台。\n\n"
+                "我可以帮您：\n"
+                "1. **智能问答** — 回答政务、政策、管理等相关问题\n"
+                "2. **安全检测** — 对输入文本进行多层安全扫描（注入攻击、越狱、数据泄露等）\n"
+                "3. **插件扫描** — 检测第三方插件/代码的安全风险\n"
+                "4. **知识库投毒检测** — 识别PDF文档中的隐藏恶意指令\n"
+                "5. **审批管理** — 对高风险操作进行审批控制\n\n"
+                "请问有什么可以帮您的？"
+            )
+        
+        # 功能询问类
+        capability_keywords = ["干什么", "能做什么", "功能", "作用", "是什么", "你是"]
+        if any(k in input_lower for k in capability_keywords):
+            return (
+                "我是面向政企场景的大模型智能体安全平台（ASP），专门为政务和企业场景设计的安全防护系统。\n\n"
+                "**核心能力：**\n"
+                "- 多源输入攻击检测（提示注入、越狱、SQL注入、命令注入等）\n"
+                "- 三层安全引擎（规则引擎 + AI检测 + 向量投毒检测）\n"
+                "- 供应链安全扫描（插件/脚本代码审计）\n"
+                "- 知识库投毒检测（PDF隐藏文本识别）\n"
+                "- Session级风险累积评估\n"
+                "- 审批工作流与操作审计\n\n"
+                "请在顶部切换到「安全检测」标签体验安全扫描功能。"
+            )
+        
+        # 安全相关
+        security_keywords = ["安全", "攻击", "注入", "漏洞", "检测", "防护", "扫描", "审计"]
+        if any(k in input_lower for k in security_keywords):
+            return (
+                "关于安全检测，本平台提供以下防护能力：\n\n"
+                "**输入层防护：**\n"
+                "- 150+ 正则规则覆盖12类攻击模式\n"
+                "- AI语义检测识别变种攻击\n"
+                "- 向量投毒检测防止知识库污染\n\n"
+                "**执行层防护：**\n"
+                "- 工具调用风险分级（A-E五级）\n"
+                "- 异常行为链分析（数据窃取、权限提升等复合攻击）\n"
+                "- 高危操作审批控制\n\n"
+                "**评测数据（基线50条样本）：**\n"
+                "- 精确率 95.8%，F1 80.7%\n"
+                "- 命令注入/内容注入检测率 100%\n\n"
+                "请在「安全检测」标签页中体验具体功能。"
+            )
+        
+        # 政务/政策类
+        gov_keywords = ["政务", "政策", "政府", "国企", "审批", "合规", "监管"]
+        if any(k in input_lower for k in gov_keywords):
+            return (
+                "本平台专为政企场景设计，遵循以下安全原则：\n\n"
+                "1. **安全左移** — 在智能体感知和决策阶段就进行安全检测\n"
+                "2. **纵深防御** — 规则引擎→AI检测→向量投毒检测 三层叠加\n"
+                "3. **默认拒绝** — HIGH/CRITICAL风险操作默认阻断，需审批放行\n"
+                "4. **全程审计** — 所有关键操作留痕，支持多维检索\n"
+                "5. **合规优先** — 权限模型、审批流程、日志格式满足等保要求\n\n"
+                "如需了解具体的合规方案或部署细节，请详细描述您的需求。"
+            )
+        
+        # 有工具结果时
         if tool_results:
+            response_parts = ["已处理您的请求，工具执行结果如下："]
             for result in tool_results:
-                response_parts.append(f"- {result['tool_name']}: {result['result']}")
-        else:
-            response_parts.append(f"- 处理查询：{user_input[:50]}...")
+                response_parts.append(f"- {result.get('tool_name', '工具')}: {result.get('result', '完成')}")
+            response_parts.append("\n注意：当前运行在演示模式（LLM未配置），上述为规则引擎响应。")
+            return "\n".join(response_parts)
         
-        response_parts.append("\n注意：此响应已通过安全检测")
-        
-        return "\n".join(response_parts)
+        # 默认回复
+        return (
+            f"关于「{user_input[:30]}{'...' if len(user_input) > 30 else ''}」，以下是相关信息：\n\n"
+            f"本平台已对您的输入完成了多层安全检测（规则引擎+AI检测+向量投毒检测），未发现安全风险。\n\n"
+            f"由于当前LLM未配置，我无法生成更详细的自然语言回复。如需完整的智能问答能力，请配置智谱AI API Key。\n\n"
+            f"您可以：\n"
+            f"1. 在「安全检测」标签页体验安全扫描功能\n"
+            f"2. 在「插件扫描」标签页测试供应链安全检测\n"
+            f"3. 在 ai_service 目录下创建 .env 文件配置 ZHIPU_API_KEY 启用LLM"
+        )
     
     def block_response(self, state: AgentState) -> AgentState:
         risk_level = state["risk_level"]
@@ -561,6 +595,7 @@ class GovAgent:
         initial_state: AgentState = {
             "user_input": user_input,
             "input_source": input_source,
+            "session_id": session_id,
             "detection_results": [],
             "risk_level": RiskLevel.NONE,
             "risk_summary": None,

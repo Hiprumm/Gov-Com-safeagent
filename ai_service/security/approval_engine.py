@@ -2,14 +2,18 @@ import sys
 import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import uuid
 from typing import Dict, Any, Optional
 from datetime import datetime
 from models.schemas import ApprovalRequest, ApprovalResponse, RiskLevel
+from storage import get_storage
 
 
 class ApprovalEngine:
+    """审批引擎，后端使用 SQLite 持久化存储"""
+
     def __init__(self):
-        self.approval_requests: Dict[str, ApprovalRequest] = {}
+        self.storage = get_storage()
         
         self.approval_matrix = {
             RiskLevel.LOW: {"auto_approve": True, "required_level": None},
@@ -21,7 +25,7 @@ class ApprovalEngine:
     def create_request(self, user_id: str, user_role: str, agent_id: str, 
                        action_type: str, action_details: Dict[str, Any], 
                        risk_level: RiskLevel) -> ApprovalRequest:
-        request_id = f"APPROVE_{user_id}_{datetime.now().strftime('%Y%m%d%H%M%S')}"
+        request_id = f"APR_{uuid.uuid4().hex[:12]}"
         
         request = ApprovalRequest(
             request_id=request_id,
@@ -33,25 +37,43 @@ class ApprovalEngine:
             risk_level=risk_level,
             status="pending"
         )
-        
-        self.approval_requests[request_id] = request
-        
-        if self.approval_matrix[risk_level]["auto_approve"]:
+
+        if risk_level in self.approval_matrix and self.approval_matrix[risk_level]["auto_approve"]:
             request.status = "auto_approved"
-        
+
+        self.storage.create_approval({
+            "request_id": request_id,
+            "tool_name": action_type,
+            "tool_args": action_details,
+            "risk_level": risk_level.value,
+            "requester_id": user_id,
+            "requester_role": user_role,
+            "required_role": self.approval_matrix.get(risk_level, {}).get("required_level", "admin"),
+            "status": request.status,
+            "reason": "",
+            "created_at": datetime.now().isoformat(),
+        })
+
         return request
 
     def approve_request(self, request_id: str, approver_id: str, 
                         approver_role: str, comments: Optional[str] = None) -> ApprovalResponse:
-        request = self.approval_requests.get(request_id)
+        data = self.storage.get_approval(request_id)
         
-        if not request:
+        if not data:
             return ApprovalResponse(request_id=request_id, status="not_found")
         
-        if request.status != "pending":
-            return ApprovalResponse(request_id=request_id, status=request.status)
+        status = data.get("status", "pending")
+        if status != "pending":
+            return ApprovalResponse(request_id=request_id, status=status)
         
-        required_level = self.approval_matrix[request.risk_level]["required_level"]
+        risk_level_str = data.get("risk_level", "low")
+        try:
+            risk_level = RiskLevel(risk_level_str)
+        except ValueError:
+            risk_level = RiskLevel.LOW
+
+        required_level = self.approval_matrix.get(risk_level, {}).get("required_level", "admin")
         
         role_hierarchy = {
             "guest": 1,
@@ -65,10 +87,12 @@ class ApprovalEngine:
         required_level_value = role_hierarchy.get(required_level, 1)
         
         if approver_level >= required_level_value:
-            request.status = "approved"
-            request.approved_by = approver_id
-            request.approved_at = datetime.now()
-            
+            self.storage.update_approval(
+                request_id, "approved",
+                approver_id=approver_id,
+                approver_role=approver_role,
+                reason=comments or ""
+            )
             return ApprovalResponse(
                 request_id=request_id,
                 status="approved",
@@ -85,12 +109,16 @@ class ApprovalEngine:
 
     def reject_request(self, request_id: str, approver_id: str, 
                        comments: Optional[str] = None) -> ApprovalResponse:
-        request = self.approval_requests.get(request_id)
+        data = self.storage.get_approval(request_id)
         
-        if not request:
+        if not data:
             return ApprovalResponse(request_id=request_id, status="not_found")
         
-        request.status = "rejected"
+        self.storage.update_approval(
+            request_id, "rejected",
+            approver_id=approver_id,
+            reason=comments or ""
+        )
         
         return ApprovalResponse(
             request_id=request_id,
@@ -101,4 +129,45 @@ class ApprovalEngine:
         )
 
     def get_request(self, request_id: str) -> Optional[ApprovalRequest]:
-        return self.approval_requests.get(request_id)
+        data = self.storage.get_approval(request_id)
+        if not data:
+            return None
+        
+        risk_level_str = data.get("risk_level", "low")
+        try:
+            risk_level = RiskLevel(risk_level_str)
+        except ValueError:
+            risk_level = RiskLevel.LOW
+
+        return ApprovalRequest(
+            request_id=data.get("request_id", ""),
+            user_id=data.get("requester_id", ""),
+            user_role=data.get("requester_role", "user"),
+            agent_id="",
+            action_type=data.get("tool_name", ""),
+            action_details=data.get("tool_args", {}),
+            risk_level=risk_level,
+            status=data.get("status", "pending"),
+        )
+
+    def list_pending(self) -> list:
+        """获取所有待审批请求"""
+        rows = self.storage.list_pending_approvals()
+        results = []
+        for data in rows:
+            risk_level_str = data.get("risk_level", "low")
+            try:
+                risk_level = RiskLevel(risk_level_str)
+            except ValueError:
+                risk_level = RiskLevel.LOW
+            results.append(ApprovalRequest(
+                request_id=data.get("request_id", ""),
+                user_id=data.get("requester_id", ""),
+                user_role=data.get("requester_role", "user"),
+                agent_id="",
+                action_type=data.get("tool_name", ""),
+                action_details=data.get("tool_args", {}),
+                risk_level=risk_level,
+                status=data.get("status", "pending"),
+            ))
+        return results

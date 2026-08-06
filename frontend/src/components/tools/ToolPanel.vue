@@ -3,13 +3,11 @@ import { ref } from 'vue'
 import axios from 'axios'
 
 interface ToolRiskResult {
-  tool_name: string
   risk_level: string
   risk_score: number
-  risk_factors: string[]
-  permission_required: boolean
-  approval_required: boolean
-  recommendations: string[]
+  risk_details: string[]
+  requires_approval: boolean
+  approval_level: string | null
 }
 
 const toolName = ref('')
@@ -134,7 +132,7 @@ const getRiskText = (riskLevel: string) => {
       <h3 class="text-lg font-semibold text-gray-800">评估结果</h3>
       <div :class="['p-4 rounded-xl border', getRiskBgColor(riskResult.risk_level)]">
         <div class="flex items-center justify-between mb-4">
-          <span class="font-medium text-gray-800">工具: {{ riskResult.tool_name }}</span>
+          <span class="font-medium text-gray-800">工具: {{ toolName }}</span>
           <span :class="['px-3 py-1 rounded-full text-sm font-medium', getRiskBgColor(riskResult.risk_level)]" :style="{ color: getRiskColor(riskResult.risk_level) }">
             {{ getRiskText(riskResult.risk_level) }}
           </span>
@@ -145,48 +143,38 @@ const getRiskText = (riskLevel: string) => {
             <div
               class="h-full rounded-full transition-all duration-500"
               :class="[
-                riskResult.risk_score >= 70 ? 'bg-red-500' :
-                riskResult.risk_score >= 40 ? 'bg-yellow-500' : 'bg-green-500'
+                riskResult.risk_score >= 0.7 ? 'bg-red-500' :
+                riskResult.risk_score >= 0.4 ? 'bg-yellow-500' : 'bg-green-500'
               ]"
-              :style="{ width: riskResult.risk_score + '%' }"
+              :style="{ width: (riskResult.risk_score * 100) + '%' }"
             ></div>
           </div>
-          <p class="text-right text-sm font-medium mt-1">{{ riskResult.risk_score }}/100</p>
+          <p class="text-right text-sm font-medium mt-1">{{ (riskResult.risk_score * 100).toFixed(0) }}/100</p>
         </div>
         <div class="grid grid-cols-2 gap-4 mb-4">
           <div>
-            <label class="text-xs text-gray-500">风险因素</label>
+            <label class="text-xs text-gray-500">风险详情</label>
             <ul class="mt-2 space-y-1">
-              <li v-for="(factor, index) in riskResult.risk_factors" :key="index" class="text-sm text-gray-700">
-                • {{ factor }}
+              <li v-for="(detail, index) in riskResult.risk_details" :key="index" class="text-sm text-gray-700">
+                • {{ detail }}
               </li>
             </ul>
           </div>
           <div>
-            <label class="text-xs text-gray-500">权限要求</label>
+            <label class="text-xs text-gray-500">审批要求</label>
             <div class="mt-2 space-y-2">
               <div class="flex items-center gap-2">
-                <span :class="riskResult.permission_required ? 'text-red-500' : 'text-green-500'">
-                  {{ riskResult.permission_required ? '✓' : '✗' }}
+                <span :class="riskResult.requires_approval ? 'text-yellow-500' : 'text-green-500'">
+                  {{ riskResult.requires_approval ? '!' : '✓' }}
                 </span>
-                <span class="text-sm">需要特殊权限</span>
+                <span class="text-sm">{{ riskResult.requires_approval ? '需要审批' : '无需审批' }}</span>
               </div>
-              <div class="flex items-center gap-2">
-                <span :class="riskResult.approval_required ? 'text-yellow-500' : 'text-green-500'">
-                  {{ riskResult.approval_required ? '✓' : '✗' }}
-                </span>
-                <span class="text-sm">需要审批</span>
+              <div v-if="riskResult.approval_level" class="flex items-center gap-2">
+                <span class="text-blue-500">→</span>
+                <span class="text-sm">审批级别: {{ riskResult.approval_level }}</span>
               </div>
             </div>
           </div>
-        </div>
-        <div>
-          <label class="text-xs text-gray-500">安全建议</label>
-          <ul class="mt-2 space-y-1">
-            <li v-for="(rec, index) in riskResult.recommendations" :key="index" class="text-sm text-gray-700">
-              • {{ rec }}
-            </li>
-          </ul>
         </div>
       </div>
     </div>

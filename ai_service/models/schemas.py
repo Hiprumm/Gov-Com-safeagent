@@ -14,6 +14,7 @@ class RiskLevel(str, Enum):
 
 class AttackType(str, Enum):
     PROMPT_INJECTION = "prompt_injection"
+    DATA_LEAKAGE = "data_leakage"
     JAILBREAK = "jailbreak"
     DATA_POISONING = "data_poisoning"
     INDIRECT_INJECTION = "indirect_injection"
@@ -25,6 +26,9 @@ class AttackType(str, Enum):
     CRLF_INJECTION = "crlf_injection"
     JSON_INJECTION = "json_injection"
     UNAUTHORIZED_ACCESS = "unauthorized_access"
+    CONTENT_INJECTION = "content_injection"
+    NETWORK_ATTACK = "network_attack"
+    DATA_EXFILTRATION = "data_exfiltration"
 
 
 class InputSource(str, Enum):
@@ -87,9 +91,10 @@ class ToolRiskResult(BaseModel):
 
 
 class PluginScanRequest(BaseModel):
-    plugin_name: str
-    plugin_version: str
-    file_path: Optional[str] = None
+    plugin_name: Optional[str] = None
+    plugin_version: Optional[str] = None
+    filename: Optional[str] = None
+    file_type: Optional[str] = None
     code_content: Optional[str] = None
 
 

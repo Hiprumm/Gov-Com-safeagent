@@ -45,9 +45,22 @@ class VectorPoisoningDetector:
         
         similarity = self.calculate_similarity(text, all_baseline_keywords)
         
-        if similarity < 0.1 and len(text) > 50:
-            evidence.append(f"知识库相似度异常: {similarity:.2f} (低于正常阈值)")
-            confidence += 0.3
+        # 低相似度异常判定需同时满足：
+        # 1. 文本中包含基线相关领域词（文本宣称属于知识域）
+        # 2. 但整体相似度极低（实际内容偏离基线，可能是合成/伪造内容）
+        # 3. 分级策略：长文本高置信，短文本低置信
+        domain_related_words = ["政策", "法规", "文件", "公开", "指南", "管理", "注册", "审核",
+                                "服务", "数据", "安全", "企业", "系统", "政府", "部门",
+                                "知识库", "通知", "采集", "个人", "上传", "采集"]
+        has_domain_context = any(word in text for word in domain_related_words)
+        
+        if similarity < 0.1 and has_domain_context:
+            if len(text) > 120:
+                evidence.append(f"知识库相似度异常: {similarity:.2f} (文本宣称属于知识域但内容偏离基线)")
+                confidence += 0.30
+            elif len(text) > 40:
+                evidence.append(f"知识库相似度异常: {similarity:.2f} (短文本知识域偏离)")
+                confidence += 0.15
         
         poisoning_hit = sum(1 for pattern in self.poisoning_patterns if pattern in text)
         if poisoning_hit > 0:
@@ -69,6 +82,14 @@ class VectorPoisoningDetector:
             if keyword in text_lower:
                 evidence.append(f"检测到非预期内容: {keyword}")
                 confidence += score
+        
+        # 钓鱼URL检测（知识库投毒高频手段）
+        phishing_indicators = ["phishing", "hack", "exploit", "backdoor", "trojan",
+                               "malware", "ransomware", "botnet", "keylogger"]
+        for indicator in phishing_indicators:
+            if indicator in text_lower:
+                evidence.append(f"检测到恶意URL特征: {indicator}")
+                confidence += 0.20
         
         attack_type = AttackType.DATA_POISONING if confidence > 0 else None
         

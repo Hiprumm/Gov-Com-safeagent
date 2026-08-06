@@ -9,6 +9,7 @@ from models.schemas import DetectionResult, ToolRiskResult, RiskLevel
 class AgentState(TypedDict):
     user_input: str
     input_source: str
+    session_id: Optional[str]
     detection_results: List[DetectionResult]
     risk_level: RiskLevel
     risk_summary: Optional[Dict[str, Any]]

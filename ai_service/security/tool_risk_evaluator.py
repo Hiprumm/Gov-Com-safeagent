@@ -123,7 +123,7 @@ class ToolRiskEvaluator:
         
         if param_risk_details:
             risk_score = min(1.0, risk_score + 0.3)
-            risk_level = RiskLevel(min(risk_level.value, RiskLevel.CRITICAL.value))
+            risk_level = RiskLevel.CRITICAL
             risk_details.extend(param_risk_details)
         
         if not has_permission:

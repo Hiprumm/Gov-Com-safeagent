@@ -56,6 +56,8 @@ class RuleEngine:
                 r"(?:union|all|distinct)\s+",
                 r"(?:--|#|/\*)\s*",
                 r"(?:or\s+1=1|and\s+1=1|or\s+'a'='a)",
+                r"(?:or\s+'1'='1'|and\s+'1'='1')",
+                r"'?\s*or\s+'?\s*1\s*'?\s*=\s*'?\s*1",
                 r"(?:sleep|benchmark|load_file|into\s+outfile)",
                 r"(?:information_schema|sys\.tables|mysql\.user)",
                 r"(?:where\s+1=1|where\s+'a'='a)",

@@ -8,10 +8,10 @@ import 'element-plus/dist/index.css'
 
 const activeTab = ref('chat')
 const tabs = [
-  { name: 'chat', label: '智能问答' },
-  { name: 'security', label: '安全检测' },
-  { name: 'tools', label: '工具调用' },
-  { name: 'audit', label: '审计日志' },
+  { name: 'chat', label: '智能问答', sub: '全链路安全执行' },
+  { name: 'security', label: '安全检测', sub: '输入 + 供应链' },
+  { name: 'tools', label: '工具管控', sub: '风险评估 + 审批' },
+  { name: 'audit', label: '审计追溯', sub: '过程可审计·责任可追溯' },
 ]
 
 onMounted(() => {
@@ -32,7 +32,15 @@ onMounted(() => {
             <p class="text-sm text-gray-500">面向政企场景的大模型智能体安全关键技术研究</p>
           </div>
         </div>
-        <span class="px-3 py-1 bg-green-100 text-green-700 rounded-full text-sm font-medium">系统运行中</span>
+        <div class="flex items-center gap-3">
+          <router-link
+            to="/evaluation"
+            class="px-3 py-1 bg-blue-50 text-blue-700 rounded-full text-sm font-medium hover:bg-blue-100 transition-colors no-underline"
+          >
+            📊 评测报告
+          </router-link>
+          <span class="px-3 py-1 bg-green-100 text-green-700 rounded-full text-sm font-medium">系统运行中</span>
+        </div>
       </div>
     </header>
 
@@ -49,7 +57,8 @@ onMounted(() => {
               : 'text-gray-600 hover:bg-gray-50'
           ]"
         >
-          {{ tab.label }}
+          <div class="text-sm">{{ tab.label }}</div>
+          <div :class="activeTab === tab.name ? 'text-blue-200' : 'text-gray-400'" class="text-xs mt-0.5">{{ tab.sub }}</div>
         </button>
       </div>
 

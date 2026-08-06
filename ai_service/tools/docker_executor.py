@@ -1,0 +1,305 @@
+"""
+Docker 沙箱工具执行器
+
+在隔离的 Docker 容器中执行工具调用，提供资源限制、网络隔离和超时保护。
+当 Docker 不可用时，自动降级为本地模拟执行。
+
+支持的工具:
+- read_file: 读取文件内容（只读）
+- search_knowledge: 搜索知识库
+- send_email: 发送邮件（仅白名单接收人）
+- query_db: 数据库只读查询
+"""
+import sys
+import os
+import json
+import subprocess
+import tempfile
+import time
+from typing import Optional, Dict, Any
+from dataclasses import dataclass, field
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+
+# ==================== 配置 ====================
+
+# Docker 镜像名
+SANDBOX_IMAGE = "safeagent-tool-sandbox:latest"
+
+# 资源限制
+RESOURCE_LIMITS = {
+    "cpu": "0.5",       # CPU 核心数
+    "memory": "256m",   # 内存限制
+    "timeout": 30,      # 执行超时（秒）
+    "disk_readonly": True,
+}
+
+# 网络白名单（允许出站的目标）
+NETWORK_WHITELIST = [
+    "localhost",
+    "127.0.0.1",
+    "knowledge.internal",  # 内部知识库
+]
+
+
+@dataclass
+class ToolResult:
+    """工具执行结果"""
+    success: bool
+    tool_name: str
+    output: str = ""
+    error: str = ""
+    duration_ms: float = 0.0
+    sandbox_mode: str = "local"  # "docker" | "local"
+
+
+class DockerToolExecutor:
+    """Docker 沙箱工具执行器"""
+
+    def __init__(self):
+        self._docker_available: Optional[bool] = None
+
+    @property
+    def docker_available(self) -> bool:
+        """检查 Docker 是否可用"""
+        if self._docker_available is None:
+            try:
+                result = subprocess.run(
+                    ["docker", "version", "--format", "{{.Server.Version}}"],
+                    capture_output=True, text=True, timeout=5
+                )
+                self._docker_available = result.returncode == 0
+            except (FileNotFoundError, subprocess.TimeoutExpired):
+                self._docker_available = False
+        return self._docker_available
+
+    def execute(self, tool_name: str, args: Dict[str, Any]) -> ToolResult:
+        """
+        执行工具调用
+
+        Args:
+            tool_name: 工具名称 (read_file|search_knowledge|send_email|query_db)
+            args: 工具参数
+
+        Returns:
+            ToolResult
+        """
+        if self.docker_available:
+            return self._execute_in_docker(tool_name, args)
+        else:
+            return self._execute_local(tool_name, args)
+
+    def _execute_in_docker(self, tool_name: str, args: Dict[str, Any]) -> ToolResult:
+        """在 Docker 容器中执行"""
+        start = time.perf_counter()
+
+        cmd = ["docker", "run", "--rm"]
+
+        # 资源限制
+        cmd.extend(["--cpus", RESOURCE_LIMITS["cpu"]])
+        cmd.extend(["--memory", RESOURCE_LIMITS["memory"]])
+
+        # 只读根文件系统
+        if RESOURCE_LIMITS["disk_readonly"]:
+            cmd.append("--read-only")
+            # 需要临时写入 /tmp
+            cmd.append("--tmpfs")
+            cmd.append("/tmp:rw,noexec,nosuid,size=64m")
+
+        # 网络隔离：仅允许白名单出站
+        cmd.extend(["--network", "none"])  # 默认无网络
+        # 如果工具需要网络访问，通过安全组配置
+        if tool_name in ("search_knowledge", "send_email"):
+            cmd.remove("--network")
+            cmd.remove("none")
+            cmd.extend(["--network", "bridge"])
+            # 添加 DNS 限制
+            cmd.extend(["--dns", "127.0.0.1"])  # 仅内部DNS
+
+        # 安全选项
+        cmd.extend(["--security-opt", "no-new-privileges"])
+        cmd.append("--cap-drop=ALL")
+        cmd.extend(["--security-opt", "apparmor=unconfined"])  # 兼容性
+
+        # 环境变量传入参数
+        cmd.extend([
+            "-e", f"TOOL_NAME={tool_name}",
+            "-e", f"TOOL_ARGS={json.dumps(args)}",
+        ])
+
+        cmd.append(SANDBOX_IMAGE)
+
+        try:
+            proc = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=RESOURCE_LIMITS["timeout"],
+            )
+            elapsed = (time.perf_counter() - start) * 1000
+
+            if proc.returncode == 0:
+                output = proc.stdout.strip()
+                return ToolResult(
+                    success=True,
+                    tool_name=tool_name,
+                    output=output[:10000],  # 限制输出长度
+                    duration_ms=elapsed,
+                    sandbox_mode="docker",
+                )
+            else:
+                return ToolResult(
+                    success=False,
+                    tool_name=tool_name,
+                    error=proc.stderr.strip() or f"Exit code {proc.returncode}",
+                    duration_ms=elapsed,
+                    sandbox_mode="docker",
+                )
+        except subprocess.TimeoutExpired:
+            elapsed = (time.perf_counter() - start) * 1000
+            return ToolResult(
+                success=False,
+                tool_name=tool_name,
+                error=f"执行超时（>{RESOURCE_LIMITS['timeout']}s）",
+                duration_ms=elapsed,
+                sandbox_mode="docker",
+            )
+        except FileNotFoundError:
+            return self._execute_local(tool_name, args)
+
+    def _execute_local(self, tool_name: str, args: Dict[str, Any]) -> ToolResult:
+        """
+        本地模拟执行（Docker 不可用时的回退方案）
+
+        仅执行安全的只读操作，不提供真实的文件系统访问。
+        """
+        start = time.perf_counter()
+
+        try:
+            if tool_name == "read_file":
+                output = self._sim_read_file(args)
+            elif tool_name == "search_knowledge":
+                output = self._sim_search_knowledge(args)
+            elif tool_name == "send_email":
+                output = self._sim_send_email(args)
+            elif tool_name == "query_db":
+                output = self._sim_query_db(args)
+            else:
+                return ToolResult(
+                    success=False,
+                    tool_name=tool_name,
+                    error=f"未知工具: {tool_name}",
+                    sandbox_mode="local",
+                )
+
+            elapsed = (time.perf_counter() - start) * 1000
+            return ToolResult(
+                success=True,
+                tool_name=tool_name,
+                output=output,
+                duration_ms=elapsed,
+                sandbox_mode="local",
+            )
+        except Exception as e:
+            elapsed = (time.perf_counter() - start) * 1000
+            return ToolResult(
+                success=False,
+                tool_name=tool_name,
+                error=str(e),
+                duration_ms=elapsed,
+                sandbox_mode="local",
+            )
+
+    # ==================== 本地模拟工具实现 ====================
+
+    def _sim_read_file(self, args: dict) -> str:
+        """模拟读取文件（返回示例内容）"""
+        path = args.get("path", "")
+
+        # 安全校验：禁止路径遍历
+        if ".." in path:
+            return "[拒绝] 路径包含非法字符"
+
+        file_samples = {
+            "/etc/config.json": '{"app_name": "SafeAgent", "version": "4.0"}',
+            "/data/report_2026.txt": "2026年度政务工作报告\n城市治理: 优秀\n智慧服务: 良好",
+            "/var/log/system.log": "[INFO] 系统启动完成\n[INFO] 安全模块加载成功",
+        }
+        if path in file_samples:
+            return file_samples[path]
+
+        return f"[沙箱] 文件 '{path}' 不存在或无权访问（模拟环境）"
+
+    def _sim_search_knowledge(self, args: dict) -> str:
+        """模拟知识库搜索"""
+        query = args.get("query", "")
+        if not query:
+            return "[错误] 查询参数为空"
+
+        # 模拟搜索结果
+        knowledge_base = {
+            "政策": "《数字政府建设实施方案(2026-2028)》已发布",
+            "公积金": "2026年公积金缴存比例: 5%-12%",
+            "安全": "等保2.0三级要求: 访问控制/安全审计/数据加密",
+            "审批": "政府采购审批流程: 申请→部门审核→财务复核→领导签批",
+        }
+
+        results = []
+        for kw, info in knowledge_base.items():
+            if kw in query:
+                results.append(f"[{kw}] {info}")
+
+        if results:
+            return "\n".join(results)
+        return f"[知识库] 未找到与 '{query}' 相关的结果"
+
+    def _sim_send_email(self, args: dict) -> str:
+        """模拟发送邮件（仅记录，不实际发送）"""
+        to = args.get("to", "")
+        subject = args.get("subject", "")
+        body = args.get("body", "")
+
+        # 白名单检查
+        allowed_domains = ["@gov.cn", "@internal.com", "@safe.gov"]
+        is_allowed = any(domain in to for domain in allowed_domains)
+
+        if not is_allowed:
+            return f"[安全拦截] 收件人 {to} 不在白名单中"
+
+        return (
+            f"[模拟发送] 邮件已记录（沙箱模式不实际发送）\n"
+            f"收件人: {to}\n"
+            f"主题: {subject}\n"
+            f"内容长度: {len(body)} 字符"
+        )
+
+    def _sim_query_db(self, args: dict) -> str:
+        """模拟数据库查询（只读SQL语法检查）"""
+        query = args.get("query", "").strip()
+
+        # 禁止写操作
+        dangerous_ops = ["INSERT", "UPDATE", "DELETE", "DROP", "TRUNCATE",
+                         "ALTER", "CREATE", "EXEC", "EXECUTE"]
+        query_upper = query.upper()
+        for op in dangerous_ops:
+            if query_upper.startswith(op) or f" {op} " in f" {query_upper} ":
+                return f"[安全拦截] 沙箱模式禁止写操作: {op}"
+
+        # 模拟查询结果
+        if "SELECT" in query_upper:
+            if "users" in query.lower():
+                return (
+                    "id | username | role\n"
+                    "1  | admin    | admin\n"
+                    "2  | user_001 | user\n"
+                    "3  | auditor  | auditor\n"
+                    "\n[沙箱] 示例数据（非真实数据库）"
+                )
+            return f"[沙箱] 模拟查询结果（查询: {query[:50]}...）"
+
+        return "[错误] 仅支持 SELECT 查询"
+
+
+# ==================== 全局单例 ====================
+docker_executor = DockerToolExecutor()

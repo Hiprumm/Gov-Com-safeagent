@@ -5,13 +5,14 @@ import axios from 'axios'
 interface AuditLog {
   log_id: string
   user_id: string
-  user_name: string
+  user_role: string
   agent_id: string
   action_type: string
   action_details: any
   risk_level: string
   is_blocked: boolean
-  source: string
+  approval_status: string | null
+  blocking_reason: string | null
   timestamp: string
 }
 
@@ -108,7 +109,8 @@ onMounted(() => {
               {{ new Date(log.timestamp).toLocaleString() }}
             </td>
             <td class="px-4 py-3">
-              <span class="font-medium">{{ log.user_name || log.user_id }}</span>
+              <span class="font-medium">{{ log.user_id }}</span>
+              <span class="text-xs text-gray-400 ml-1">{{ log.user_role }}</span>
             </td>
             <td class="px-4 py-3">
               <span class="text-blue-600">{{ getActionTypeText(log.action_type) }}</span>
