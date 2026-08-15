@@ -157,6 +157,16 @@ class PluginScanner:
         
         return max(0, score)
 
+    def calculate_grade(self, score: int) -> str:
+        if score >= 85:
+            return "A"
+        elif score >= 65:
+            return "B"
+        elif score >= 40:
+            return "C"
+        else:
+            return "D"
+
     def scan(self, request: PluginScanRequest) -> PluginScanResult:
         code = request.code_content
         name = request.plugin_name or request.filename or "unknown"
@@ -178,6 +188,7 @@ class PluginScanner:
         all_vulnerabilities = ast_vulnerabilities + pattern_vulnerabilities
         
         safety_score = self.calculate_safety_score(all_vulnerabilities)
+        safety_grade = self.calculate_grade(safety_score)
         is_safe = safety_score >= 70
         
         scan_details = {
@@ -187,12 +198,14 @@ class PluginScanner:
             "medium_count": sum(1 for v in all_vulnerabilities if v.severity == RiskLevel.MEDIUM),
             "low_count": sum(1 for v in all_vulnerabilities if v.severity == RiskLevel.LOW),
             "code_lines": len(code.splitlines()),
+            "safety_grade": safety_grade,
         }
         
         return PluginScanResult(
             plugin_name=name,
             plugin_version=version,
             safety_score=safety_score,
+            safety_grade=safety_grade,
             vulnerabilities=all_vulnerabilities,
             is_safe=is_safe,
             scan_details=scan_details

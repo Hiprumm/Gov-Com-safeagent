@@ -105,10 +105,15 @@ class LLMClassifier:
 
         Returns:
             (risk_level, attack_type, confidence, evidence)
-            - 若 LLM 不可用或调用失败，返回 (NONE, None, 0.0, [])
+            - LLM 可用：调用 API，失败时回退到本地启发式
+            - LLM 不可用 (enabled=False)：直接执行本地启发式（纯规则，不依赖 API）
         """
-        if not self.enabled or not text or not text.strip():
+        if not text or not text.strip():
             return RiskLevel.NONE, None, 0.0, []
+
+        # LLM 不可用时，直接走本地启发式（纯规则，确保降级防御）
+        if not self.enabled:
+            return self._local_heuristic_check(text)
 
         try:
             result = await self._call_llm(text)

@@ -64,6 +64,8 @@ const imageInput = ref<HTMLInputElement | null>(null)
 const sessions = ref<SessionItem[]>([])
 const isLoadingSessions = ref(false)
 const showSessionSidebar = ref(false)
+const editingMessageId = ref<number | null>(null)
+const hoveredMessageId = ref<number | null>(null)
 
 const createNewSession = async () => {
   try {
@@ -109,6 +111,29 @@ const sendMessage = async () => {
 
     const result = response.data
     sessionId.value = result.session_id
+
+    // 同步历史以获取正确的 SQLite ID
+    try {
+      const histResp = await axios.get('/ai/agent/history', {
+        params: { session_id: result.session_id }
+      })
+      const histMsgs = histResp.data.messages || []
+      if (histMsgs.length > 0) {
+        messages.value = histMsgs.map((msg: any) => ({
+          id: msg.id,
+          content: msg.content,
+          role: msg.role === 'user' ? 'user' : 'assistant',
+          timestamp: new Date(msg.timestamp || Date.now()),
+          type: msg.type || 'text',
+          fileName: msg.fileName,
+          imageUrl: msg.imageUrl
+        }))
+        messageIdCounter.value = histMsgs.length + 1
+        return
+      }
+    } catch (e) {
+      console.warn('Failed to sync history IDs:', e)
+    }
 
     const assistantMessage: Message = {
       id: messageIdCounter.value++,
@@ -316,6 +341,136 @@ const clearChat = () => {
   createNewSession()
 }
 
+const recallMessage = async (message: Message) => {
+  if (!sessionId.value) {
+    // 本地没有会话，直接在前端处理
+    const idx = messages.value.findIndex(m => m.id === message.id)
+    if (idx >= 0) {
+      inputMessage.value = message.content
+      messages.value = messages.value.slice(0, idx)
+      if (editingMessageId.value === message.id) {
+        editingMessageId.value = null
+      }
+    }
+    return
+  }
+
+  try {
+    const response = await axios.post('/ai/agent/recall_messages', null, {
+      params: {
+        session_id: sessionId.value,
+        message_id: message.id
+      }
+    })
+
+    const remaining = response.data.messages || []
+    messageIdCounter.value = remaining.length + 1
+
+    messages.value = remaining.map((msg: any) => ({
+      id: msg.id,
+      content: msg.content,
+      role: msg.role === 'user' ? 'user' : 'assistant',
+      timestamp: new Date(msg.timestamp || Date.now()),
+      type: msg.type || 'text',
+      fileName: msg.fileName,
+      imageUrl: msg.imageUrl
+    }))
+
+    inputMessage.value = message.content
+    editingMessageId.value = null
+  } catch (error) {
+    console.error('Failed to recall message:', error)
+  }
+}
+
+const editMessage = async (message: Message) => {
+  inputMessage.value = message.content
+  editingMessageId.value = message.id
+  await recallMessage(message)
+}
+
+const cancelEdit = () => {
+  editingMessageId.value = null
+  inputMessage.value = ''
+}
+
+const sendEditedMessage = async () => {
+  if (!inputMessage.value.trim() || isLoading.value) return
+
+  const originalContent = inputMessage.value
+  inputMessage.value = ''
+
+  const userMessage: Message = {
+    id: messageIdCounter.value++,
+    content: originalContent,
+    role: 'user',
+    timestamp: new Date(),
+    type: 'text'
+  }
+  messages.value.push(userMessage)
+  isLoading.value = true
+
+  try {
+    const response = await axios.post('/ai/agent/chat', null, {
+      params: {
+        user_input: originalContent,
+        input_source: 'user_input',
+        session_id: sessionId.value
+      }
+    })
+
+    const result = response.data
+    sessionId.value = result.session_id
+
+    // 同步历史以获取正确的 SQLite ID
+    try {
+      const histResp = await axios.get('/ai/agent/history', {
+        params: { session_id: result.session_id }
+      })
+      const histMsgs = histResp.data.messages || []
+      if (histMsgs.length > 0) {
+        messages.value = histMsgs.map((msg: any) => ({
+          id: msg.id,
+          content: msg.content,
+          role: msg.role === 'user' ? 'user' : 'assistant',
+          timestamp: new Date(msg.timestamp || Date.now()),
+          type: msg.type || 'text',
+          fileName: msg.fileName,
+          imageUrl: msg.imageUrl
+        }))
+        messageIdCounter.value = histMsgs.length + 1
+        editingMessageId.value = null
+        return
+      }
+    } catch (e) {
+      console.warn('Failed to sync history IDs:', e)
+    }
+
+    const assistantMessage: Message = {
+      id: messageIdCounter.value++,
+      content: result.final_response || '抱歉，无法处理您的请求',
+      role: 'assistant',
+      timestamp: new Date(),
+      riskLevel: result.risk_level,
+      type: 'text'
+    }
+    messages.value.push(assistantMessage)
+  } catch (error) {
+    const errorMessage: Message = {
+      id: messageIdCounter.value++,
+      content: '网络错误，请稍后重试',
+      role: 'assistant',
+      timestamp: new Date(),
+      riskLevel: 'error',
+      type: 'text'
+    }
+    messages.value.push(errorMessage)
+  } finally {
+    isLoading.value = false
+    editingMessageId.value = null
+  }
+}
+
 const loadSessions = async () => {
   isLoadingSessions.value = true
   try {
@@ -342,8 +497,8 @@ const switchSession = async (sessionItem: SessionItem) => {
     sessionId.value = sessionItem.session_id
     messageIdCounter.value = history.length + 1
     
-    messages.value = history.map((msg: any, index: number) => ({
-      id: index + 1,
+    messages.value = history.map((msg: any) => ({
+      id: msg.id || (index + 1),
       content: msg.content,
       role: msg.role === 'user' ? 'user' : 'assistant',
       timestamp: new Date(msg.timestamp || Date.now()),
@@ -366,6 +521,33 @@ const switchSession = async (sessionItem: SessionItem) => {
     console.error('Failed to switch session:', error)
   } finally {
     isLoading.value = false
+  }
+}
+
+const deleteSession = async (sessionItem: SessionItem) => {
+  const title = sessionItem.title || '会话 ' + sessionItem.session_id.slice(0, 8)
+  if (!window.confirm(`确定删除历史会话「${title}」吗？删除后不可恢复。`)) return
+  try {
+    await axios.post('/ai/agent/delete_session', null, {
+      params: { session_id: sessionItem.session_id }
+    })
+    sessions.value = sessions.value.filter(s => s.session_id !== sessionItem.session_id)
+    // 删除的是当前会话时，重置聊天区
+    if (sessionId.value === sessionItem.session_id) {
+      sessionId.value = null
+      messages.value = [{
+        id: 1,
+        content: '您好！我是面向政企场景的大模型智能体安全平台。\n\n发送消息即可开始体验安全检测流程，您的每条输入都会经过多层安全引擎扫描。',
+        role: 'assistant',
+        timestamp: new Date(),
+        riskLevel: 'none',
+        type: 'text'
+      }]
+      messageIdCounter.value = 2
+    }
+  } catch (error) {
+    console.error('Failed to delete session:', error)
+    window.alert('删除会话失败，请稍后重试')
   }
 }
 
@@ -429,10 +611,17 @@ onMounted(() => {
             <div class="flex items-center justify-between mt-2">
               <span class="text-xs text-gray-400">
                 {{ session.updated_at ? session.updated_at.slice(0, 10) : '' }}
+                {{ session.updated_at ? ' ' + session.updated_at.slice(11, 16) : '' }}
               </span>
-              <span class="text-xs text-gray-400">
-                {{ session.updated_at ? session.updated_at.slice(11, 16) : '' }}
-              </span>
+              <button
+                @click.stop="deleteSession(session)"
+                class="p-1 text-gray-300 hover:text-red-500 hover:bg-red-50 rounded transition-colors"
+                title="删除会话"
+              >
+                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"></path>
+                </svg>
+              </button>
             </div>
           </button>
         </div>
@@ -447,9 +636,11 @@ onMounted(() => {
         v-for="message in messages"
         :key="message.id"
         :class="[
-          'flex gap-3',
+          'flex gap-3 group relative',
           message.role === 'user' ? 'flex-row-reverse' : 'flex-row'
         ]"
+        @mouseenter="hoveredMessageId = message.id"
+        @mouseleave="hoveredMessageId = null"
       >
         <div
           :class="[
@@ -522,6 +713,45 @@ onMounted(() => {
             <span class="text-xs text-gray-400">
               {{ new Date(message.timestamp).toLocaleTimeString() }}
             </span>
+            <!-- 撤回/编辑按钮（悬停显示） -->
+            <div
+              v-if="hoveredMessageId === message.id && message.role === 'user'"
+              class="flex items-center gap-1 ml-1"
+            >
+              <button
+                @click="editMessage(message)"
+                class="p-1 rounded hover:bg-gray-200 text-gray-500 hover:text-blue-600 transition-colors"
+                title="编辑并重新发送"
+              >
+                <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z"></path>
+                </svg>
+              </button>
+              <button
+                @click="recallMessage(message)"
+                class="p-1 rounded hover:bg-gray-200 text-gray-500 hover:text-red-600 transition-colors"
+                title="撤回到此消息"
+              >
+                <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 10h10a8 8 0 018 8v2M3 10l6 6m-6-6l6-6"></path>
+                </svg>
+              </button>
+            </div>
+            <!-- 撤回按钮（AI消息也可撤回） -->
+            <div
+              v-if="hoveredMessageId === message.id && message.role === 'assistant'"
+              class="flex items-center gap-1 ml-1"
+            >
+              <button
+                @click="recallMessage(message)"
+                class="p-1 rounded hover:bg-gray-200 text-gray-400 hover:text-red-600 transition-colors"
+                title="撤回此回复"
+              >
+                <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 10h10a8 8 0 018 8v2M3 10l6 6m-6-6l6-6"></path>
+                </svg>
+              </button>
+            </div>
           </div>
         </div>
       </div>
@@ -590,27 +820,46 @@ onMounted(() => {
         </span>
       </div>
       
+      <!-- 编辑状态提示 -->
+      <div v-if="editingMessageId" class="flex items-center gap-2 mb-2 px-3 py-1.5 bg-blue-50 rounded-lg text-sm">
+        <svg class="w-4 h-4 text-blue-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z"></path>
+        </svg>
+        <span class="text-blue-700">正在编辑消息，修改后点击发送</span>
+        <button
+          @click="cancelEdit"
+          class="ml-auto text-blue-500 hover:text-blue-700 transition-colors"
+        >
+          <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path>
+          </svg>
+        </button>
+      </div>
+
       <!-- 输入框 -->
       <div class="flex gap-3">
         <textarea
           v-model="inputMessage"
-          @keydown.enter.exact.prevent="sendMessage"
-          placeholder="请输入您的问题..."
+          @keydown.enter.exact.prevent="editingMessageId ? sendEditedMessage() : sendMessage()"
+          :placeholder="editingMessageId ? '修改您的问题后重新发送...' : '请输入您的问题...'"
           class="flex-1 px-4 py-3 border border-gray-200 rounded-xl resize-none focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
           rows="2"
           :disabled="isLoading"
         ></textarea>
         <button
-          @click="sendMessage"
+          @click="editingMessageId ? sendEditedMessage() : sendMessage()"
           :disabled="isLoading || !inputMessage.trim()"
           :class="[
             'px-6 py-3 rounded-xl font-medium transition-all duration-200 flex-shrink-0',
             isLoading || !inputMessage.trim()
               ? 'bg-gray-300 text-gray-500 cursor-not-allowed'
-              : 'bg-blue-600 text-white hover:bg-blue-700 shadow-md hover:shadow-lg'
+              : editingMessageId
+                ? 'bg-amber-600 text-white hover:bg-amber-700 shadow-md hover:shadow-lg'
+                : 'bg-blue-600 text-white hover:bg-blue-700 shadow-md hover:shadow-lg'
           ]"
         >
           <span v-if="isLoading">发送中...</span>
+          <span v-else-if="editingMessageId">重新发送</span>
           <span v-else>发送</span>
         </button>
       </div>
@@ -622,7 +871,6 @@ onMounted(() => {
       ref="fileInput"
       type="file"
       class="hidden"
-      accept=".txt,.json,.md"
       @change="handleFileUpload"
     />
     <input

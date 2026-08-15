@@ -29,6 +29,10 @@ from security.session_risk_accumulator import SessionRiskAccumulator
 from security.adversarial_mutator import BypassTester
 from security.cross_source_correlator import CrossSourceCorrelator, get_cross_source_correlator
 from plugins.plugin_scanner import PluginScanner
+from security.mcp_scanner import MCPScanner
+from security.skill_analyzer import SkillAnalyzer
+from security.mcp_combination_detector import MCPCombinationDetector
+from security.operation_guard import get_operation_guard, OperationIntent, ActionType as GuardActionType
 from audit.audit_logger import AuditLogger
 from audit.evaluation_metrics import EvaluationMetricsCalculator
 from gov_agent_graph.gov_agent import GovAgent
@@ -49,6 +53,13 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# ======== 来源IP审计中间件（等保2.0：审计日志记录来源IP） ========
+@app.middleware("http")
+async def audit_source_ip_middleware(request: Request, call_next):
+    from audit.audit_logger import set_source_ip
+    set_source_ip(request.client.host if request.client else "")
+    return await call_next(request)
 
 # ======== 基本 API Key 鉴权 (公网预览用) ========
 _SKIP_AUTH_PATHS = {"/", "/api/health", "/docs", "/openapi.json", "/redoc"}
@@ -106,6 +117,10 @@ bypass_tester = BypassTester(
     detector_func=lambda text, src: input_detector.detect_single_input(text, src)
 )
 plugin_scanner = PluginScanner()
+mcp_scanner = MCPScanner()
+skill_analyzer = SkillAnalyzer()
+combination_detector = MCPCombinationDetector()
+operation_guard = get_operation_guard()
 audit_logger = AuditLogger()
 metrics_calculator = EvaluationMetricsCalculator()
 gov_agent = GovAgent()
@@ -217,6 +232,269 @@ async def evaluate_tool_risk(request: ToolCallRequest):
     try:
         result = tool_evaluator.evaluate(request)
         return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ==================== 操作守卫层 API ====================
+
+@app.post("/api/security/operation_guard/check")
+async def check_operation_intent(request: Request):
+    """操作守卫层——动作执行前的最后一道防线
+
+    请求体:
+    {
+        "tool_name": "export_data",
+        "parameters": {"target": "all_users", "format": "csv"},
+        "session_id": "sess-001",
+        "user_input": "导出所有用户数据"
+    }
+
+    返回:
+    {
+        "allowed": false,
+        "requires_approval": true,
+        "risk_level": "medium",
+        "reason": "数据导出类操作需审批",
+        "blocked_by": "",
+        "rate_limited": false
+    }
+    """
+    try:
+        body = await request.json()
+        tool_name = body.get("tool_name", "")
+        parameters = body.get("parameters", {})
+        session_id = body.get("session_id", "default")
+        user_input = body.get("user_input", "")
+
+        if not tool_name:
+            raise HTTPException(status_code=400, detail="请提供 tool_name")
+
+        intent = OperationIntent(
+            tool_name=tool_name,
+            parameters=parameters,
+            session_id=session_id,
+            user_input=user_input,
+        )
+
+        result = operation_guard.check_intent(intent)
+
+        # 审计日志
+        audit_logger.create_log(
+            user_id="anonymous", user_role="user", agent_id="operation_guard",
+            action_type="operation_guard_check",
+            action_details={
+                "tool_name": tool_name,
+                "parameters_preview": str(parameters)[:200],
+                "session_id": session_id,
+            },
+            risk_level=result.risk_level,
+            is_blocked=not result.allowed,
+        )
+
+        # 守卫拦截时推送实时告警
+        if not result.allowed:
+            import asyncio
+            asyncio.create_task(push_risk_alert(
+                session_id=session_id,
+                risk_level=result.risk_level.value if hasattr(result.risk_level, 'value') else str(result.risk_level),
+                message=f"操作被拦截：{result.reason}",
+                attack_type="operation_blocked",
+            ))
+
+        return {
+            "allowed": result.allowed,
+            "reason": result.reason,
+            "requires_approval": result.requires_approval,
+            "approval_reason": result.approval_reason,
+            "risk_level": result.risk_level.value if hasattr(result.risk_level, 'value') else str(result.risk_level),
+            "blocked_by": result.blocked_by,
+            "action_type": result.action_type.value if hasattr(result.action_type, 'value') else str(result.action_type),
+            "rate_limited": result.rate_limited,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/security/operation_guard/session/{session_id}")
+async def get_operation_guard_session(session_id: str):
+    """获取会话操作守卫历史摘要"""
+    try:
+        summary = operation_guard.get_session_summary(session_id)
+        return {"success": True, "summary": summary}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/security/operation_guard/clear/{session_id}")
+async def clear_operation_guard_session(session_id: str):
+    """清除会话操作守卫记录"""
+    try:
+        operation_guard.clear_session(session_id)
+        return {"success": True, "message": f"Session {session_id} 操作守卫记录已清除"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ==================== T4: 运行时工具调用控制 API ====================
+
+@app.get("/api/security/runtime/trace/{session_id}")
+async def get_runtime_trace(session_id: str):
+    """获取会话ReAct执行轨迹（Think-Act-Observe全流程）"""
+    try:
+        trace = gov_agent.security_layer.runtime_monitor.get_session_trace(session_id)
+        return {
+            "session_id": session_id,
+            "trace": [
+                {
+                    "step_id": s.step_id,
+                    "step_type": s.step_type,
+                    "tool_name": s.tool_name,
+                    "reasoning": s.reasoning[:500] if s.reasoning else "",
+                    "risk_level": s.risk_level.value,
+                    "timestamp": s.timestamp,
+                }
+                for s in trace
+            ],
+            "total_steps": len(trace),
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/security/runtime/anomalies/{session_id}")
+async def get_runtime_anomalies(session_id: str):
+    """获取会话运行时异常告警"""
+    try:
+        alerts = gov_agent.security_layer.runtime_monitor.check_anomalies(session_id)
+        cascade = gov_agent.security_layer.runtime_monitor.detect_cascade_failure(session_id)
+        return {
+            "session_id": session_id,
+            "anomalies": [
+                {
+                    "alert_type": a.alert_type,
+                    "severity": a.severity.value,
+                    "description": a.description,
+                    "step_id": a.step_id,
+                    "evidence": a.evidence,
+                }
+                for a in alerts
+            ],
+            "cascade_failure": {
+                "name": cascade.name,
+                "description": cascade.description,
+                "severity": cascade.severity.value,
+            } if cascade else None,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/security/runtime/terminate/{session_id}")
+async def terminate_session(session_id: str, reason: str = "手动终止"):
+    """一键终止会话——中断智能体ReAct循环"""
+    try:
+        termination_id = gov_agent.security_layer.runtime_monitor.terminate(session_id, reason)
+        audit_logger.create_log(
+            user_id="admin", user_role="admin", agent_id="gov_agent",
+            action_type="manual_termination",
+            action_details={"session_id": session_id, "reason": reason},
+            risk_level=RiskLevel.HIGH,
+            is_blocked=True,
+            blocking_reason=f"手动终止: {reason}",
+        )
+        return {
+            "success": True,
+            "termination_id": termination_id,
+            "message": f"会话 {session_id} 已终止",
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/security/runtime/summary/{session_id}")
+async def get_runtime_summary(session_id: str):
+    """获取会话运行时摘要（步数/异常/级联/终止状态）"""
+    try:
+        summary = gov_agent.security_layer.runtime_monitor.get_session_summary(session_id)
+        return {"session_id": session_id, "summary": summary}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/security/runtime/task_chain/{session_id}")
+async def get_task_chain(session_id: str):
+    """获取会话任务执行图"""
+    try:
+        chain = gov_agent.security_layer.runtime_monitor.build_task_chain(session_id)
+        return {
+            "session_id": session_id,
+            "nodes": [
+                {
+                    "step_id": n.step_id,
+                    "tool_name": n.tool_name,
+                    "action_category": n.action_category,
+                    "target": n.target,
+                    "risk_level": n.risk_level.value,
+                }
+                for n in chain
+            ],
+            "total_nodes": len(chain),
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/security/permission/check")
+async def check_tool_permission(request: Request):
+    """检查工具调用权限（工具级权限矩阵 + 参数级校验）"""
+    try:
+        body = await request.json()
+        tool_name = body.get("tool_name", "")
+        parameters = body.get("parameters", {})
+        session_id = body.get("session_id", "default")
+
+        perm = gov_agent.security_layer.permission_matrix.get_permission(tool_name)
+        can_call, call_count = gov_agent.security_layer.permission_matrix.check_call_limit(tool_name, session_id)
+        param_result = gov_agent.security_layer.permission_matrix.validate_parameters(tool_name, parameters)
+
+        return {
+            "tool_name": tool_name,
+            "allowed_permissions": [p.value for p in perm.allowed_permissions],
+            "requires_approval": perm.requires_approval,
+            "base_risk": perm.base_risk.value,
+            "call_limit": perm.max_calls_per_session,
+            "current_calls": call_count,
+            "can_call": can_call,
+            "param_valid": param_result.is_valid,
+            "param_violations": param_result.violations,
+            "param_risk": param_result.risk_level.value,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/security/browser/check_url")
+async def check_url_access(request: Request):
+    """检查URL访问权限（浏览器访问控制）"""
+    try:
+        body = await request.json()
+        url = body.get("url", "")
+        session_id = body.get("session_id", "default")
+
+        result = gov_agent.security_layer.browser_controller.check_request(
+            url=url, parameters=body.get("parameters", {}), session_id=session_id,
+        )
+        return {
+            "url": url,
+            "is_allowed": result.is_allowed,
+            "risk_level": result.risk_level.value,
+            "reason": result.reason,
+            "category": result.category,
+            "detected_patterns": result.detected_patterns,
+        }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -360,11 +638,189 @@ def _get_plugin_recommendations(vulnerabilities) -> list:
     return recs
 
 
+# ======== 工具管控模块（MCP/Skill生态安全检测） ========
+tool_management_enabled = True
+
+
+@app.get("/api/security/tool_management/status")
+async def get_tool_management_status():
+    return {"enabled": tool_management_enabled}
+
+
+@app.post("/api/security/tool_management/toggle")
+async def toggle_tool_management(request: Request):
+    global tool_management_enabled
+    body = await request.json() if request.headers.get("content-type", "").startswith("application/json") else {}
+    tool_management_enabled = body.get("enabled", not tool_management_enabled)
+    return {"enabled": tool_management_enabled}
+
+
+@app.post("/api/security/mcp_scan")
+async def scan_mcp_tool(request: Request):
+    body = await request.json()
+    descriptor = body.get("descriptor", {})
+    tool_id = body.get("tool_id", "unknown")
+
+    if not tool_management_enabled:
+        return {
+            "module_enabled": False,
+            "blocked": False,
+            "message": "工具管控模块未开启，MCP工具可正常加载",
+            "tool_id": tool_id,
+        }
+
+    findings = mcp_scanner.analyze_descriptor(descriptor, tool_id)
+
+    critical = sum(1 for f in findings if f.get("risk_level") == RiskLevel.CRITICAL)
+    high = sum(1 for f in findings if f.get("risk_level") == RiskLevel.HIGH)
+    blocked = critical > 0
+
+    perm_findings = [f for f in findings if f.get("type") == "over_permission"]
+    permission_matrix = []
+    for pf in perm_findings:
+        permission_matrix.append({
+            "permissions": pf.get("detected_permissions", []),
+            "description": pf.get("description", ""),
+            "risk_level": pf.get("risk_level", RiskLevel.MEDIUM).value if hasattr(pf.get("risk_level"), 'value') else str(pf.get("risk_level", "")),
+        })
+
+    return {
+        "module_enabled": True,
+        "blocked": blocked,
+        "tool_id": tool_id,
+        "total_findings": len(findings),
+        "critical": critical,
+        "high": high,
+        "findings": findings,
+        "permission_matrix": permission_matrix,
+        "risk_report": {
+            "summary": f"检测到{len(findings)}个问题（{critical}个严重、{high}个高危）",
+            "recommendation": "阻止加载" if blocked else "建议审批后加载",
+        },
+    }
+
+
+@app.post("/api/security/skill_scan")
+async def scan_skill_package(request: Request):
+    body = await request.json()
+    manifest = body.get("manifest", {})
+    scripts = body.get("scripts", [])
+    skill_name = body.get("skill_name", "unknown")
+
+    if not tool_management_enabled:
+        return {
+            "module_enabled": False,
+            "blocked": False,
+            "message": "工具管控模块未开启，Skill包可正常加载",
+            "skill_name": skill_name,
+        }
+
+    result = skill_analyzer.analyze_skill_package(manifest, scripts, skill_name)
+
+    blocked = result.safety_grade in ("C", "D") and any(
+        f.severity == RiskLevel.CRITICAL for f in result.findings
+    )
+
+    return {
+        "module_enabled": True,
+        "blocked": blocked,
+        "skill_name": skill_name,
+        "safety_grade": result.safety_grade,
+        "safety_score": result.safety_score,
+        "total_findings": len(result.findings),
+        "findings": [
+            {
+                "type": f.finding_type,
+                "description": f.description,
+                "severity": f.severity.value if hasattr(f.severity, 'value') else str(f.severity),
+                "location": f.location,
+            } for f in result.findings
+        ],
+        "url_findings": result.url_findings,
+        "secrets_found": result.secrets_found,
+        "risk_report": {
+            "summary": result.summary,
+            "recommendation": "禁止加载" if blocked else ("审批后加载" if result.safety_grade in ("B", "C") else "可安全加载"),
+        },
+    }
+
+
+@app.post("/api/security/tool_combination_scan")
+async def scan_tool_combinations(request: Request):
+    body = await request.json()
+    tools = body.get("tools", [])
+
+    if not tool_management_enabled:
+        return {
+            "module_enabled": False,
+            "message": "工具管控模块未开启，跳过组合风险检测",
+        }
+
+    result = combination_detector.analyze_tool_set(tools)
+
+    return {
+        "module_enabled": True,
+        "total_tools": result.total_tools_analyzed,
+        "total_capabilities": result.total_capabilities,
+        "total_findings": len(result.findings),
+        "highest_risk_score": result.highest_risk_score,
+        "overall_risk": result.overall_risk.value if hasattr(result.overall_risk, 'value') else str(result.overall_risk),
+        "summary": result.summary,
+        "findings": [
+            {
+                "pattern_name": f.pattern_name,
+                "description": f.description,
+                "detected_tools": f.detected_tools,
+                "risk_score": f.risk_score,
+                "risk_level": f.risk_level.value if hasattr(f.risk_level, 'value') else str(f.risk_level),
+                "attack_type": f.attack_type.value if hasattr(f.attack_type, 'value') else str(f.attack_type),
+                "recommended_action": f.recommended_action,
+            } for f in result.findings
+        ],
+    }
+
+
 @app.get("/api/audit/logs/recent")
 async def get_recent_logs(limit: int = 100):
     try:
         logs = audit_logger.get_recent_logs(limit)
         return {"logs": [log.dict() for log in logs]}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/audit/logs/page")
+async def get_logs_page(page: int = 1, page_size: int = 20):
+    """分页查询审计日志（按时间倒序）
+
+    page: 页码，从 1 开始
+    page_size: 每页条数（默认20，可选20/50，上限100）
+    """
+    page = max(1, page)
+    page_size = min(max(1, page_size), 100)
+    try:
+        result = audit_logger.get_logs_page(page=page, page_size=page_size)
+        result["logs"] = [log.dict() for log in result["logs"]]
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/audit/config")
+async def get_audit_config():
+    """审计配置（日志留存天数等）"""
+    from audit.audit_logger import AUDIT_RETENTION_DAYS
+    return {
+        "retention_days": AUDIT_RETENTION_DAYS,
+        "retention_hint": f"审计日志默认留存 {AUDIT_RETENTION_DAYS} 天（可通过环境变量 AUDIT_RETENTION_DAYS 配置为 30=1个月 / 90=3个月 / 180=6个月）",
+    }
+
+
+@app.get("/api/audit/logs/verify")
+async def verify_audit_chain():
+    """校验审计日志哈希链与签名完整性（防篡改）"""
+    try:
+        return audit_logger.verify_chain()
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -551,6 +1007,244 @@ async def audit_statistics(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# ============================================================================
+# T5 合规标准对接：合规报告 / 关键词库 / AIGC标识 / 哈希链校验
+# ============================================================================
+
+@app.get("/api/compliance/report")
+async def compliance_report(format: str = "json"):
+    """生成等保2.0/算法备案/大模型备案安全评估报告
+
+    Args:
+        format: json | markdown(md) | html
+    """
+    try:
+        from audit.compliance_report import get_compliance_generator
+        generator = get_compliance_generator()
+        data = generator.generate(format)
+        if format.lower() in ("md", "markdown"):
+            from fastapi.responses import PlainTextResponse
+            return PlainTextResponse(data, media_type="text/markdown")
+        if format.lower() == "html":
+            from fastapi.responses import HTMLResponse
+            return HTMLResponse(data)
+        return data
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/compliance/keywords/stats")
+async def compliance_keywords_stats():
+    """关键词库规模统计（GB/T 45654-2025）"""
+    try:
+        from security.compliance_lexicon import get_lexicon_stats
+        return get_lexicon_stats()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/compliance/content_safety")
+async def compliance_content_safety(request: dict):
+    """生成内容安全合格率评测（要求 ≥90%）"""
+    try:
+        from security.compliance_lexicon import evaluate_content_safety_batch
+        samples = request.get("samples") or []
+        return evaluate_content_safety_batch(samples)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/compliance/refusal_rate")
+async def compliance_refusal_rate(request: dict):
+    """拒答率/非拒答率评测"""
+    try:
+        from security.compliance_lexicon import evaluate_refusal_rate
+        attack = request.get("attack_prompts") or []
+        normal = request.get("normal_prompts") or []
+        if not attack and not normal:
+            return {"error": "请提供 attack_prompts 和 normal_prompts"}
+        def _responder(prompt: str) -> str:
+            from security.input_detector import InputDetectionService
+            from security.compliance_lexicon import search_risks
+            from models.schemas import RiskLevel, InputSource
+            try:
+                r = InputDetectionService().detect_single_input(prompt, InputSource.USER_INPUT)
+                if r.risk_level in (RiskLevel.HIGH, RiskLevel.CRITICAL):
+                    return "抱歉，拒绝生成。"
+            except Exception:
+                pass
+            if search_risks(prompt):
+                return "抱歉，拒绝生成。"
+            return f"正常回答：{prompt}"
+        return evaluate_refusal_rate(attack, normal, _responder)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/aigc/label")
+async def aigc_label_config():
+    """AIGC内容标识配置（显式+隐式+元数据）"""
+    try:
+        from security.aigc_labeling import get_aigc_config, build_aigc_metadata
+        cfg = get_aigc_config()
+        cfg["sample_metadata"] = build_aigc_metadata()
+        return cfg
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ============================================================================
+# T6 持续优化闭环：反馈标注 / 自动调优 / 版本管理 / 威胁情报 / 聚类 / 回归
+# ============================================================================
+
+@app.post("/api/optimization/feedback")
+async def optimization_feedback(request: dict):
+    """检测结果人工标注（确认/驳回）"""
+    try:
+        from security.optimization_loop import get_optimization_loop
+        return get_optimization_loop().record_feedback(
+            sample_text=request.get("sample_text", ""),
+            predicted_label=request.get("predicted_label", "benign"),
+            predicted_risk=request.get("predicted_risk", "none"),
+            annotator_label=request.get("annotator_label", "benign"),
+            annotator_comment=request.get("comment", ""),
+            source=request.get("source", "manual"),
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/optimization/feedback")
+async def optimization_feedback_list(limit: int = 100):
+    try:
+        from security.optimization_loop import get_optimization_loop
+        return {"items": get_optimization_loop().list_feedback(limit)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/optimization/feedback/stats")
+async def optimization_feedback_stats():
+    """误报/漏报统计"""
+    try:
+        from security.optimization_loop import get_optimization_loop
+        return get_optimization_loop().feedback_stats()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/optimization/tune")
+async def optimization_tune(request: dict):
+    """基于标注数据的规则自动调优"""
+    try:
+        from security.optimization_loop import get_optimization_loop
+        return get_optimization_loop().auto_tune_from_feedback(
+            auto_apply=request.get("auto_apply", True),
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/optimization/versions")
+async def optimization_versions(limit: int = 100):
+    """关键词/模式库版本列表"""
+    try:
+        from security.optimization_loop import get_optimization_loop
+        return {"versions": get_optimization_loop().list_versions(limit)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/optimization/versions/{version_id}/apply")
+async def optimization_version_apply(version_id: str):
+    """应用版本（写入动态检测库）"""
+    try:
+        from security.optimization_loop import get_optimization_loop
+        return get_optimization_loop().apply_version(version_id)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/optimization/attack_samples")
+async def optimization_attack_samples_add(request: dict):
+    """攻击样例库动态扩充"""
+    try:
+        from security.optimization_loop import get_optimization_loop
+        return get_optimization_loop().record_attack_sample(
+            content=request.get("content", ""),
+            attack_type=request.get("attack_type", "unknown"),
+            source=request.get("source", "manual"),
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/optimization/attack_samples")
+async def optimization_attack_samples_list(limit: int = 200):
+    try:
+        from security.optimization_loop import get_optimization_loop
+        return {"items": get_optimization_loop().list_attack_samples(limit)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/optimization/cluster")
+async def optimization_cluster(request: dict):
+    """新型攻击模式自动聚类"""
+    try:
+        from security.optimization_loop import get_optimization_loop
+        return get_optimization_loop().cluster_attack_patterns(
+            min_cluster=request.get("min_cluster", 2),
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/optimization/threat_intel")
+async def optimization_threat_intel(request: dict):
+    """威胁情报订阅接口（外部IOC导入）"""
+    try:
+        from security.optimization_loop import get_optimization_loop
+        iocs = request.get("iocs") or []
+        return get_optimization_loop().import_threat_iocs(
+            iocs=iocs, source=request.get("source", "external"),
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/optimization/threat_intel")
+async def optimization_threat_intel_list(limit: int = 200):
+    try:
+        from security.optimization_loop import get_optimization_loop
+        return {"items": get_optimization_loop().list_threat_iocs(limit)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/optimization/regression")
+async def optimization_regression(request: dict):
+    """规则更新后自动回归测试"""
+    try:
+        from security.optimization_loop import get_optimization_loop
+        samples = request.get("samples")
+        return get_optimization_loop().run_regression(
+            samples=samples, note=request.get("note", "api"),
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/optimization/trend")
+async def optimization_trend(limit: int = 30):
+    """检测效果趋势可视化数据"""
+    try:
+        from security.optimization_loop import get_optimization_loop
+        return get_optimization_loop().get_trend(limit)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.post("/api/security/eval_calc", response_model=EvaluationMetrics)
 async def calculate_evaluation_metrics(request: dict):
     try:
@@ -626,6 +1320,34 @@ async def clear_conversation(session_id: str):
     try:
         result = gov_agent.clear_conversation(session_id)
         return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/agent/delete_session")
+async def delete_conversation(session_id: str):
+    """删除整个历史会话（会话记录及全部消息）"""
+    try:
+        result = gov_agent.delete_session(session_id)
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/agent/recall_messages")
+async def recall_messages(session_id: str, message_id: int):
+    """撤回/编辑消息：删除指定消息及之后的所有消息"""
+    try:
+        from storage import get_storage
+        storage = get_storage()
+        deleted = storage.truncate_messages_from(session_id, message_id)
+        history = storage.get_history(session_id)
+        return {
+            "success": True,
+            "deleted_count": deleted,
+            "remaining_messages": len(history),
+            "messages": history
+        }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

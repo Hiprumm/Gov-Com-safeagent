@@ -25,3 +25,12 @@ class AgentState(TypedDict):
     final_response: Optional[str]
     audit_logs: List[Dict[str, Any]]
     llm_response: Optional[str]
+    guard_results: List[Dict[str, Any]]
+    runtime_trace: List[Dict[str, Any]]
+    anomaly_alerts: List[Dict[str, Any]]
+    # T4: ReAct 循环控制
+    react_iteration: int
+    react_max_iterations: int
+    should_continue_react: bool
+    # T5 合规：AIGC 内容标识元数据
+    aigc_metadata: Optional[Dict[str, Any]]

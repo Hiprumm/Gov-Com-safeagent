@@ -29,6 +29,18 @@ class AttackType(str, Enum):
     CONTENT_INJECTION = "content_injection"
     NETWORK_ATTACK = "network_attack"
     DATA_EXFILTRATION = "data_exfiltration"
+    MEMORY_POISONING = "memory_poisoning"
+    CONTEXT_POISONING = "context_poisoning"
+    MCP_POISONING = "mcp_poisoning"
+    SKILL_TAMPERING = "skill_tampering"
+    TOOL_DESCRIPTOR_POISONING = "tool_descriptor_poisoning"
+    COMBINED_ATTACK = "combined_attack"
+    WEB_CONTENT_INJECTION = "web_content_injection"
+    DOCUMENT_EMBEDDED_INJECTION = "document_embedded_injection"
+    HIDDEN_TEXT_STEGANOGRAPHY = "hidden_text_steganography"
+    MACRO_INJECTION = "macro_injection"
+    DDE_INJECTION = "dde_injection"
+    MARKDOWN_INJECTION = "markdown_injection"
 
 
 class InputSource(str, Enum):
@@ -83,6 +95,7 @@ class ToolCallRequest(BaseModel):
 
 
 class ToolRiskResult(BaseModel):
+    tool_name: str = ""
     risk_level: RiskLevel
     risk_score: float = Field(ge=0.0, le=1.0)
     risk_details: List[str] = []
@@ -110,6 +123,7 @@ class PluginScanResult(BaseModel):
     plugin_name: str
     plugin_version: str
     safety_score: int = Field(ge=0, le=100)
+    safety_grade: str = "A"
     vulnerabilities: List[PluginVulnerability] = []
     is_safe: bool
     scan_details: Dict[str, Any] = {}
@@ -130,6 +144,19 @@ class AuditLog(BaseModel):
     approval_status: Optional[str] = None
     is_blocked: bool = False
     blocking_reason: Optional[str] = None
+    # 审计完整性扩展：会话ID、Think原文、返回值（不丢失推理阶段内容）
+    session_id: str = ""
+    think_text: str = ""
+    return_value: str = ""
+    # 等保2.0审计要素：操作主体/客体/时间/结果/来源IP
+    source_ip: str = ""
+    operation_subject: str = ""    # 操作主体（用户/角色）
+    operation_object: str = ""     # 操作客体（工具/资源）
+    operation_result: str = ""     # 操作结果（success/blocked/approved/timeout）
+    # 日志防篡改：哈希链 + 签名
+    log_hash: str = ""             # 当前日志哈希
+    prev_hash: str = ""            # 前一条日志哈希
+    signature: str = ""            # HMAC签名
 
 
 class EvaluationMetrics(BaseModel):

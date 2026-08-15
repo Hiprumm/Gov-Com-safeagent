@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onMounted } from 'vue'
+import { ref, computed, onMounted } from 'vue'
 import axios from 'axios'
 
 interface AuditLog {
@@ -14,24 +14,99 @@ interface AuditLog {
   approval_status: string | null
   blocking_reason: string | null
   timestamp: string
+  session_id: string
+  think_text: string
+  return_value: string
+  detection_result: any
+  tool_call_result: any
 }
 
 const logs = ref<AuditLog[]>([])
 const isLoading = ref(false)
+const detailVisible = ref(false)
+const currentLog = ref<AuditLog | null>(null)
+const total = ref(0)
+const totalPages = ref(0)
+const currentPage = ref(1)
+const pageSize = ref(20)
+const retentionDays = ref<number | null>(null)
 
 const loadLogs = async () => {
   isLoading.value = true
   try {
-    const response = await axios.get('/ai/audit/logs/recent', {
+    const response = await axios.get('/ai/audit/logs/page', {
       params: {
-        limit: 50
+        page: currentPage.value,
+        page_size: pageSize.value
       }
     })
     logs.value = response.data.logs || []
+    total.value = response.data.total || 0
+    totalPages.value = response.data.total_pages || 0
   } catch (error) {
     console.error('Failed to load logs:', error)
   } finally {
     isLoading.value = false
+  }
+}
+
+const loadAuditConfig = async () => {
+  try {
+    const response = await axios.get('/ai/audit/config')
+    retentionDays.value = response.data.retention_days
+  } catch (error) {
+    console.error('Failed to load audit config:', error)
+  }
+}
+
+const changePage = (page: number) => {
+  if (page < 1 || page > totalPages.value || page === currentPage.value) return
+  currentPage.value = page
+  loadLogs()
+}
+
+const changePageSize = (size: number) => {
+  if (size === pageSize.value) return
+  pageSize.value = size
+  currentPage.value = 1
+  loadLogs()
+}
+
+const pageNumbers = computed(() => {
+  const pages: number[] = []
+  const maxShown = 5
+  let start = Math.max(1, currentPage.value - 2)
+  let end = Math.min(totalPages.value, start + maxShown - 1)
+  start = Math.max(1, end - maxShown + 1)
+  for (let i = start; i <= end; i++) pages.push(i)
+  return pages
+})
+
+const retentionText = computed(() => {
+  if (!retentionDays.value) return ''
+  const days = retentionDays.value
+  if (days >= 180) return `${days}天（6个月）`
+  if (days >= 90) return `${days}天（3个月）`
+  return `${days}天（1个月）`
+})
+
+const openDetail = (log: AuditLog) => {
+  currentLog.value = log
+  detailVisible.value = true
+}
+
+const closeDetail = () => {
+  detailVisible.value = false
+  currentLog.value = null
+}
+
+const formatDetails = (obj: any): string => {
+  if (obj === null || obj === undefined) return '-'
+  if (typeof obj === 'string') return obj
+  try {
+    return JSON.stringify(obj, null, 2)
+  } catch {
+    return String(obj)
   }
 }
 
@@ -51,6 +126,8 @@ const getRiskColor = (riskLevel: string) => {
 
 const getRiskText = (riskLevel: string) => {
   switch (riskLevel) {
+    case 'critical':
+      return '严重风险'
     case 'high':
       return '高风险'
     case 'medium':
@@ -65,9 +142,15 @@ const getRiskText = (riskLevel: string) => {
 const getActionTypeText = (actionType: string) => {
   const map: Record<string, string> = {
     'input_detection': '输入检测',
+    'tool_risk_evaluation': '工具风险评估',
+    'tool_execution': '工具执行',
     'tool_call': '工具调用',
     'response_generation': '响应生成',
     'approval_request': '审批请求',
+    'operation_guard_blocked': '操作守卫拦截',
+    'operation_guard_approval': '操作守卫审批',
+    'runtime_termination': '运行时终止',
+    'chain_detection': '链路检测',
     'blocked': '被拦截',
   }
   return map[actionType] || actionType
@@ -75,13 +158,19 @@ const getActionTypeText = (actionType: string) => {
 
 onMounted(() => {
   loadLogs()
+  loadAuditConfig()
 })
 </script>
 
 <template>
   <div class="h-full">
     <div class="flex items-center justify-between mb-4">
-      <h2 class="text-xl font-bold text-gray-900">审计日志</h2>
+      <div class="flex items-center gap-3">
+        <h2 class="text-xl font-bold text-gray-900">审计日志</h2>
+        <span v-if="retentionDays" class="px-2 py-1 text-xs text-gray-500 bg-gray-100 rounded-full">
+          日志留存：{{ retentionText }}
+        </span>
+      </div>
       <button
         @click="loadLogs"
         :disabled="isLoading"
@@ -100,12 +189,13 @@ onMounted(() => {
             <th class="text-left px-4 py-3 font-semibold text-gray-600">动作</th>
             <th class="text-left px-4 py-3 font-semibold text-gray-600">风险等级</th>
             <th class="text-left px-4 py-3 font-semibold text-gray-600">状态</th>
+            <th class="text-left px-4 py-3 font-semibold text-gray-600">会话ID</th>
             <th class="text-left px-4 py-3 font-semibold text-gray-600">详情</th>
           </tr>
         </thead>
         <tbody>
           <tr v-for="log in logs" :key="log.log_id" class="border-b border-gray-100 hover:bg-gray-50">
-            <td class="px-4 py-3 text-gray-600">
+            <td class="px-4 py-3 text-gray-600 whitespace-nowrap">
               {{ new Date(log.timestamp).toLocaleString() }}
             </td>
             <td class="px-4 py-3">
@@ -125,12 +215,20 @@ onMounted(() => {
                 {{ log.is_blocked ? '已拦截' : '正常' }}
               </span>
             </td>
-            <td class="px-4 py-3 text-gray-500 max-w-xs truncate">
-              {{ typeof log.action_details === 'object' ? JSON.stringify(log.action_details).slice(0, 50) + '...' : (log.action_details || '-') }}
+            <td class="px-4 py-3 text-gray-500">
+              {{ log.session_id || '-' }}
+            </td>
+            <td class="px-4 py-3">
+              <button
+                @click="openDetail(log)"
+                class="px-2 py-1 text-xs text-blue-600 bg-blue-50 rounded hover:bg-blue-100 transition-colors"
+              >
+                查看详情
+              </button>
             </td>
           </tr>
           <tr v-if="logs.length === 0">
-            <td colspan="6" class="text-center py-8 text-gray-500">
+            <td colspan="7" class="text-center py-8 text-gray-500">
               <div v-if="isLoading">加载中...</div>
               <div v-else>暂无审计日志</div>
             </td>
@@ -138,28 +236,154 @@ onMounted(() => {
         </tbody>
       </table>
     </div>
+    <!-- 分页控件 -->
+    <div class="mt-4 flex items-center justify-between">
+      <div class="flex items-center gap-2 text-sm text-gray-500">
+        <span>共 {{ total }} 条日志</span>
+        <span class="mx-2 text-gray-300">|</span>
+        <span>每页</span>
+        <select
+          :value="pageSize"
+          @change="changePageSize(Number(($event.target as HTMLSelectElement).value))"
+          class="px-2 py-1 border border-gray-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+        >
+          <option :value="20">20 条</option>
+          <option :value="50">50 条</option>
+        </select>
+      </div>
+      <div class="flex items-center gap-1" v-if="totalPages > 1">
+        <button
+          @click="changePage(currentPage - 1)"
+          :disabled="currentPage <= 1"
+          class="px-3 py-1 text-sm text-gray-600 bg-gray-50 border border-gray-200 rounded-lg hover:bg-gray-100 disabled:opacity-40 disabled:cursor-not-allowed"
+        >上一页</button>
+        <button
+          v-for="p in pageNumbers"
+          :key="p"
+          @click="changePage(p)"
+          :class="[
+            'px-3 py-1 text-sm rounded-lg border transition-colors',
+            p === currentPage
+              ? 'bg-blue-600 text-white border-blue-600'
+              : 'text-gray-600 bg-gray-50 border-gray-200 hover:bg-gray-100'
+          ]"
+        >{{ p }}</button>
+        <button
+          @click="changePage(currentPage + 1)"
+          :disabled="currentPage >= totalPages"
+          class="px-3 py-1 text-sm text-gray-600 bg-gray-50 border border-gray-200 rounded-lg hover:bg-gray-100 disabled:opacity-40 disabled:cursor-not-allowed"
+        >下一页</button>
+        <span class="ml-2 text-sm text-gray-500">{{ currentPage }} / {{ totalPages }} 页</span>
+      </div>
+    </div>
+
     <div v-if="logs.length > 0" class="mt-6 grid grid-cols-4 gap-4">
       <div class="bg-gray-50 rounded-xl p-4">
-        <div class="text-2xl font-bold text-gray-900">{{ logs.length }}</div>
+        <div class="text-2xl font-bold text-gray-900">{{ total }}</div>
         <div class="text-sm text-gray-500">总日志数</div>
       </div>
       <div class="bg-red-50 rounded-xl p-4">
         <div class="text-2xl font-bold text-red-600">
           {{ logs.filter(l => l.risk_level === 'high' || l.risk_level === 'critical').length }}
         </div>
-        <div class="text-sm text-red-600">高风险</div>
+        <div class="text-sm text-red-600">本页高风险</div>
       </div>
       <div class="bg-yellow-50 rounded-xl p-4">
         <div class="text-2xl font-bold text-yellow-600">
           {{ logs.filter(l => l.risk_level === 'medium').length }}
         </div>
-        <div class="text-sm text-yellow-600">中风险</div>
+        <div class="text-sm text-yellow-600">本页中风险</div>
       </div>
-      <div class="bg-green-50 rounded-xl p-4">
-        <div class="text-2xl font-bold text-green-600">
+      <div class="bg-red-50 rounded-xl p-4">
+        <div class="text-2xl font-bold text-red-600">
           {{ logs.filter(l => l.is_blocked).length }}
         </div>
-        <div class="text-sm text-green-600">已拦截</div>
+        <div class="text-sm text-red-600">本页已拦截</div>
+      </div>
+    </div>
+
+    <!-- 审计详情弹窗：完整展示所有字段 -->
+    <div v-if="detailVisible && currentLog" class="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4" @click.self="closeDetail">
+      <div class="bg-white rounded-2xl shadow-2xl max-w-3xl w-full max-h-[85vh] overflow-y-auto">
+        <div class="sticky top-0 bg-white border-b border-gray-100 px-6 py-4 flex items-center justify-between">
+          <h3 class="text-lg font-bold text-gray-900">审计日志详情</h3>
+          <button @click="closeDetail" class="text-gray-400 hover:text-gray-600 text-xl leading-none">&times;</button>
+        </div>
+        <div class="p-6 space-y-5">
+          <!-- 基本信息 -->
+          <div class="grid grid-cols-2 gap-4 text-sm">
+            <div>
+              <div class="text-xs text-gray-400 mb-1">日志ID</div>
+              <div class="text-gray-800 break-all font-mono">{{ currentLog.log_id }}</div>
+            </div>
+            <div>
+              <div class="text-xs text-gray-400 mb-1">时间戳</div>
+              <div class="text-gray-800">{{ new Date(currentLog.timestamp).toLocaleString() }}</div>
+            </div>
+            <div>
+              <div class="text-xs text-gray-400 mb-1">会话ID</div>
+              <div class="text-gray-800 break-all">{{ currentLog.session_id || '-' }}</div>
+            </div>
+            <div>
+              <div class="text-xs text-gray-400 mb-1">用户 / 角色</div>
+              <div class="text-gray-800">{{ currentLog.user_id }} / {{ currentLog.user_role }}</div>
+            </div>
+            <div>
+              <div class="text-xs text-gray-400 mb-1">动作类型</div>
+              <div class="text-gray-800">{{ getActionTypeText(currentLog.action_type) }}</div>
+            </div>
+            <div>
+              <div class="text-xs text-gray-400 mb-1">风险等级</div>
+              <span :class="['px-2 py-0.5 rounded-full text-xs font-medium', getRiskColor(currentLog.risk_level)]">
+                {{ getRiskText(currentLog.risk_level) }}
+              </span>
+            </div>
+            <div>
+              <div class="text-xs text-gray-400 mb-1">状态</div>
+              <div :class="currentLog.is_blocked ? 'text-red-600' : 'text-green-600'">
+                {{ currentLog.is_blocked ? '已拦截' : '正常' }}
+              </div>
+            </div>
+            <div>
+              <div class="text-xs text-gray-400 mb-1">审批状态</div>
+              <div class="text-gray-800">{{ currentLog.approval_status || '-' }}</div>
+            </div>
+          </div>
+
+          <!-- Think 原文（推理阶段内容不丢失） -->
+          <div>
+            <div class="text-xs text-gray-400 mb-1 font-semibold">Think 推理原文</div>
+            <div class="bg-gray-50 rounded-lg p-3 text-gray-800 text-sm whitespace-pre-wrap">
+              {{ currentLog.think_text || '（无）' }}
+            </div>
+          </div>
+
+          <!-- 操作详情 -->
+          <div>
+            <div class="text-xs text-gray-400 mb-1 font-semibold">操作详情（入参等）</div>
+            <pre class="bg-gray-50 rounded-lg p-3 text-gray-800 text-xs whitespace-pre-wrap overflow-x-auto">{{ formatDetails(currentLog.action_details) }}</pre>
+          </div>
+
+          <!-- 返回值 -->
+          <div>
+            <div class="text-xs text-gray-400 mb-1 font-semibold">返回值</div>
+            <pre class="bg-gray-50 rounded-lg p-3 text-gray-800 text-xs whitespace-pre-wrap overflow-x-auto">{{ currentLog.return_value || '-' }}</pre>
+          </div>
+
+          <!-- 阻断原因 -->
+          <div>
+            <div class="text-xs text-gray-400 mb-1 font-semibold">阻断原因</div>
+            <div class="bg-red-50 rounded-lg p-3 text-red-700 text-sm whitespace-pre-wrap">
+              {{ currentLog.blocking_reason || '（无）' }}
+            </div>
+          </div>
+
+          <!-- 检测结果 / 工具风险评估 -->
+          <div v-if="currentLog.detection_result || currentLog.tool_call_result">
+            <div class="text-xs text-gray-400 mb-1 font-semibold">检测结果 / 工具风险评估</div>
+            <pre class="bg-gray-50 rounded-lg p-3 text-gray-800 text-xs whitespace-pre-wrap overflow-x-auto">{{ formatDetails(currentLog.detection_result || currentLog.tool_call_result) }}</pre>
+          </div>
+        </div>
       </div>
     </div>
   </div>

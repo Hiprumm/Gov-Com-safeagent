@@ -37,12 +37,16 @@ def run_detection(samples: list, detector: InputDetectionService) -> list:
             elapsed_ms = (time.perf_counter() - start) * 1000
         except Exception as e:
             # 出错视为未检出
+            try:
+                fallback_source = InputSource(sample["source"])
+            except Exception:
+                fallback_source = InputSource.USER_INPUT
             result = DetectionResult(
                 risk_level=RiskLevel.NONE,
                 attack_type=None,
                 confidence=0.0,
                 evidence=[f"Error: {str(e)}"],
-                source=sample["source"],
+                source=fallback_source,
                 processed_text=sample["text"][:50]
             )
             elapsed_ms = 0

@@ -33,6 +33,9 @@ class ConversationManager:
     def list_sessions(self) -> List[Dict[str, Any]]:
         return self.storage.list_sessions()
 
+    def delete_session(self, session_id: str):
+        self.storage.delete_session(session_id)
+
 
 class FileProcessor:
     def __init__(self):
@@ -47,18 +50,38 @@ class FileProcessor:
             "file_type": file_type,
             "filename": filename
         }
-        
+
+        # 获取文件扩展名（小写）
+        ext = ""
+        if "." in filename:
+            ext = filename.rsplit(".", 1)[-1].lower()
+
         try:
             if file_type.startswith('image/'):
                 result.update(self._process_image(file_data, file_type))
-            elif file_type.startswith('text/') or filename.endswith('.txt'):
+            elif file_type.startswith('text/') or ext in ("txt", "md", "markdown", "csv", "log",
+                                                            "py", "js", "ts", "java", "c", "cpp", "h",
+                                                            "go", "rs", "rb", "php", "sh", "bat", "ps1",
+                                                            "yml", "yaml", "toml", "ini", "cfg", "conf",
+                                                            "xml", "html", "htm", "css", "scss", "sql",
+                                                            "vue", "jsx", "tsx", "swift", "kt", "scala",
+                                                            "lua", "r", "dart", "gradle", "dockerfile",
+                                                            "makefile", "gitignore", "env"):
                 result.update(self._process_text(file_data))
-            elif filename.endswith('.json'):
+            elif ext == "json" or file_type == "application/json":
                 result.update(self._process_json(file_data))
+            elif ext == "pdf":
+                result.update(self._process_pdf(file_data))
+            elif ext in ("doc", "docx"):
+                result.update(self._process_doc(file_data, ext))
+            elif ext in ("xls", "xlsx"):
+                result.update(self._process_excel(file_data, ext))
+            elif ext in ("zip", "rar", "7z", "tar", "gz", "bz2"):
+                result.update(self._process_archive(file_data, ext, filename))
             else:
-                result["content"] = f"文件类型 {file_type} 暂不支持直接解析，文件名: {filename}"
-                result["success"] = True
-            
+                # 兜底：尝试按文本解码，失败则返回二进制信息
+                result.update(self._process_unknown(file_data, file_type, filename))
+
             return result
         except Exception as e:
             result["content"] = f"文件处理失败: {str(e)}"
@@ -174,6 +197,232 @@ class FileProcessor:
                 "summary": "JSON解析失败"
             }
 
+    def _process_pdf(self, file_data: str) -> Dict[str, Any]:
+        try:
+            decoded = base64.b64decode(file_data)
+            file_size_mb = len(decoded) / (1024 * 1024)
+
+            try:
+                import fitz  # PyMuPDF
+                from io import BytesIO
+                doc = fitz.open(stream=BytesIO(decoded), filetype="pdf")
+                text_parts = []
+                for page in doc:
+                    text_parts.append(page.get_text())
+                doc.close()
+                content = "\n".join(text_parts).strip()
+
+                if content:
+                    return {
+                        "success": True,
+                        "content": content,
+                        "summary": f"PDF文件，共 {len(text_parts)} 页，{len(content)} 字符",
+                        "detection_required": True
+                    }
+                else:
+                    return {
+                        "success": True,
+                        "content": f"PDF文件已接收，大小: {file_size_mb:.2f} MB\n\n(未提取到文本内容，可能是扫描件图片)",
+                        "summary": "PDF无文本层",
+                        "detection_required": False
+                    }
+            except ImportError:
+                return {
+                    "success": True,
+                    "content": f"PDF文件已接收，大小: {file_size_mb:.2f} MB\n\n(未安装 PyMuPDF，请 pip install PyMuPDF)",
+                    "summary": "PDF已上传，PyMuPDF未安装",
+                    "detection_required": False
+                }
+        except Exception as e:
+            return {
+                "success": False,
+                "content": f"PDF解析失败: {str(e)}",
+                "summary": "PDF解析失败"
+            }
+
+    def _process_doc(self, file_data: str, ext: str) -> Dict[str, Any]:
+        try:
+            decoded = base64.b64decode(file_data)
+            file_size_mb = len(decoded) / (1024 * 1024)
+
+            try:
+                from io import BytesIO
+
+                if ext == "docx":
+                    from docx import Document
+                    doc = Document(BytesIO(decoded))
+                    paragraphs = [p.text for p in doc.paragraphs if p.text.strip()]
+                    content = "\n".join(paragraphs)
+                    return {
+                        "success": True,
+                        "content": content or f"Word文档(.docx)，大小: {file_size_mb:.2f} MB\n\n(文档无文本段落)",
+                        "summary": f"Word文档(.docx)，{len(paragraphs)} 个段落，{len(content)} 字符",
+                        "detection_required": True
+                    }
+                else:
+                    # .doc 旧格式，python-docx 不支持，尝试按二进制提取
+                    return {
+                        "success": True,
+                        "content": f"Word文档(.doc)，大小: {file_size_mb:.2f} MB\n\n(旧版.doc格式需安装 antiword 或 LibreOffice 转换)",
+                        "summary": "Word(.doc)旧格式",
+                        "detection_required": False
+                    }
+            except ImportError:
+                return {
+                    "success": True,
+                    "content": f"Word文档已接收，大小: {file_size_mb:.2f} MB\n\n(未安装 python-docx，请 pip install python-docx)",
+                    "summary": "Word已上传，python-docx未安装",
+                    "detection_required": False
+                }
+        except Exception as e:
+            return {
+                "success": False,
+                "content": f"Word解析失败: {str(e)}",
+                "summary": "Word解析失败"
+            }
+
+    def _process_excel(self, file_data: str, ext: str) -> Dict[str, Any]:
+        try:
+            decoded = base64.b64decode(file_data)
+            file_size_mb = len(decoded) / (1024 * 1024)
+
+            try:
+                from io import BytesIO
+                import openpyxl
+
+                if ext == "xlsx":
+                    wb = openpyxl.load_workbook(BytesIO(decoded), read_only=True, data_only=True)
+                else:
+                    # .xls 旧格式，openpyxl 不支持
+                    return {
+                        "success": True,
+                        "content": f"Excel文件(.xls)，大小: {file_size_mb:.2f} MB\n\n(旧版.xls格式需安装 xlrd 库)",
+                        "summary": "Excel(.xls)旧格式",
+                        "detection_required": False
+                    }
+
+                sheets_info = []
+                all_content = []
+                for sheet_name in wb.sheetnames:
+                    ws = wb[sheet_name]
+                    rows = list(ws.iter_rows(values_only=True))
+                    sheet_text = "\n".join([
+                        "\t".join(str(c) if c is not None else "" for c in row)
+                        for row in rows
+                    ])
+                    all_content.append(f"=== Sheet: {sheet_name} ({len(rows)} 行) ===\n{sheet_text}")
+                    sheets_info.append(f"{sheet_name}({len(rows)}行)")
+
+                wb.close()
+                content = "\n\n".join(all_content)
+                return {
+                    "success": True,
+                    "content": content,
+                    "summary": f"Excel文件(.xlsx)，工作表: {', '.join(sheets_info)}",
+                    "detection_required": True
+                }
+            except ImportError:
+                return {
+                    "success": True,
+                    "content": f"Excel文件已接收，大小: {file_size_mb:.2f} MB\n\n(未安装 openpyxl，请 pip install openpyxl)",
+                    "summary": "Excel已上传，openpyxl未安装",
+                    "detection_required": False
+                }
+        except Exception as e:
+            return {
+                "success": False,
+                "content": f"Excel解析失败: {str(e)}",
+                "summary": "Excel解析失败"
+            }
+
+    def _process_archive(self, file_data: str, ext: str, filename: str) -> Dict[str, Any]:
+        """压缩包：列出文件清单，不解压内容（安全考虑）"""
+        try:
+            decoded = base64.b64decode(file_data)
+            file_size_mb = len(decoded) / (1024 * 1024)
+
+            file_list = []
+            try:
+                import zipfile
+                from io import BytesIO
+
+                if ext in ("zip",):
+                    with zipfile.ZipFile(BytesIO(decoded)) as zf:
+                        file_list = zf.namelist()
+                elif ext in ("tar", "gz", "bz2"):
+                    import tarfile
+                    with tarfile.open(fileobj=BytesIO(decoded), mode="r:*") as tf:
+                        file_list = tf.getnames()
+                else:
+                    return {
+                        "success": True,
+                        "content": f"压缩包文件({ext})，大小: {file_size_mb:.2f} MB\n\n(格式 {ext} 暂不支持列出内容)",
+                        "summary": f"压缩包({ext})",
+                        "detection_required": False
+                    }
+
+                content = f"压缩包: {filename}\n大小: {file_size_mb:.2f} MB\n包含 {len(file_list)} 个文件:\n\n"
+                content += "\n".join(f"  - {f}" for f in file_list[:200])
+                if len(file_list) > 200:
+                    content += f"\n  ... 共 {len(file_list)} 个文件"
+
+                return {
+                    "success": True,
+                    "content": content,
+                    "summary": f"压缩包({ext})，{len(file_list)} 个文件",
+                    "detection_required": True
+                }
+            except Exception as e:
+                return {
+                    "success": True,
+                    "content": f"压缩包文件已接收，大小: {file_size_mb:.2f} MB\n\n(解析失败: {str(e)})",
+                    "summary": f"压缩包({ext})解析失败",
+                    "detection_required": False
+                }
+        except Exception as e:
+            return {
+                "success": False,
+                "content": f"压缩包处理失败: {str(e)}",
+                "summary": "压缩包处理失败"
+            }
+
+    def _process_unknown(self, file_data: str, file_type: str, filename: str) -> Dict[str, Any]:
+        """兜底：尝试按文本解码，失败则返回二进制信息"""
+        try:
+            decoded = base64.b64decode(file_data)
+            file_size_mb = len(decoded) / (1024 * 1024)
+
+            # 尝试按 UTF-8 解码
+            try:
+                content = decoded.decode('utf-8')
+                lines = content.split('\n')
+                return {
+                    "success": True,
+                    "content": content,
+                    "summary": f"文件({file_type})，{len(lines)} 行，{len(content)} 字符",
+                    "detection_required": True
+                }
+            except UnicodeDecodeError:
+                # 二进制文件，无法按文本解析
+                return {
+                    "success": True,
+                    "content": (
+                        f"二进制文件已接收\n"
+                        f"文件名: {filename}\n"
+                        f"类型: {file_type}\n"
+                        f"大小: {file_size_mb:.2f} MB\n\n"
+                        f"(该文件类型不支持文本解析，已记录文件信息)"
+                    ),
+                    "summary": f"二进制文件({file_type})，{file_size_mb:.2f} MB",
+                    "detection_required": False
+                }
+        except Exception as e:
+            return {
+                "success": False,
+                "content": f"文件处理失败: {str(e)}",
+                "summary": "文件处理失败"
+            }
+
 
 class GovAgent:
     def __init__(self):
@@ -193,10 +442,14 @@ class GovAgent:
                 self.llm_available = True
                 
                 self.prompt_template = ChatPromptTemplate.from_messages([
-                    ("system", """你是一个面向政企场景的安全智能体。你的职责是：
-1. 分析用户输入，决定是否需要调用工具
-2. 如果需要工具，输出工具调用列表
-3. 如果不需要工具，直接生成回答
+                    ("system", """你是一个面向政企场景的安全智能体。请结合对话历史和之前的工具执行结果，分析用户输入，判断是否需要调用工具。
+
+规则：
+1. 仅在用户明确需要执行操作（如读取文件、写入、执行命令、导出数据、搜索知识库）时才调用工具
+2. 对于普通问答、闲聊、问候等，不需要调用工具，直接回答
+3. 如果之前的工具执行结果已经足够回答用户问题，请返回空的 tool_calls 列表
+4. 每次只返回本轮需要执行的工具调用，后续步骤在下一轮迭代中决定
+5. 输出必须是合法JSON格式
 
 可用工具：
 - read_file: 读取文件内容，参数: file_path
@@ -205,22 +458,34 @@ class GovAgent:
 - export_data: 导出数据，参数: format, query
 - search_knowledge: 搜索知识库，参数: query
 
-输出格式：必须是JSON格式，包含 tool_calls 数组和 reasoning 字段。
-如果不需要工具，tool_calls 为空数组。
+输出格式：
 {{"tool_calls": [], "reasoning": "直接回答用户问题"}}
 {{"tool_calls": [{{"name": "read_file", "args": {{"file_path": "/path/to/file"}}}}], "reasoning": "需要读取文件"}}
-"""),
-                    ("human", "{user_input}")
-                ])
-                
-                self.response_template = ChatPromptTemplate.from_messages([
-                    ("system", """你是一个面向政企场景的安全智能体。请根据对话历史和工具执行结果，给出友好、专业的回答。
-注意：回答必须符合政务安全规范，不泄露敏感信息。
+
+之前的工具执行结果：
+{tool_results}
 
 对话历史：
 {conversation_history}
 """),
-                    ("human", "用户问题: {user_input}\n工具结果: {tool_results}")
+                    ("human", "用户当前输入: {user_input}")
+                ])
+                
+                self.response_template = ChatPromptTemplate.from_messages([
+                    ("system", """你是一个面向政企场景的安全智能体。请根据对话历史和当前问题，直接、准确地回答用户的问题。
+
+要求：
+1. 结合对话历史理解上下文，直接回答用户的具体问题
+2. 如果用户引用之前的对话内容（如"上面"、"之前"等），请根据对话历史进行关联回答
+3. 如果用户问"你好"，请友好回应并询问具体需求
+4. 如果用户问"你是谁"或"你叫什么"，简短介绍自己是政企安全智能体
+5. 回答必须符合政务安全规范，不泄露敏感信息
+6. 回答要具体、有针对性，不要空泛
+
+对话历史：
+{conversation_history}
+"""),
+                    ("human", "用户当前问题: {user_input}\n工具执行结果: {tool_results}")
                 ])
                 
                 self.parser = JsonOutputParser()
@@ -275,7 +540,12 @@ class GovAgent:
             {"approved": "tool_execution", "rejected": "block_response"}
         )
         
-        workflow.add_edge("tool_execution", "response_generation")
+        # T4: ReAct 循环——tool_execution 后可回到 decision_making 做下一轮迭代
+        workflow.add_conditional_edges(
+            "tool_execution",
+            self._route_after_execution,
+            {"block": "block_response", "continue": "decision_making", "end": "response_generation"}
+        )
         
         workflow.add_edge("response_generation", END)
         workflow.add_edge("block_response", END)
@@ -305,6 +575,33 @@ class GovAgent:
         if state["can_proceed"]:
             return "approved"
         return "rejected"
+
+    def _route_after_execution(self, state: AgentState) -> str:
+        """T4: ReAct 循环路由——决定是否继续下一轮迭代
+
+        终止条件（优先级从高到低）:
+        1. 运行时监控已终止会话 → block
+        2. 达到最大迭代次数 → end
+        3. LLM 未要求继续 → end
+        4. 否则 → continue（回到 decision_making）
+        """
+        session_id = state.get("session_id", "default")
+
+        # 1. 运行时一键终止检查
+        if self.security_layer.runtime_monitor.is_terminated(session_id):
+            return "block"
+
+        # 2. 最大迭代次数检查
+        iteration = state.get("react_iteration", 0)
+        max_iter = state.get("react_max_iterations", 5)
+        if iteration >= max_iter:
+            return "end"
+
+        # 3. LLM 是否要求继续 ReAct
+        if state.get("should_continue_react", False):
+            return "continue"
+
+        return "end"
     
     def risk_assessment(self, state: AgentState) -> AgentState:
         detection_results = state["detection_results"]
@@ -324,32 +621,104 @@ class GovAgent:
     
     def decision_making(self, state: AgentState) -> AgentState:
         user_input = state["user_input"]
-        
+        conversation_history = state.get("conversation_history", [])
+        session_id = state.get("session_id", "default")
+        react_iteration = state.get("react_iteration", 0)
+        prev_tool_results = state.get("tool_execution_results", [])
+
+        history_str = "\n".join([
+            f"{msg['role']}: {msg['content']}"
+            for msg in conversation_history[-10:]
+        ])
+
+        # T4: 构建之前工具执行结果摘要（供 LLM 判断是否需要继续迭代）
+        if prev_tool_results:
+            tool_results_str = "\n".join([
+                f"- 迭代{react_iteration} | {r.get('tool_name', '?')}: {r.get('result', '')[:200]}"
+                for r in prev_tool_results
+            ])
+        else:
+            tool_results_str = "（无，首轮迭代）"
+
         if self.llm_available:
             try:
                 chain = self.prompt_template | self.llm | self.parser
-                result = chain.invoke({"user_input": user_input})
-                
+                result = chain.invoke({
+                    "user_input": user_input,
+                    "conversation_history": history_str,
+                    "tool_results": tool_results_str,
+                })
+
                 tool_calls = result.get("tool_calls", [])
                 reasoning = result.get("reasoning", "")
+
+                # T4: 运行时监控——记录Think阶段
+                self.security_layer.runtime_monitor.set_user_input(session_id, user_input)
+                self.security_layer.runtime_monitor.record_think(
+                    session_id=session_id,
+                    reasoning=reasoning,
+                    proposed_tool_calls=tool_calls,
+                )
+
+                # T4: 设置 ReAct 循环标志——LLM 返回了工具调用则继续迭代
+                should_continue = len(tool_calls) > 0
+
+                # T4: 更新运行时轨迹（即使被拦截也能查看Think记录）
+                runtime_trace = self._get_runtime_trace(session_id)
+
                 return {
                     **state,
                     "tool_calls": tool_calls,
                     "llm_response": reasoning,
+                    "should_continue_react": should_continue,
+                    "runtime_trace": runtime_trace,
                     "current_step": "decision_making_completed",
                 }
             except Exception as e:
                 print(f"[WARN] LLM decision failed: {e}, falling back to rule-based selection")
-        
-        tool_calls = self._fallback_tool_selection(user_input)
-        reasoning = "使用规则匹配进行决策"
-        
+
+        # T4: 回退路径——仅首轮迭代做关键词匹配，后续迭代不再调用工具（防止无限循环）
+        if react_iteration == 0:
+            tool_calls = self._fallback_tool_selection(user_input)
+            reasoning = "使用规则匹配进行决策"
+        else:
+            tool_calls = []
+            reasoning = f"规则回退模式：第{react_iteration}轮迭代，无需更多工具调用"
+
+        # T4: 运行时监控——记录Think阶段
+        self.security_layer.runtime_monitor.set_user_input(session_id, user_input)
+        self.security_layer.runtime_monitor.record_think(
+            session_id=session_id,
+            reasoning=reasoning,
+            proposed_tool_calls=tool_calls,
+        )
+
+        # T4: 更新运行时轨迹
+        runtime_trace = self._get_runtime_trace(session_id)
+
         return {
             **state,
             "tool_calls": tool_calls,
             "llm_response": reasoning,
+            "should_continue_react": len(tool_calls) > 0,
+            "runtime_trace": runtime_trace,
             "current_step": "decision_making_completed",
         }
+
+    def _get_runtime_trace(self, session_id: str) -> List[Dict[str, Any]]:
+        """T4: 获取运行时执行轨迹（Think-Act-Observe 全流程）"""
+        trace = self.security_layer.runtime_monitor.get_session_trace(session_id)
+        return [
+            {
+                "step_id": s.step_id,
+                "step_type": s.step_type,
+                "tool_name": s.tool_name,
+                "reasoning": s.reasoning[:200] if s.reasoning else "",
+                "risk_level": s.risk_level.value,
+                "timestamp": s.timestamp,
+            }
+            for s in trace
+        ]
     
     def _fallback_tool_selection(self, user_input: str) -> List[Dict[str, Any]]:
         tool_calls = []
@@ -402,25 +771,86 @@ class GovAgent:
     
     def tool_execution(self, state: AgentState) -> AgentState:
         tool_calls = state["tool_calls"]
-        execution_results = []
-        
+        session_id = state.get("session_id", "default")
+        react_iteration = state.get("react_iteration", 0)
+
+        # T4: 执行前检查是否已被运行时监控终止
+        if self.security_layer.runtime_monitor.is_terminated(session_id):
+            return {
+                **state,
+                "tool_execution_results": state.get("tool_execution_results", []),
+                "current_step": "terminated",
+                "final_response": "会话已被安全系统终止：检测到运行时异常行为链",
+            }
+
+        # T4: 累积所有迭代的执行结果（不是替换）
+        execution_results = list(state.get("tool_execution_results", []))
+
         for tool_call in tool_calls:
             tool_name = tool_call.get("name", "")
             tool_args = tool_call.get("args", {})
-            
+
             result = {
                 "tool_name": tool_name,
                 "args": tool_args,
                 "result": f"模拟执行工具 [{tool_name}] 成功",
                 "status": "success",
-                "timestamp": "2024-01-01 12:00:00",
+                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "react_iteration": react_iteration,
             }
-            
+
             execution_results.append(result)
-        
+
+            # T4: 运行时监控——记录Observe阶段
+            self.security_layer.runtime_monitor.record_observe(
+                session_id=session_id,
+                tool_name=tool_name,
+                result=result,
+                success=True,
+            )
+
+            # 审计：记录工具返回值（审计完整性-返回值）
+            try:
+                think_text = ""
+                for s in reversed(self.security_layer.runtime_monitor.get_session_trace(session_id)):
+                    if s.step_type == "think":
+                        think_text = s.reasoning
+                        break
+                self.security_layer.audit_logger.create_log(
+                    user_id="user",
+                    user_role="user",
+                    agent_id="gov_agent",
+                    action_type="tool_execution",
+                    action_details={"tool_name": tool_name, "tool_args": tool_args,
+                                    "status": "success"},
+                    risk_level=RiskLevel.NONE,
+                    is_blocked=False,
+                    session_id=session_id,
+                    think_text=think_text,
+                    return_value=str(result.get("result", ""))[:500],
+                )
+            except Exception:
+                pass
+
+        # 获取运行时执行轨迹（包含所有迭代的 Think-Act-Observe）
+        runtime_trace = self.security_layer.runtime_monitor.get_session_trace(session_id)
+        trace_dicts = [
+            {
+                "step_id": s.step_id,
+                "step_type": s.step_type,
+                "tool_name": s.tool_name,
+                "reasoning": s.reasoning[:200] if s.reasoning else "",
+                "risk_level": s.risk_level.value,
+                "timestamp": s.timestamp,
+            }
+            for s in runtime_trace
+        ]
+
         return {
             **state,
             "tool_execution_results": execution_results,
+            "runtime_trace": trace_dicts,
+            "react_iteration": react_iteration + 1,
             "current_step": "tool_execution_completed",
         }
     
@@ -428,8 +858,16 @@ class GovAgent:
         user_input = state["user_input"]
         tool_results = state.get("tool_execution_results", [])
         conversation_history = state.get("conversation_history", [])
+        session_id = state.get("session_id", "default")
+
+        # AIGC 内容标识：构建元数据（模型信息 + 服务提供者 + 备案号）
+        from security.aigc_labeling import build_aigc_metadata, apply_aigc_label
+        aigc_metadata = build_aigc_metadata(session_id=session_id)
         
-        history_str = "\n".join([f"{msg['role']}: {msg['content'][:100]}..." for msg in conversation_history[-5:]])
+        history_str = "\n".join([
+            f"{msg['role']}: {msg['content'][:300]}"
+            for msg in conversation_history[-10:]
+        ])
         
         if self.llm_available:
             try:
@@ -442,18 +880,25 @@ class GovAgent:
                 })
                 final_response = llm_response.content
                 
+                # AIGC 标识应用（显式 + 隐式）
+                labeled = apply_aigc_label(final_response, aigc_metadata)
+                
                 self.security_layer.audit_logger.create_log(
                     user_id="user",
                     user_role="user",
                     agent_id="gov_agent",
                     action_type="response_generation",
-                    action_details={"response_length": len(final_response)},
+                    action_details={"response_length": len(final_response),
+                                    "aigc_labeled": True,
+                                    "content_id": aigc_metadata["content_id"]},
                     risk_level=RiskLevel.NONE,
+                    session_id=session_id,
                 )
                 
                 return {
                     **state,
-                    "final_response": final_response,
+                    "final_response": labeled["labeled_content"],
+                    "aigc_metadata": labeled["metadata"],
                     "current_step": "completed",
                 }
             except Exception as e:
@@ -461,18 +906,25 @@ class GovAgent:
         
         final_response = self._fallback_response(user_input, tool_results)
         
+        # AIGC 标识应用（显式 + 隐式）
+        labeled = apply_aigc_label(final_response, aigc_metadata)
+        
         self.security_layer.audit_logger.create_log(
             user_id="user",
             user_role="user",
             agent_id="gov_agent",
             action_type="response_generation",
-            action_details={"response_length": len(final_response)},
+            action_details={"response_length": len(final_response),
+                            "aigc_labeled": True,
+                            "content_id": aigc_metadata["content_id"]},
             risk_level=RiskLevel.NONE,
+            session_id=session_id,
         )
         
         return {
             **state,
-            "final_response": final_response,
+            "final_response": labeled["labeled_content"],
+            "aigc_metadata": labeled["metadata"],
             "current_step": "completed",
         }
     
@@ -563,25 +1015,65 @@ class GovAgent:
     def block_response(self, state: AgentState) -> AgentState:
         risk_level = state["risk_level"]
         detection_results = state.get("detection_results", [])
-        
+        session_id = state.get("session_id", "default")
+
+        # 收集证据，确保记忆安全检测（第6层）证据不被截断丢失
         evidence = []
+        memory_evidence = []
         for result in detection_results:
-            evidence.extend(result.evidence[:3])
-        
+            for e in result.evidence:
+                # 第6层证据单独收集，优先展示
+                if "记忆安全检测" in e or "记忆写入拦截" in e or "记忆读取拦截" in e \
+                        or "持久化注入" in e or "政务篡改" in e or "写入指令" in e \
+                        or "跨会话异常" in e or "敏感信息记忆" in e:
+                    memory_evidence.append(e)
+                else:
+                    evidence.append(e)
+        # 非记忆证据最多保留前5条，记忆证据全部保留，放在前面突出显示
+        evidence = memory_evidence + evidence[:5]
+        if memory_evidence and "记忆安全检测" not in evidence:
+            evidence.insert(0, "记忆安全检测")
+
+        # T4: 收集运行时异常告警证据
+        anomaly_alerts = state.get("anomaly_alerts", [])
+        runtime_evidence = []
+        if anomaly_alerts:
+            runtime_evidence.append("=== 运行时异常检测告警 ===")
+            for alert in anomaly_alerts:
+                runtime_evidence.append(
+                    f"[{alert.get('severity', '?').upper()}] {alert.get('alert_type', '?')}: "
+                    f"{alert.get('description', '')}"
+                )
+
+        # T4: 运行时终止信息
+        if self.security_layer.runtime_monitor.is_terminated(session_id):
+            runtime_evidence.insert(0, "=== 会话已被运行时监控终止 ===")
+
+        # T4: guard_results 中的拦截信息
+        guard_results = state.get("guard_results", [])
+        guard_evidence = []
+        for g in guard_results:
+            if not g.get("allowed", True):
+                guard_evidence.append(
+                    f"[操作守卫] {g.get('tool_name', '?')}: {g.get('reason', '')}"
+                )
+
+        all_evidence = memory_evidence + evidence[:5] + guard_evidence + runtime_evidence
+
         block_message = f"""
 您的请求已被安全系统拦截！
 
 风险等级: {risk_level.value.upper()}
 
 风险原因:
-{chr(10).join(f"- {e}" for e in evidence)}
+{chr(10).join(f"- {e}" for e in all_evidence[:20])}
 
 建议:
 - 请检查您的输入内容是否包含敏感信息
 - 如果这是正常请求，请联系管理员审批
 - 请勿尝试绕过安全检测机制
 """
-        
+
         return {
             **state,
             "final_response": block_message,
@@ -611,6 +1103,15 @@ class GovAgent:
             "final_response": None,
             "audit_logs": [],
             "llm_response": None,
+            "guard_results": [],
+            "runtime_trace": [],
+            "anomaly_alerts": [],
+            # T4: ReAct 循环控制
+            "react_iteration": 0,
+            "react_max_iterations": 5,
+            "should_continue_react": False,
+            # T5 合规：AIGC 内容标识元数据
+            "aigc_metadata": None,
         }
         
         result = self.graph.invoke(initial_state)
@@ -629,6 +1130,13 @@ class GovAgent:
             "llm_response": result.get("llm_response"),
             "session_id": session_id,
             "conversation_history": self.conversation_manager.get_history(session_id),
+            # T4: 运行时监控信息
+            "runtime_trace": result.get("runtime_trace", []),
+            "anomaly_alerts": result.get("anomaly_alerts", []),
+            "react_iteration": result.get("react_iteration", 0),
+            "guard_results": result.get("guard_results", []),
+            # T5 合规：AIGC 内容标识元数据
+            "aigc_metadata": result.get("aigc_metadata", None),
         }
     
     def run(self, user_input: str, input_source: str = "user_input", session_id: Optional[str] = None) -> Dict[str, Any]:
@@ -692,4 +1200,15 @@ class GovAgent:
         return {
             "sessions": sessions,
             "count": len(sessions)
+        }
+
+    def delete_session(self, session_id: str) -> Dict[str, Any]:
+        """删除整个历史会话（会话及全部消息）"""
+        existed = self.conversation_manager.storage.get_session(session_id) is not None
+        self.conversation_manager.delete_session(session_id)
+        return {
+            "success": True,
+            "session_id": session_id,
+            "deleted": existed,
+            "message": "会话已删除" if existed else "会话不存在或已删除"
         }

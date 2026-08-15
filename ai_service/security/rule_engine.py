@@ -54,7 +54,9 @@ class RuleEngine:
             AttackType.SQL_INJECTION: [
                 r"(?:select|insert|update|delete|drop|truncate)\s+",
                 r"(?:union|all|distinct)\s+",
-                r"(?:--|#|/\*)\s*",
+                # SQL注释: -- 和 /* 通用; # 仅匹配行内(非行首), 避免Markdown标题#误判
+                r"(?:--|/\*)\s*",
+                r"(?<=[^\n#])#\s",  # # 前面必须是非换行非#的字符(行内SQL注释)
                 r"(?:or\s+1=1|and\s+1=1|or\s+'a'='a)",
                 r"(?:or\s+'1'='1'|and\s+'1'='1')",
                 r"'?\s*or\s+'?\s*1\s*'?\s*=\s*'?\s*1",
@@ -152,6 +154,49 @@ class RuleEngine:
             "环境变量", "配置文件", "敏感信息", "隐私数据",
         ]
 
+        # T6 持续优化：动态关键词（由人工标注调优/威胁情报导入动态扩充）
+        self.dynamic_high_keywords: List[str] = []
+        self.dynamic_medium_keywords: List[str] = []
+
+    def add_keywords(self, words: List[str], level: str = "medium") -> int:
+        """动态扩充关键词库（持续优化闭环使用）
+
+        Args:
+            words: 新增关键词列表
+            level: high | medium（对应风险级别）
+
+        Returns:
+            实际新增数量（去重后）
+        """
+        added = 0
+        target = self.dynamic_high_keywords if level == "high" else self.dynamic_medium_keywords
+        for w in words:
+            w = str(w).strip()
+            if not w:
+                continue
+            if w not in target and w.lower() not in [k.lower() for k in target]:
+                target.append(w)
+                added += 1
+        return added
+
+    def remove_keywords(self, words: List[str]) -> int:
+        """移除动态关键词（持续优化闭环使用）"""
+        removed = 0
+        for w in words:
+            w = str(w).strip().lower()
+            before = len(self.dynamic_high_keywords) + len(self.dynamic_medium_keywords)
+            self.dynamic_high_keywords = [k for k in self.dynamic_high_keywords if k.lower() != w]
+            self.dynamic_medium_keywords = [k for k in self.dynamic_medium_keywords if k.lower() != w]
+            removed += (before - (len(self.dynamic_high_keywords) + len(self.dynamic_medium_keywords)))
+        return removed
+
+    def get_dynamic_keywords(self) -> Dict[str, List[str]]:
+        """返回当前动态关键词"""
+        return {
+            "high": list(self.dynamic_high_keywords),
+            "medium": list(self.dynamic_medium_keywords),
+        }
+
     def detect_by_rules(self, text: str) -> Tuple[RiskLevel, AttackType, float, List[str]]:
         evidence = []
         detected_attack_type = None
@@ -176,8 +221,9 @@ class RuleEngine:
                     detected_attack_type = attack_type
                     confidence = min(0.95, confidence + weight)
         
-        # 检测特殊字符和异常负载
-        special_chars_count = len(re.findall(r'[!@#$%^&*()_+\-=\[\]{}|;:\'",./<>?`~]', text))
+        # 检测特殊字符和异常负载（剥离PDF/Markdown结构字符后计数）
+        text_for_count = self._strip_structural_syntax(text)
+        special_chars_count = len(re.findall(r'[!@#$%^&*()_+\-=\[\]{}|;:\'",./<>?`~]', text_for_count))
         if special_chars_count > 10:
             evidence.append(f"检测到大量特殊字符（{special_chars_count}个）")
             if not detected_attack_type:
@@ -220,6 +266,19 @@ class RuleEngine:
                 if not detected_attack_type:
                     detected_attack_type = AttackType.INDIRECT_INJECTION
                 confidence = min(0.85, confidence + 0.1)
+
+        # T6 持续优化：动态关键词检测（人工调优/威胁情报导入）
+        for keyword in self.dynamic_high_keywords:
+            if keyword.lower() in decoded_text.lower():
+                evidence.append(f"检测到动态高危关键词: {keyword}")
+                detected_attack_type = AttackType.INDIRECT_INJECTION
+                confidence = min(0.95, confidence + 0.2)
+        for keyword in self.dynamic_medium_keywords:
+            if keyword.lower() in decoded_text.lower():
+                evidence.append(f"检测到动态中危关键词: {keyword}")
+                if not detected_attack_type:
+                    detected_attack_type = AttackType.INDIRECT_INJECTION
+                confidence = min(0.85, confidence + 0.1)
         
         if confidence >= 0.85:
             risk_level = RiskLevel.CRITICAL
@@ -233,3 +292,51 @@ class RuleEngine:
             risk_level = RiskLevel.NONE
         
         return risk_level, detected_attack_type, confidence, evidence
+
+    def _strip_structural_syntax(self, text: str) -> str:
+        """
+        剥离PDF/Markdown结构语法字符，避免结构字符被误计为特殊字符。
+
+        - PDF: %PDF头、/Key、/Key (value)、<< >>、obj/endobj、stream/endstream、BT/Tj/ET、trailer
+        - Markdown: #标题、[text](url)、![alt](url)、```代码块``"、`行内代码`、- *列表、|表格|
+        """
+        stripped = text
+
+        # --- PDF 结构语法 ---
+        if stripped.startswith('%PDF'):
+            stripped = re.sub(r'%PDF-\d+\.\d+', '', stripped)
+            stripped = re.sub(r'/\w+\s*\([^)]*\)', '', stripped)          # /Title (content)
+            stripped = re.sub(r'/\w+\s+', '', stripped)                    # /Type /Catalog 等
+            stripped = re.sub(r'\d+\s+\d+\s+obj\b', '', stripped)          # 1 0 obj
+            stripped = re.sub(r'\bendobj\b', '', stripped)
+            stripped = re.sub(r'\bstream\b.*?\bendstream\b', '', stripped, flags=re.DOTALL)
+            stripped = re.sub(r'\btrailer\b\s*<<', '', stripped)
+            stripped = re.sub(r'<<\s*/\w+.*?>>', '', stripped, flags=re.DOTALL)
+            stripped = re.sub(r'\bBT\b.*?\bET\b', '', stripped, flags=re.DOTALL)
+            stripped = re.sub(r'\/Root\s+\d+\s+\d+\s+\w+', '', stripped)
+
+        # --- Markdown 结构语法 ---
+        stripped = re.sub(r'^#{1,6}\s', '', stripped, flags=re.MULTILINE)  # # 标题
+        stripped = re.sub(r'\[([^\]]+)\]\([^)]+\)', r'\1', stripped)       # [text](url) → text
+        stripped = re.sub(r'!\[([^\]]*)\]\([^)]+\)', '', stripped)         # ![alt](url)
+        stripped = re.sub(r'```.*?```', '', stripped, flags=re.DOTALL)     # 代码块
+        stripped = re.sub(r'`[^`]+`', '', stripped)                        # 行内代码
+        stripped = re.sub(r'^\s*[-*+]\s', '', stripped, flags=re.MULTILINE)  # 列表项
+        stripped = re.sub(r'^\|.*\|$', '', stripped, flags=re.MULTILINE)    # 表格行
+
+        return stripped
+
+
+# ============================================================================
+# 单例：确保动态调优关键词在检测流水线各实例间共享
+# ============================================================================
+
+_rule_engine_instance: Optional[RuleEngine] = None
+
+
+def get_rule_engine() -> RuleEngine:
+    """获取全局共享的规则引擎实例（持续优化闭环的动态关键词依赖共享）"""
+    global _rule_engine_instance
+    if _rule_engine_instance is None:
+        _rule_engine_instance = RuleEngine()
+    return _rule_engine_instance

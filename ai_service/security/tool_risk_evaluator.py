@@ -121,11 +121,6 @@ class ToolRiskEvaluator:
             risk_level = RiskLevel.MEDIUM
             risk_details.append(f"工具 [{tool_name}] 风险等级未知")
         
-        if param_risk_details:
-            risk_score = min(1.0, risk_score + 0.3)
-            risk_level = RiskLevel.CRITICAL
-            risk_details.extend(param_risk_details)
-        
         if not has_permission:
             risk_score = min(1.0, risk_score + 0.2)
             risk_details.append(f"用户角色 [{user_role}] 无权限执行此操作")
@@ -139,11 +134,20 @@ class ToolRiskEvaluator:
         elif risk_score > 0:
             risk_level = RiskLevel.LOW
         
+        # 参数级敏感风险始终为 CRITICAL，不被分数阈值降级
+        if param_risk_details:
+            risk_score = min(1.0, risk_score + 0.3)
+            risk_level = RiskLevel.CRITICAL
+            risk_details.extend(param_risk_details)
+        
         if risk_level in [RiskLevel.HIGH, RiskLevel.CRITICAL]:
-            requires_approval = True
-            approval_level = "admin"
+            # 用户无权限或参数级敏感风险时必须审批；管理员且有权限且无敏感参数时放行
+            if not has_permission or param_risk_details:
+                requires_approval = True
+                approval_level = "admin"
         
         return ToolRiskResult(
+            tool_name=tool_name,
             risk_level=risk_level,
             risk_score=round(risk_score, 2),
             risk_details=risk_details,

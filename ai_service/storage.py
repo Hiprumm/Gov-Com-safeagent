@@ -5,7 +5,7 @@ SQLite 持久化存储模块
 import sqlite3
 import json
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Dict, Any, List, Optional
 from threading import Lock
 from contextlib import contextmanager
@@ -135,6 +135,22 @@ class Storage:
             ).fetchall()
         return [self._row_to_dict(r) for r in rows]
 
+    def get_audit_logs_page(self, page: int = 1, page_size: int = 20) -> List[Dict[str, Any]]:
+        """分页查询审计日志（按时间倒序），page 从 1 开始"""
+        offset = max(0, (page - 1) * page_size)
+        with self._get_conn() as conn:
+            rows = conn.execute(
+                "SELECT * FROM audit_logs ORDER BY timestamp DESC, rowid DESC LIMIT ? OFFSET ?",
+                (page_size, offset)
+            ).fetchall()
+        return [self._row_to_dict(r) for r in rows]
+
+    def count_audit_logs(self) -> int:
+        """统计审计日志总条数"""
+        with self._get_conn() as conn:
+            row = conn.execute("SELECT COUNT(*) FROM audit_logs").fetchone()
+        return row[0] if row else 0
+
     def get_audit_log_by_id(self, log_id: str) -> Optional[Dict[str, Any]]:
         with self._get_conn() as conn:
             row = conn.execute(
@@ -164,6 +180,33 @@ class Storage:
         params.append(limit)
         with self._get_conn() as conn:
             rows = conn.execute(query, params).fetchall()
+        return [self._row_to_dict(r) for r in rows]
+
+    def delete_audit_logs_older_than(self, days: int) -> int:
+        """按等保2.0留存策略删除超过留存期限的审计日志，返回删除条数"""
+        with self._lock:
+            with self._get_conn() as conn:
+                cutoff = (datetime.now() - timedelta(days=days)).isoformat()
+                cur = conn.execute(
+                    "DELETE FROM audit_logs WHERE timestamp < ?", (cutoff,)
+                )
+                return cur.rowcount
+
+    def get_last_audit_log(self) -> Optional[Dict[str, Any]]:
+        """获取最近一条审计日志（用于哈希链链接）"""
+        with self._get_conn() as conn:
+            row = conn.execute(
+                "SELECT * FROM audit_logs ORDER BY timestamp DESC, rowid DESC LIMIT 1"
+            ).fetchone()
+        return self._row_to_dict(row) if row else None
+
+    def get_audit_logs_ordered(self, limit: int = 100000) -> List[Dict[str, Any]]:
+        """按时间正序获取全部审计日志（用于哈希链完整性校验）"""
+        with self._get_conn() as conn:
+            rows = conn.execute(
+                "SELECT * FROM audit_logs ORDER BY timestamp ASC, rowid ASC LIMIT ?",
+                (limit,),
+            ).fetchall()
         return [self._row_to_dict(r) for r in rows]
 
     # ==================== 审批记录 ====================
@@ -203,7 +246,7 @@ class Storage:
         with self._lock:
             with self._get_conn() as conn:
                 conn.execute(
-                    """UPDATE approvals
+                    """UPDATE approval_requests
                     SET status = ?, approver_id = ?, approver_role = ?,
                         reason = ?, updated_at = ?
                     WHERE request_id = ?
@@ -215,7 +258,7 @@ class Storage:
         with self._lock:
             with self._get_conn() as conn:
                 rows = conn.execute(
-                    "SELECT * FROM approvals WHERE status = 'pending' ORDER BY created_at DESC"
+                    "SELECT * FROM approval_requests WHERE status = 'pending' ORDER BY created_at DESC"
                 ).fetchall()
                 return [dict(r) for r in rows]
 
@@ -224,7 +267,7 @@ class Storage:
         with self._lock:
             with self._get_conn() as conn:
                 rows = conn.execute(
-                    "SELECT * FROM approvals WHERE session_id = ? ORDER BY created_at DESC",
+                    "SELECT * FROM approval_requests WHERE session_id = ? ORDER BY created_at DESC",
                     (session_id,)
                 ).fetchall()
                 return [dict(r) for r in rows]
@@ -259,7 +302,7 @@ class Storage:
     def get_history(self, session_id: str, limit: int = 20) -> List[Dict[str, Any]]:
         with self._get_conn() as conn:
             rows = conn.execute(
-                "SELECT role, content, type, timestamp FROM conversation_history WHERE session_id = ? ORDER BY id ASC LIMIT ?",
+                "SELECT id, role, content, type, timestamp FROM conversation_history WHERE session_id = ? ORDER BY id ASC LIMIT ?",
                 (session_id, limit)
             ).fetchall()
         return [dict(r) for r in rows]
@@ -296,6 +339,24 @@ class Storage:
                     "UPDATE sessions SET updated_at = ?, message_count = 0 WHERE session_id = ?",
                     (datetime.now().isoformat(), session_id)
                 )
+
+    def truncate_messages_from(self, session_id: str, message_id: int):
+        """删除指定ID及之后的所有消息（用于撤回/编辑）"""
+        with self._lock:
+            with self._get_conn() as conn:
+                cursor = conn.execute(
+                    "DELETE FROM conversation_history WHERE session_id = ? AND id >= ?",
+                    (session_id, message_id)
+                )
+                remaining = conn.execute(
+                    "SELECT COUNT(*) FROM conversation_history WHERE session_id = ?",
+                    (session_id,)
+                ).fetchone()[0]
+                conn.execute(
+                    "UPDATE sessions SET updated_at = ?, message_count = ? WHERE session_id = ?",
+                    (datetime.now().isoformat(), remaining, session_id)
+                )
+                return cursor.rowcount
 
     def delete_session(self, session_id: str):
         with self._lock:

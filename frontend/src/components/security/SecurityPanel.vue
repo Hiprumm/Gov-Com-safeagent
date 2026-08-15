@@ -1448,7 +1448,6 @@ onMounted(() => {
       ref="fileInput"
       type="file"
       class="hidden"
-      accept=".txt,.json,.md"
       @change="detectFile"
     />
     <input
@@ -1462,7 +1461,6 @@ onMounted(() => {
       ref="kbPdfInput"
       type="file"
       class="hidden"
-      accept=".pdf"
       @change="detectKBPoisoning"
     />
   </div>

@@ -73,6 +73,8 @@ const getRiskBgColor = (riskLevel: string) => {
 
 const getRiskText = (riskLevel: string) => {
   switch (riskLevel) {
+    case 'critical':
+      return '严重风险'
     case 'high':
       return '高风险'
     case 'medium':
