@@ -18,7 +18,6 @@ class ToolRiskEvaluator:
         }
         
         self.medium_risk_tools = {
-            "file_read": ["read_file", "open_file", "view_file", "list_dir"],
             "database_read": ["select", "query", "search", "lookup"],
             "data_export": ["export", "download", "backup", "extract"],
             "internal_api": ["intranet", "internal", "private_api"],
@@ -26,6 +25,8 @@ class ToolRiskEvaluator:
         
         self.low_risk_tools = {
             "information": ["get_info", "query_status", "help", "search_knowledge"],
+            # 方向B-3：只读操作无副作用，归为 low（user 角色可执行，无需审批）
+            "file_read": ["read_file", "open_file", "view_file", "list_dir", "list_files"],
             "calculation": ["calculate", "compute", "sum", "analyze"],
             "formatting": ["format", "convert", "transform", "parse"],
             "utility": ["log", "trace", "debug", "monitor"],

@@ -13,6 +13,10 @@ from datetime import datetime, timedelta
 from typing import Dict, Any, Optional, List
 from models.schemas import AuditLog, RiskLevel, DetectionResult, ToolRiskResult, PluginScanResult
 from storage import get_storage
+# 方向A-6：分级审计签名（HIGH 加 ZKP，让审计链更强防篡改）
+from audit.graded_signer import (
+    GradedAuditSigner, AgentIdentity, AuditActionType, SensitivityLevel, SignedAuditRecord,
+)
 
 
 # 当前请求来源IP（由 main.py 中间件设置，供审计日志记录来源IP要素）
@@ -104,11 +108,33 @@ class AuditLogger:
         self.storage = get_storage()
         self._signing_key = _load_signing_key()
         self._lock = threading.Lock()
+        # 方向A-6：分级审计签名器（HIGH 加 ZKP，MEDIUM 加 Agent 签名）
+        try:
+            self._graded_signer = GradedAuditSigner(AgentIdentity("gov_agent"))
+        except Exception:
+            self._graded_signer = None
         # 启动时按留存策略清理过期日志（尽力而为，不影响启动）
         try:
             self.apply_retention_policy()
         except Exception:
             pass
+
+    # ------------------------------------------------------------------
+    # 方向A-6：动作类型 → 敏感度映射（决定签名强度）
+    # ------------------------------------------------------------------
+
+    def _map_action_type(self, action_type: str) -> AuditActionType:
+        """字符串 action_type → AuditActionType 枚举（决定签名强度）"""
+        at = (action_type or "").lower()
+        if "exec" in at or "command" in at or "block" in at:
+            return AuditActionType.EXECUTE      # HIGH：命令执行/阻断
+        if "export" in at or "network" in at or "remote" in at or "exfil" in at:
+            return AuditActionType.NETWORK     # HIGH：网络外发
+        if "write" in at or "save" in at or "modify" in at or "update" in at:
+            return AuditActionType.WRITE_LOCAL  # MEDIUM：本地写入
+        if "approval" in at or "approve" in at:
+            return AuditActionType.APPROVAL    # MEDIUM：审批
+        return AuditActionType.READ            # LOW：只读
 
     # ------------------------------------------------------------------
     # 日志创建（含哈希链 + 签名 + 等保2.0要素）
@@ -181,6 +207,29 @@ class AuditLogger:
             log_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
             signature = hmac.new(self._signing_key, log_hash.encode(), hashlib.sha256).hexdigest()
 
+            # 方向A-6：分级签名（HIGH 加 ZKP，MEDIUM 加 Agent 签名）
+            graded_sensitivity = ""
+            graded_hmac = ""
+            graded_agent_sig = ""
+            graded_zkp = ""
+            if self._graded_signer:
+                try:
+                    graded_action = self._map_action_type(action_type)
+                    graded_record = self._graded_signer.sign_record(
+                        log_id=log_id,
+                        timestamp=timestamp.isoformat(),
+                        prev_hash=prev_hash,
+                        content={"log_hash": log_hash, "action_type": action_type,
+                                 "user_id": user_id, "agent_id": agent_id},
+                        action_type=graded_action,
+                    )
+                    graded_sensitivity = graded_record.sensitivity.value
+                    graded_hmac = graded_record.hmac_signature
+                    graded_agent_sig = graded_record.agent_signature
+                    graded_zkp = graded_record.zkp_proof
+                except Exception:
+                    pass
+
             extra_data = {
                 "session_id": session_id,
                 "think_text": think_text,
@@ -192,6 +241,10 @@ class AuditLogger:
                 "log_hash": log_hash,
                 "prev_hash": prev_hash,
                 "signature": signature,
+                "graded_sensitivity": graded_sensitivity,
+                "graded_hmac": graded_hmac,
+                "graded_agent_signature": graded_agent_sig,
+                "graded_zkp_proof": graded_zkp,
             }
 
             log = AuditLog(
@@ -311,6 +364,114 @@ class AuditLogger:
             "legacy": legacy,
             "tampered": tampered,
             "retention_days": AUDIT_RETENTION_DAYS,
+        }
+
+    def verify_graded_chain(self) -> Dict[str, Any]:
+        """校验分级审计签名链完整性（方向A-6）
+
+        遍历所有日志，重建 SignedAuditRecord 并调用 GradedAuditSigner.verify_record：
+        - LOW（只读）：校验 HMAC
+        - MEDIUM（本地写入）：校验 HMAC + Agent 签名
+        - HIGH（命令执行/网络外发）：校验 HMAC + Agent 签名 + ZKP 证明
+
+        返回:
+            {
+                "ok": bool,
+                "total": int,
+                "graded_checked": int,   # 有分级签名的记录数
+                "graded_passed": int,
+                "legacy": int,           # 无分级签名的旧记录
+                "by_sensitivity": {"low": n, "medium": n, "high": n},
+                "tampered": [...],
+            }
+        """
+        if not self._graded_signer:
+            return {
+                "ok": False,
+                "error": "graded_signer 未初始化，无法验签",
+                "total": self.storage.count_audit_logs(),
+            }
+
+        logs = self.storage.get_audit_logs_ordered()
+        graded_checked = 0
+        graded_passed = 0
+        legacy = 0
+        by_sensitivity = {"low": 0, "medium": 0, "high": 0}
+        tampered: List[Dict[str, Any]] = []
+
+        for d in logs:
+            extra = _parse_extra(d)
+            graded_hmac = extra.get("graded_hmac", "")
+            if not graded_hmac:
+                legacy += 1
+                continue
+
+            log_id = d.get("log_id", "")
+            log_hash = extra.get("log_hash", "")
+            action_type = d.get("action_type", "")
+            user_id = d.get("user_id", "")
+            agent_id = d.get("agent_id", "")
+            sensitivity_str = extra.get("graded_sensitivity", "low")
+            # 归一到 by_sensitivity 键
+            sens_key = sensitivity_str if sensitivity_str in by_sensitivity else "low"
+            by_sensitivity[sens_key] += 1
+
+            # 重建签名时的 content（与 sign_record 调用点保持一致）
+            content = {
+                "log_hash": log_hash,
+                "action_type": action_type,
+                "user_id": user_id,
+                "agent_id": agent_id,
+            }
+            content_str = json.dumps(content, sort_keys=True, ensure_ascii=False, default=str)
+            content_hash = hashlib.sha256(content_str.encode("utf-8")).hexdigest()
+
+            record = SignedAuditRecord(
+                log_id=log_id,
+                timestamp=d.get("timestamp", ""),
+                sensitivity=SensitivityLevel(sensitivity_str) if sensitivity_str in [s.value for s in SensitivityLevel] else SensitivityLevel.LOW,
+                content_hash=content_hash,
+                prev_hash=extra.get("prev_hash", ""),
+                hmac_signature=graded_hmac,
+                agent_signature=extra.get("graded_agent_signature", ""),
+                zkp_proof=extra.get("graded_zkp_proof", ""),
+            )
+
+            try:
+                ok = self._graded_signer.verify_record(record, content)
+            except Exception as e:
+                ok = False
+                tampered.append({
+                    "log_id": log_id,
+                    "type": "verify_exception",
+                    "detail": str(e),
+                })
+
+            if ok:
+                graded_passed += 1
+            else:
+                # 定位具体失败类型
+                fail_type = "graded_signature_mismatch"
+                if record.sensitivity == SensitivityLevel.HIGH and not record.zkp_proof:
+                    fail_type = "missing_zkp_proof"
+                elif record.sensitivity in (SensitivityLevel.MEDIUM, SensitivityLevel.HIGH) and not record.agent_signature:
+                    fail_type = "missing_agent_signature"
+                tampered.append({
+                    "log_id": log_id,
+                    "type": fail_type,
+                    "sensitivity": record.sensitivity.value,
+                })
+
+            graded_checked += 1
+
+        return {
+            "ok": len(tampered) == 0,
+            "total": len(logs),
+            "graded_checked": graded_checked,
+            "graded_passed": graded_passed,
+            "legacy": legacy,
+            "by_sensitivity": by_sensitivity,
+            "tampered": tampered,
         }
 
     def get_chain_head(self) -> Dict[str, str]:

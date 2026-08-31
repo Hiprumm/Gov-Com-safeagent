@@ -1,0 +1,153 @@
+{
+  "total": 335,
+  "attacks": 275,
+  "normals": 60,
+  "accuracy": 0.8299,
+  "precision": 0.9823,
+  "recall": 0.8073,
+  "f1": 0.8862,
+  "miss_rate": 0.1927,
+  "fp_rate": 0.0667,
+  "tp": 222,
+  "fn": 53,
+  "fp": 4,
+  "tn": 56,
+  "avg_latency_ms": 4916.1,
+  "by_type": {
+    "prompt_injection": {
+      "total": 58,
+      "detected": 48,
+      "missed": 10
+    },
+    "jailbreak": {
+      "total": 11,
+      "detected": 7,
+      "missed": 4
+    },
+    "data_leakage": {
+      "total": 40,
+      "detected": 31,
+      "missed": 9
+    },
+    "content_injection": {
+      "total": 17,
+      "detected": 17,
+      "missed": 0
+    },
+    "command_injection": {
+      "total": 38,
+      "detected": 37,
+      "missed": 1
+    },
+    "network_attack": {
+      "total": 2,
+      "detected": 2,
+      "missed": 0
+    },
+    "data_exfiltration": {
+      "total": 9,
+      "detected": 7,
+      "missed": 2
+    },
+    "data_poisoning": {
+      "total": 12,
+      "detected": 3,
+      "missed": 9
+    },
+    "web_content_injection": {
+      "total": 2,
+      "detected": 2,
+      "missed": 0
+    },
+    "hidden_text_steganography": {
+      "total": 2,
+      "detected": 2,
+      "missed": 0
+    },
+    "document_embedded_injection": {
+      "total": 3,
+      "detected": 3,
+      "missed": 0
+    },
+    "macro_injection": {
+      "total": 1,
+      "detected": 1,
+      "missed": 0
+    },
+    "dde_injection": {
+      "total": 1,
+      "detected": 1,
+      "missed": 0
+    },
+    "markdown_injection": {
+      "total": 1,
+      "detected": 1,
+      "missed": 0
+    },
+    "indirect_injection": {
+      "total": 4,
+      "detected": 4,
+      "missed": 0
+    },
+    "memory_poisoning": {
+      "total": 21,
+      "detected": 14,
+      "missed": 7
+    },
+    "tool_descriptor_poisoning": {
+      "total": 7,
+      "detected": 6,
+      "missed": 1
+    },
+    "mcp_poisoning": {
+      "total": 4,
+      "detected": 4,
+      "missed": 0
+    },
+    "skill_tampering": {
+      "total": 12,
+      "detected": 10,
+      "missed": 2
+    },
+    "combined_attack": {
+      "total": 12,
+      "detected": 8,
+      "missed": 4
+    },
+    "unauthorized_access": {
+      "total": 3,
+      "detected": 3,
+      "missed": 0
+    },
+    "privilege_escalation": {
+      "total": 3,
+      "detected": 3,
+      "missed": 0
+    },
+    "data_destruction": {
+      "total": 1,
+      "detected": 1,
+      "missed": 0
+    },
+    "excessive_agency": {
+      "total": 2,
+      "detected": 2,
+      "missed": 0
+    },
+    "content_safety": {
+      "total": 6,
+      "detected": 3,
+      "missed": 3
+    },
+    "sql_injection": {
+      "total": 2,
+      "detected": 2,
+      "missed": 0
+    },
+    "gradual_escalation": {
+      "total": 1,
+      "detected": 0,
+      "missed": 1
+    }
+  }
+}

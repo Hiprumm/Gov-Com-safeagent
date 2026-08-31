@@ -104,6 +104,9 @@ TOOL_NAME_BLACKLIST_PATTERNS = [
 
 # 3. 参数值黑名单（参数值含这些内容直接拦）
 PARAM_VALUE_BLACKLIST_PATTERNS = [
+    # 路径遍历（无论哪个参数，含 ../ 或 ..\ 直接拦）
+    r"\.\./",
+    r"\.\.\\",
     # 系统破坏命令
     r"rm\s+-rf\s+/",
     r"del\s+/[sS]\s+/[qQ]",

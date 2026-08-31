@@ -25,7 +25,7 @@ from security.input_detector import InputDetectionService
 from security.tool_risk_evaluator import ToolRiskEvaluator
 from security.approval_engine import ApprovalEngine
 from security.kb_poisoning_detector import KBPoisoningDetector
-from security.session_risk_accumulator import SessionRiskAccumulator
+from security.session_risk_accumulator import SessionRiskAccumulator, session_risk_accumulator
 from security.adversarial_mutator import BypassTester
 from security.cross_source_correlator import CrossSourceCorrelator, get_cross_source_correlator
 from plugins.plugin_scanner import PluginScanner
@@ -110,7 +110,7 @@ input_detector = InputDetectionService()
 tool_evaluator = ToolRiskEvaluator()
 approval_engine = ApprovalEngine()
 kb_poisoning_detector = KBPoisoningDetector()
-session_risk_accumulator = SessionRiskAccumulator()
+# 复用模块级单例，与 correlation_analyzer 内部的 accumulator 保持一致（否则累积与查询实例不一致）
 cross_source_correlator = get_cross_source_correlator()
 # BypassTester 用 input_detector 的 detect_single_input 作为检测函数
 bypass_tester = BypassTester(
@@ -156,18 +156,9 @@ async def detect_input(request: BatchDetectionRequest):
 @app.post("/api/security/detect_single")
 async def detect_single(text: str, source: str = "user_input", session_id: Optional[str] = None):
     try:
-        result = input_detector.detect_single_input(text, source)
-
-        # 记录到 session 风险累积
-        if session_id:
-            session_risk_accumulator.record_event(
-                session_id=session_id,
-                source=source,
-                risk_level=result.risk_level if hasattr(result, 'risk_level') else RiskLevel.NONE,
-                attack_type=result.attack_type.value if result.attack_type else None,
-                confidence=result.confidence,
-                details={"text_preview": text[:100]},
-            )
+        # 传入 session_id，让 detect_single_input 内部的关联分析按 session 正确累积
+        # （修复：原实现未传 session_id，导致所有请求累积到 "default" session，正常样本被污染）
+        result = input_detector.detect_single_input(text, source, session_id=session_id or "default")
 
         # 记录审计日志
         audit_logger.create_log(
@@ -541,6 +532,25 @@ async def reject_approval(request_id: str, approver_id: str, comments: Optional[
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/api/security/approval/pending")
+async def get_pending_approvals():
+    """获取所有待审批的请求
+
+    注意：本路由必须注册在 /api/security/approval/{request_id} 之前，
+    否则 "pending" 会被当作 request_id 匹配（历史缺陷：前端审批面板
+    一直显示"暂无待审批请求"即由此导致）。
+    """
+    try:
+        pending = approval_engine.list_pending()
+        pending_dicts = [r.dict() for r in pending]
+        return {
+            "pending": pending_dicts,
+            "count": len(pending_dicts),
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.get("/api/security/approval/{request_id}", response_model=ApprovalRequest)
 async def get_approval(request_id: str):
     try:
@@ -821,6 +831,21 @@ async def verify_audit_chain():
     """校验审计日志哈希链与签名完整性（防篡改）"""
     try:
         return audit_logger.verify_chain()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/audit/logs/verify-graded")
+async def verify_graded_chain():
+    """校验分级审计签名链完整性（方向A-6）
+
+    分级验签：
+    - LOW（只读）：HMAC
+    - MEDIUM（本地写入）：HMAC + Agent 签名
+    - HIGH（命令执行/网络外发）：HMAC + Agent 签名 + ZKP 证明
+    """
+    try:
+        return audit_logger.verify_graded_chain()
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -1373,34 +1398,77 @@ async def health_check():
 
 # ==================== 审批管理 API ====================
 
-@app.get("/api/security/approval/pending")
-async def get_pending_approvals():
-    """获取所有待审批的请求"""
-    try:
-        pending = approval_engine.list_pending()
-        pending_dicts = [r.dict() for r in pending]
-        return {
-            "pending": pending_dicts,
-            "count": len(pending_dicts),
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
 @app.post("/api/security/approval/approve/{request_id}")
 async def approve_request(request_id: str, approver_comment: str = ""):
-    """审批通过指定的请求"""
+    """审批通过指定的请求
+
+    异步审批流（B-2/B-5 联动）：批准时立即授予会话能力令牌 + 解锁会话工具，
+    用户重试原请求时自动放行，无需重复审批。
+    """
     try:
-        approved = approval_engine.approve_request(request_id, "admin", approver_comment)
-        if not approved:
+        # 注意参数顺序：approve_request(request_id, approver_id, approver_role, comments)
+        # 历史缺陷曾把 "admin" 传成 approver_id 而 approver_role 为空 → 角色层级不足
+        # 静默拒绝（DB 状态不更新但端点仍返回成功）
+        result = approval_engine.approve_request(
+            request_id,
+            approver_id="admin_panel",
+            approver_role="admin",
+            comments=approver_comment,
+        )
+        if result.status not in ("approved", "auto_approved"):
             return {
                 "success": False,
-                "message": f"审批请求 {request_id} 不存在或已处理"
+                "message": f"审批未通过: {result.status}"
+                           + (f"（{result.comments}）" if result.comments else ""),
             }
+
+        # B-2/B-5：从审批单提取会话与工具信息 → 授予能力 + 会话级解锁
+        grant_info = {"session_id": None, "tool_name": None}
+        try:
+            record = approval_engine.get_request(request_id)
+            if record is not None:
+                details = dict(record.action_details or {})
+                # 守卫类审批单：tool_name 在 action_details 顶层；工具类在 _tool_name
+                sid = details.get("_session_id")
+                tname = details.get("_tool_name") or details.get("tool_name")
+                # action_type 形如 tool_call_export_data / guard_export_data
+                if not tname and record.action_type:
+                    for prefix in ("tool_call_", "guard_"):
+                        if record.action_type.startswith(prefix):
+                            tname = record.action_type[len(prefix):]
+                            break
+                if sid and tname:
+                    gov_agent.security_layer.capability_tokens.grant_for_tool(sid, tname)
+                    gov_agent.security_layer.record_session_unlock(sid, tname)
+                    grant_info = {"session_id": sid, "tool_name": tname}
+                    # 联动清理：同一请求可能产生两张审批单（tool_risk + guard 各一张），
+                    # 批准其一即解锁会话，另一张若继续 pending 会成为垃圾数据 → 一并标记
+                    try:
+                        for p in approval_engine.list_pending():
+                            pdet = dict(p.action_details or {})
+                            psid = pdet.get("_session_id")
+                            ptool = pdet.get("_tool_name") or pdet.get("tool_name")
+                            if psid == sid and ptool == tname and p.request_id != request_id:
+                                approval_engine.approve_request(
+                                    p.request_id, "system", "super_admin",
+                                    "关联审批单已批准（同会话同工具联动）"
+                                )
+                    except Exception:
+                        pass
+        except Exception as grant_err:
+            # 授予失败不阻断审批本身，仅记录（重试路径会在 check_approval 兜底授予）
+            audit_logger.create_log(
+                user_id="admin", user_role="admin", agent_id="security_panel",
+                action_type="approval_grant_warning",
+                action_details={"request_id": request_id, "error": str(grant_err)},
+                risk_level=RiskLevel.LOW,
+                is_blocked=False,
+            )
+
         audit_logger.create_log(
             user_id="admin", user_role="admin", agent_id="security_panel",
             action_type="approval_approved",
-            action_details={"request_id": request_id, "comment": approver_comment},
+            action_details={"request_id": request_id, "comment": approver_comment, **grant_info},
             risk_level=RiskLevel.NONE,
             is_blocked=False,
         )
@@ -1408,9 +1476,13 @@ async def approve_request(request_id: str, approver_comment: str = ""):
         import asyncio
         asyncio.create_task(push_approval_update(
             request_id=request_id, action="approved",
-            detail={"comment": approver_comment}
+            detail={"comment": approver_comment, **grant_info}
         ))
-        return {"success": True, "message": f"请求 {request_id} 已审批通过"}
+        return {
+            "success": True,
+            "message": f"请求 {request_id} 已审批通过",
+            **grant_info,
+        }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -1420,7 +1492,7 @@ async def reject_request(request_id: str, reason: str = ""):
     """驳回指定的请求"""
     try:
         rejected = approval_engine.reject_request(request_id, "admin", reason)
-        if not rejected:
+        if rejected.status not in ("rejected", "approved", "auto_approved"):
             return {
                 "success": False,
                 "message": f"审批请求 {request_id} 不存在或已处理"
@@ -1635,6 +1707,84 @@ async def run_bypass_test(request: dict):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# ==================== PSSU 自适应攻击自评估 API（创新点5 接入） ====================
+
+@app.post("/api/security/pssu/assess")
+async def run_pssu_assess(request: dict):
+    """
+    方向A-7：PSSU 自适应攻击自评估（第 5 个创新点接入）
+
+    用真实 input_detector 作为防御，跑 PSSU 自适应攻击（种子模板 + 变异），
+    量化防御的真实突破率——暴露静态样本测试测不出的弱点。
+
+    请求体:
+    {
+        "target_defense": "input_detector",   // 目标防御名称
+        "max_iterations": 8,                   // 可选，进化迭代上限，默认 8
+        "success_threshold": 0.8               // 可选，攻击成功阈值，默认 0.8
+    }
+    """
+    try:
+        from audit.pssu_attack import PSSURunner, AttackerType
+
+        target_defense = request.get("target_defense", "input_detector")
+        max_iterations = int(request.get("max_iterations", 8))
+        success_threshold = float(request.get("success_threshold", 0.8))
+
+        # 风险等级 → 0-1 风险分（PSSU 依据 risk_score 判断攻击是否突破防御）
+        risk_map = {
+            RiskLevel.NONE: 0.0, RiskLevel.LOW: 0.2,
+            RiskLevel.MEDIUM: 0.5, RiskLevel.HIGH: 0.8, RiskLevel.CRITICAL: 1.0,
+        }
+
+        def defense_fn(payload: str):
+            # skip_llm=True：PSSU 自适应攻击需反复调用防御（毫秒级），
+            # 只评估快速判定层（规则+AI+向量），不触发 LLM（15s/次会拖垮评估）
+            result = input_detector.detect_single_input(
+                payload, "user_input", session_id="pssu-assess", skip_llm=True
+            )
+            blocked = result.risk_level in (RiskLevel.HIGH, RiskLevel.CRITICAL)
+            risk_score = risk_map.get(result.risk_level, 0.5)
+            return (blocked, risk_score, {
+                "risk_level": result.risk_level.value,
+                "attack_type": result.attack_type.value if result.attack_type else None,
+            })
+
+        runner = PSSURunner(max_iterations=max_iterations, success_threshold=success_threshold)
+        result = runner.assess_defense(target_defense=target_defense, defense_fn=defense_fn)
+        summary = runner.summary(result)
+
+        # 记录审计日志
+        audit_logger.create_log(
+            user_id="anonymous", user_role="user", agent_id="security_panel",
+            action_type="pssu_assess",
+            action_details={
+                "target_defense": target_defense,
+                "breakthrough_achieved": summary["breakthrough_achieved"],
+                "defense_break_rate": summary["defense_break_rate"],
+                "total_attempts": summary["total_attempts"],
+            },
+            risk_level=RiskLevel.HIGH if summary["breakthrough_achieved"] else RiskLevel.MEDIUM,
+            is_blocked=False,
+        )
+
+        return {
+            "success": True,
+            **summary,
+            # 突破 payload 示例（红队自评估，暴露防御真实弱点用）
+            "breakthrough_payload": (
+                result.breakthrough_attempt.payload if result.breakthrough_attempt else None
+            ),
+            "breakthrough_metadata": (
+                result.breakthrough_attempt.metadata if result.breakthrough_attempt else None
+            ),
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.post("/api/security/bypass_batch_test")
 async def run_bypass_batch_test(request: dict):
     """
@@ -1724,8 +1874,7 @@ async def run_scenario(scenario_id: str):
     try:
         if not _has_scenario_engine:
             raise HTTPException(status_code=503, detail="场景演示引擎未就绪")
-        results = scenario_engine.run_scenario_with_builtin_detector(scenario_id)
-        report = scenario_engine.generate_demo_report(scenario_id, results)
+        results, report = scenario_engine.run_scenario_with_builtin_detector(scenario_id)
 
         # 记录审计日志
         audit_logger.create_log(
@@ -1747,21 +1896,22 @@ async def run_scenario(scenario_id: str):
             "report": {
                 "total_steps": report.total_steps,
                 "attack_steps": report.attack_steps,
-                "attacks_detected": report.attacks_detected,
-                "false_positives": report.false_positives,
+                "normal_steps": report.normal_steps,
+                "blocked_count": report.blocked_count,
+                "passed_count": report.passed_count,
                 "detection_rate": report.detection_rate,
                 "false_positive_rate": report.false_positive_rate,
                 "summary": report.summary,
             },
             "results": [{
                 "step_id": r.step_id,
-                "role": r.role,
-                "message": r.message[:100],
+                "user_message": r.user_message[:100],
                 "is_attack": r.is_attack,
                 "passed": r.passed,
-                "risk_level": r.risk_level,
-                "confidence": r.confidence,
-                "expected_action": r.expected_action,
+                "expected_action": r.expected_security_action,
+                "actual_action": r.actual_security_action,
+                "risk_level": r.detection_result.risk_level.value if r.detection_result else None,
+                "confidence": r.detection_result.confidence if r.detection_result else 0.0,
             } for r in results],
         }
     except HTTPException:
@@ -1778,10 +1928,37 @@ async def run_all_scenarios():
             raise HTTPException(status_code=503, detail="场景演示引擎未就绪")
         all_results = scenario_engine.run_all_scenarios()
 
+        # all_results: Dict[scenario_id, ScenarioReport]
+        scenarios = []
+        total_steps = total_attacks = total_blocked = 0
+        for sid, rep in all_results.items():
+            scenarios.append({
+                "scenario_id": sid,
+                "scenario_name": rep.scenario_name,
+                "total_steps": rep.total_steps,
+                "attack_steps": rep.attack_steps,
+                "normal_steps": rep.normal_steps,
+                "blocked_count": rep.blocked_count,
+                "passed_count": rep.passed_count,
+                "detection_rate": rep.detection_rate,
+                "false_positive_rate": rep.false_positive_rate,
+                "summary": rep.summary,
+            })
+            total_steps += rep.total_steps
+            total_attacks += rep.attack_steps
+            total_blocked += rep.blocked_count
+
+        overall_rate = (total_blocked / total_attacks) if total_attacks else 0.0
         return {
             "success": True,
-            "overall": all_results["overall"],
-            "scenarios": all_results["scenarios"],
+            "overall": {
+                "total_scenarios": len(all_results),
+                "total_steps": total_steps,
+                "total_attacks": total_attacks,
+                "total_blocked": total_blocked,
+                "overall_detection_rate": overall_rate,
+            },
+            "scenarios": scenarios,
         }
     except HTTPException:
         raise

@@ -114,13 +114,13 @@ const getRiskColor = (riskLevel: string) => {
   switch (riskLevel) {
     case 'high':
     case 'critical':
-      return 'text-red-600 bg-red-100'
+      return 'text-critical bg-critical/15'
     case 'medium':
-      return 'text-yellow-600 bg-yellow-100'
+      return 'text-medium bg-medium/15'
     case 'low':
-      return 'text-blue-600 bg-blue-100'
+      return 'text-low bg-low/15'
     default:
-      return 'text-green-600 bg-green-100'
+      return 'text-safe bg-safe/15'
   }
 }
 
@@ -166,15 +166,15 @@ onMounted(() => {
   <div class="h-full">
     <div class="flex items-center justify-between mb-4">
       <div class="flex items-center gap-3">
-        <h2 class="text-xl font-bold text-gray-900">审计日志</h2>
-        <span v-if="retentionDays" class="px-2 py-1 text-xs text-gray-500 bg-gray-100 rounded-full">
+        <h2 class="text-xl font-bold text-primary">审计日志</h2>
+        <span v-if="retentionDays" class="px-2 py-1 text-xs text-muted bg-elevated rounded-full">
           日志留存：{{ retentionText }}
         </span>
       </div>
       <button
         @click="loadLogs"
         :disabled="isLoading"
-        class="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition-colors disabled:bg-gray-300"
+        class="px-4 py-2 bg-gradient-to-r from-accent to-low text-white rounded-lg hover:opacity-90 transition-all active:scale-95 disabled:opacity-40"
       >
         <span v-if="isLoading">刷新中...</span>
         <span v-else>刷新</span>
@@ -183,27 +183,27 @@ onMounted(() => {
     <div class="overflow-x-auto">
       <table class="w-full text-sm">
         <thead>
-          <tr class="bg-gray-50">
-            <th class="text-left px-4 py-3 font-semibold text-gray-600">时间</th>
-            <th class="text-left px-4 py-3 font-semibold text-gray-600">用户</th>
-            <th class="text-left px-4 py-3 font-semibold text-gray-600">动作</th>
-            <th class="text-left px-4 py-3 font-semibold text-gray-600">风险等级</th>
-            <th class="text-left px-4 py-3 font-semibold text-gray-600">状态</th>
-            <th class="text-left px-4 py-3 font-semibold text-gray-600">会话ID</th>
-            <th class="text-left px-4 py-3 font-semibold text-gray-600">详情</th>
+          <tr class="bg-elevated">
+            <th class="text-left px-4 py-3 font-semibold text-secondary">时间</th>
+            <th class="text-left px-4 py-3 font-semibold text-secondary">用户</th>
+            <th class="text-left px-4 py-3 font-semibold text-secondary">动作</th>
+            <th class="text-left px-4 py-3 font-semibold text-secondary">风险等级</th>
+            <th class="text-left px-4 py-3 font-semibold text-secondary">状态</th>
+            <th class="text-left px-4 py-3 font-semibold text-secondary">会话ID</th>
+            <th class="text-left px-4 py-3 font-semibold text-secondary">详情</th>
           </tr>
         </thead>
         <tbody>
-          <tr v-for="log in logs" :key="log.log_id" class="border-b border-gray-100 hover:bg-gray-50">
-            <td class="px-4 py-3 text-gray-600 whitespace-nowrap">
+          <tr v-for="log in logs" :key="log.log_id" class="border-b border-border-default hover:bg-elevated/50 animate-list-in">
+            <td class="px-4 py-3 text-secondary whitespace-nowrap">
               {{ new Date(log.timestamp).toLocaleString() }}
             </td>
             <td class="px-4 py-3">
               <span class="font-medium">{{ log.user_id }}</span>
-              <span class="text-xs text-gray-400 ml-1">{{ log.user_role }}</span>
+              <span class="text-xs text-disabled ml-1">{{ log.user_role }}</span>
             </td>
             <td class="px-4 py-3">
-              <span class="text-blue-600">{{ getActionTypeText(log.action_type) }}</span>
+              <span class="text-accent">{{ getActionTypeText(log.action_type) }}</span>
             </td>
             <td class="px-4 py-3">
               <span :class="['px-2 py-1 rounded-full text-xs font-medium', getRiskColor(log.risk_level)]">
@@ -211,24 +211,24 @@ onMounted(() => {
               </span>
             </td>
             <td class="px-4 py-3">
-              <span :class="log.is_blocked ? 'text-red-600' : 'text-green-600'">
+              <span :class="log.is_blocked ? 'text-critical' : 'text-safe'">
                 {{ log.is_blocked ? '已拦截' : '正常' }}
               </span>
             </td>
-            <td class="px-4 py-3 text-gray-500">
+            <td class="px-4 py-3 text-muted">
               {{ log.session_id || '-' }}
             </td>
             <td class="px-4 py-3">
               <button
                 @click="openDetail(log)"
-                class="px-2 py-1 text-xs text-blue-600 bg-blue-50 rounded hover:bg-blue-100 transition-colors"
+                class="px-2 py-1 text-xs text-accent bg-accent/10 rounded hover:bg-accent/20 transition-all active:scale-95"
               >
                 查看详情
               </button>
             </td>
           </tr>
           <tr v-if="logs.length === 0">
-            <td colspan="7" class="text-center py-8 text-gray-500">
+            <td colspan="7" class="text-center py-8 text-muted">
               <div v-if="isLoading">加载中...</div>
               <div v-else>暂无审计日志</div>
             </td>
@@ -237,15 +237,15 @@ onMounted(() => {
       </table>
     </div>
     <!-- 分页控件 -->
-    <div class="mt-4 flex items-center justify-between">
-      <div class="flex items-center gap-2 text-sm text-gray-500">
+    <div class="mt-4 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3">
+      <div class="flex items-center gap-2 text-sm text-muted">
         <span>共 {{ total }} 条日志</span>
-        <span class="mx-2 text-gray-300">|</span>
+        <span class="mx-2 text-disabled">|</span>
         <span>每页</span>
         <select
           :value="pageSize"
           @change="changePageSize(Number(($event.target as HTMLSelectElement).value))"
-          class="px-2 py-1 border border-gray-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+          class="px-2 py-1 border border-border-default rounded-lg text-sm text-primary focus:outline-none focus:ring-2 focus:ring-accent/20"
         >
           <option :value="20">20 条</option>
           <option :value="50">50 条</option>
@@ -255,133 +255,133 @@ onMounted(() => {
         <button
           @click="changePage(currentPage - 1)"
           :disabled="currentPage <= 1"
-          class="px-3 py-1 text-sm text-gray-600 bg-gray-50 border border-gray-200 rounded-lg hover:bg-gray-100 disabled:opacity-40 disabled:cursor-not-allowed"
+          class="px-3 py-1 text-sm text-secondary bg-elevated border border-border-default rounded-lg hover:bg-hover transition-all active:scale-95 disabled:opacity-40 disabled:cursor-not-allowed"
         >上一页</button>
         <button
           v-for="p in pageNumbers"
           :key="p"
           @click="changePage(p)"
           :class="[
-            'px-3 py-1 text-sm rounded-lg border transition-colors',
+            'px-3 py-1 text-sm rounded-lg border transition-all active:scale-95',
             p === currentPage
-              ? 'bg-blue-600 text-white border-blue-600'
-              : 'text-gray-600 bg-gray-50 border-gray-200 hover:bg-gray-100'
+              ? 'bg-accent text-white border-accent'
+              : 'text-secondary bg-elevated border-border-default hover:bg-hover'
           ]"
         >{{ p }}</button>
         <button
           @click="changePage(currentPage + 1)"
           :disabled="currentPage >= totalPages"
-          class="px-3 py-1 text-sm text-gray-600 bg-gray-50 border border-gray-200 rounded-lg hover:bg-gray-100 disabled:opacity-40 disabled:cursor-not-allowed"
+          class="px-3 py-1 text-sm text-secondary bg-elevated border border-border-default rounded-lg hover:bg-hover transition-all active:scale-95 disabled:opacity-40 disabled:cursor-not-allowed"
         >下一页</button>
-        <span class="ml-2 text-sm text-gray-500">{{ currentPage }} / {{ totalPages }} 页</span>
+        <span class="ml-2 text-sm text-muted">{{ currentPage }} / {{ totalPages }} 页</span>
       </div>
     </div>
 
-    <div v-if="logs.length > 0" class="mt-6 grid grid-cols-4 gap-4">
-      <div class="bg-gray-50 rounded-xl p-4">
-        <div class="text-2xl font-bold text-gray-900">{{ total }}</div>
-        <div class="text-sm text-gray-500">总日志数</div>
+    <div v-if="logs.length > 0" class="mt-6 grid grid-cols-2 lg:grid-cols-4 gap-4">
+      <div class="bg-elevated/50 rounded-xl p-4">
+        <div class="text-2xl font-bold text-primary">{{ total }}</div>
+        <div class="text-sm text-muted">总日志数</div>
       </div>
-      <div class="bg-red-50 rounded-xl p-4">
-        <div class="text-2xl font-bold text-red-600">
+      <div class="bg-critical/10 rounded-xl p-4">
+        <div class="text-2xl font-bold text-critical">
           {{ logs.filter(l => l.risk_level === 'high' || l.risk_level === 'critical').length }}
         </div>
-        <div class="text-sm text-red-600">本页高风险</div>
+        <div class="text-sm text-critical">本页高风险</div>
       </div>
-      <div class="bg-yellow-50 rounded-xl p-4">
-        <div class="text-2xl font-bold text-yellow-600">
+      <div class="bg-medium/10 rounded-xl p-4">
+        <div class="text-2xl font-bold text-medium">
           {{ logs.filter(l => l.risk_level === 'medium').length }}
         </div>
-        <div class="text-sm text-yellow-600">本页中风险</div>
+        <div class="text-sm text-medium">本页中风险</div>
       </div>
-      <div class="bg-red-50 rounded-xl p-4">
-        <div class="text-2xl font-bold text-red-600">
+      <div class="bg-critical/10 rounded-xl p-4">
+        <div class="text-2xl font-bold text-critical">
           {{ logs.filter(l => l.is_blocked).length }}
         </div>
-        <div class="text-sm text-red-600">本页已拦截</div>
+        <div class="text-sm text-critical">本页已拦截</div>
       </div>
     </div>
 
     <!-- 审计详情弹窗：完整展示所有字段 -->
-    <div v-if="detailVisible && currentLog" class="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4" @click.self="closeDetail">
-      <div class="bg-white rounded-2xl shadow-2xl max-w-3xl w-full max-h-[85vh] overflow-y-auto">
-        <div class="sticky top-0 bg-white border-b border-gray-100 px-6 py-4 flex items-center justify-between">
-          <h3 class="text-lg font-bold text-gray-900">审计日志详情</h3>
-          <button @click="closeDetail" class="text-gray-400 hover:text-gray-600 text-xl leading-none">&times;</button>
+    <div v-if="detailVisible && currentLog" class="fixed inset-0 bg-black/60 backdrop-blur-sm z-50 flex items-center justify-center p-4" @click.self="closeDetail">
+      <div class="bg-surface rounded-2xl shadow-2xl border border-border-default max-w-3xl w-full max-h-[85vh] overflow-y-auto">
+        <div class="sticky top-0 bg-surface border-b border-border-default px-6 py-4 flex items-center justify-between">
+          <h3 class="text-lg font-bold text-primary">审计日志详情</h3>
+          <button @click="closeDetail" class="text-muted hover:text-primary text-xl leading-none transition-all active:scale-95">&times;</button>
         </div>
         <div class="p-6 space-y-5">
           <!-- 基本信息 -->
-          <div class="grid grid-cols-2 gap-4 text-sm">
+          <div class="grid grid-cols-1 sm:grid-cols-2 gap-4 text-sm">
             <div>
-              <div class="text-xs text-gray-400 mb-1">日志ID</div>
-              <div class="text-gray-800 break-all font-mono">{{ currentLog.log_id }}</div>
+              <div class="text-xs text-muted mb-1">日志ID</div>
+              <div class="text-primary break-all font-mono">{{ currentLog.log_id }}</div>
             </div>
             <div>
-              <div class="text-xs text-gray-400 mb-1">时间戳</div>
-              <div class="text-gray-800">{{ new Date(currentLog.timestamp).toLocaleString() }}</div>
+              <div class="text-xs text-muted mb-1">时间戳</div>
+              <div class="text-primary">{{ new Date(currentLog.timestamp).toLocaleString() }}</div>
             </div>
             <div>
-              <div class="text-xs text-gray-400 mb-1">会话ID</div>
-              <div class="text-gray-800 break-all">{{ currentLog.session_id || '-' }}</div>
+              <div class="text-xs text-muted mb-1">会话ID</div>
+              <div class="text-primary break-all">{{ currentLog.session_id || '-' }}</div>
             </div>
             <div>
-              <div class="text-xs text-gray-400 mb-1">用户 / 角色</div>
-              <div class="text-gray-800">{{ currentLog.user_id }} / {{ currentLog.user_role }}</div>
+              <div class="text-xs text-muted mb-1">用户 / 角色</div>
+              <div class="text-primary">{{ currentLog.user_id }} / {{ currentLog.user_role }}</div>
             </div>
             <div>
-              <div class="text-xs text-gray-400 mb-1">动作类型</div>
-              <div class="text-gray-800">{{ getActionTypeText(currentLog.action_type) }}</div>
+              <div class="text-xs text-muted mb-1">动作类型</div>
+              <div class="text-primary">{{ getActionTypeText(currentLog.action_type) }}</div>
             </div>
             <div>
-              <div class="text-xs text-gray-400 mb-1">风险等级</div>
+              <div class="text-xs text-muted mb-1">风险等级</div>
               <span :class="['px-2 py-0.5 rounded-full text-xs font-medium', getRiskColor(currentLog.risk_level)]">
                 {{ getRiskText(currentLog.risk_level) }}
               </span>
             </div>
             <div>
-              <div class="text-xs text-gray-400 mb-1">状态</div>
-              <div :class="currentLog.is_blocked ? 'text-red-600' : 'text-green-600'">
+              <div class="text-xs text-muted mb-1">状态</div>
+              <div :class="currentLog.is_blocked ? 'text-critical' : 'text-safe'">
                 {{ currentLog.is_blocked ? '已拦截' : '正常' }}
               </div>
             </div>
             <div>
-              <div class="text-xs text-gray-400 mb-1">审批状态</div>
-              <div class="text-gray-800">{{ currentLog.approval_status || '-' }}</div>
+              <div class="text-xs text-muted mb-1">审批状态</div>
+              <div class="text-primary">{{ currentLog.approval_status || '-' }}</div>
             </div>
           </div>
 
           <!-- Think 原文（推理阶段内容不丢失） -->
           <div>
-            <div class="text-xs text-gray-400 mb-1 font-semibold">Think 推理原文</div>
-            <div class="bg-gray-50 rounded-lg p-3 text-gray-800 text-sm whitespace-pre-wrap">
+            <div class="text-xs text-muted mb-1 font-semibold">Think 推理原文</div>
+            <div class="bg-elevated/50 rounded-lg p-3 text-primary text-sm whitespace-pre-wrap">
               {{ currentLog.think_text || '（无）' }}
             </div>
           </div>
 
           <!-- 操作详情 -->
           <div>
-            <div class="text-xs text-gray-400 mb-1 font-semibold">操作详情（入参等）</div>
-            <pre class="bg-gray-50 rounded-lg p-3 text-gray-800 text-xs whitespace-pre-wrap overflow-x-auto">{{ formatDetails(currentLog.action_details) }}</pre>
+            <div class="text-xs text-muted mb-1 font-semibold">操作详情（入参等）</div>
+            <pre class="bg-elevated/50 rounded-lg p-3 text-primary text-xs whitespace-pre-wrap overflow-x-auto">{{ formatDetails(currentLog.action_details) }}</pre>
           </div>
 
           <!-- 返回值 -->
           <div>
-            <div class="text-xs text-gray-400 mb-1 font-semibold">返回值</div>
-            <pre class="bg-gray-50 rounded-lg p-3 text-gray-800 text-xs whitespace-pre-wrap overflow-x-auto">{{ currentLog.return_value || '-' }}</pre>
+            <div class="text-xs text-muted mb-1 font-semibold">返回值</div>
+            <pre class="bg-elevated/50 rounded-lg p-3 text-primary text-xs whitespace-pre-wrap overflow-x-auto">{{ currentLog.return_value || '-' }}</pre>
           </div>
 
           <!-- 阻断原因 -->
           <div>
-            <div class="text-xs text-gray-400 mb-1 font-semibold">阻断原因</div>
-            <div class="bg-red-50 rounded-lg p-3 text-red-700 text-sm whitespace-pre-wrap">
+            <div class="text-xs text-muted mb-1 font-semibold">阻断原因</div>
+            <div class="bg-critical/10 rounded-lg p-3 text-critical text-sm whitespace-pre-wrap">
               {{ currentLog.blocking_reason || '（无）' }}
             </div>
           </div>
 
           <!-- 检测结果 / 工具风险评估 -->
           <div v-if="currentLog.detection_result || currentLog.tool_call_result">
-            <div class="text-xs text-gray-400 mb-1 font-semibold">检测结果 / 工具风险评估</div>
-            <pre class="bg-gray-50 rounded-lg p-3 text-gray-800 text-xs whitespace-pre-wrap overflow-x-auto">{{ formatDetails(currentLog.detection_result || currentLog.tool_call_result) }}</pre>
+            <div class="text-xs text-muted mb-1 font-semibold">检测结果 / 工具风险评估</div>
+            <pre class="bg-elevated/50 rounded-lg p-3 text-primary text-xs whitespace-pre-wrap overflow-x-auto">{{ formatDetails(currentLog.detection_result || currentLog.tool_call_result) }}</pre>
           </div>
         </div>
       </div>

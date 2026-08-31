@@ -19,6 +19,8 @@ class AgentState(TypedDict):
     tool_execution_results: List[Dict[str, Any]]
     approval_requests: List[Dict[str, Any]]
     approval_status: Dict[str, str]
+    # 异步审批：待人工审批事项（request_id/tool_name/risk_level），非空时 current_step=approval_pending
+    pending_human_approval: List[Dict[str, Any]]
     plugin_scan_results: List[Dict[str, Any]]
     conversation_history: List[Dict[str, str]]
     current_step: str
@@ -34,3 +36,8 @@ class AgentState(TypedDict):
     should_continue_react: bool
     # T5 合规：AIGC 内容标识元数据
     aigc_metadata: Optional[Dict[str, Any]]
+    # 方向A：创新点接入 graph —— Plan IR + 序列级风险评估
+    plan_ir: Optional[Any]                            # PlanIR 对象（tool_selection 后构建）
+    sequence_risk_assessment: Optional[Dict[str, Any]]  # 序列评估结果（to_dict）
+    # 方向A-5：输出过滤——response_generation 后对 final_response 做敏感数据脱敏
+    output_filter_result: Optional[Dict[str, Any]]   # 脱敏摘要（filtered_count/by_type/has_critical）

@@ -12,6 +12,7 @@ from security.chain_analyzer import ChainAnalyzer, ChainAlert
 from security.cross_source_correlator import get_cross_source_correlator
 from security.memory_guard import MemoryGuard
 from security.operation_guard import get_operation_guard, OperationIntent
+from security.capability_token import get_capability_token_manager
 from security.runtime_monitor import get_runtime_monitor
 from security.tool_permission_matrix import PermissionMatrix, PermissionLevel
 from security.browser_access_control import BrowserAccessController
@@ -34,6 +35,13 @@ class SecurityLayer:
         self.runtime_monitor = get_runtime_monitor()
         self.permission_matrix = PermissionMatrix()
         self.browser_controller = BrowserAccessController()
+        # 方向B-5：会话级审批解锁缓存（session_id -> {tool_name: 解锁时间戳}）
+        # 一次审批通过后，同一会话内同类工具调用复用解锁，不再重复审批
+        import threading
+        self._session_unlocks: Dict[str, Dict[str, float]] = {}
+        self._unlock_lock = threading.Lock()
+        # 方向B-2：会话级能力令牌（默认最小权限，审批解锁后授予危险能力）
+        self.capability_tokens = get_capability_token_manager()
 
     def detect_input(self, state: AgentState) -> AgentState:
         user_input = state["user_input"]
@@ -208,7 +216,11 @@ class SecurityLayer:
                     user_role="user",
                     agent_id="gov_agent",
                     action_type=f"tool_call_{tool_name}",
-                    action_details=tool_args,
+                    action_details={
+                        **tool_args,
+                        "_session_id": state.get("session_id", "default"),
+                        "_tool_name": tool_name,
+                    },
                     risk_level=risk_result.risk_level
                 )
                 approval_requests.append(approval_request.dict())
@@ -327,6 +339,7 @@ class SecurityLayer:
                         "tool_name": tool_name,
                         "tool_args": tool_args,
                         "guard_reason": guard_result.approval_reason,
+                        "_session_id": session_id,
                     },
                     risk_level=guard_result.risk_level,
                 )
@@ -498,49 +511,108 @@ class SecurityLayer:
             "current_step": "tool_evaluation_completed",
         }
 
-    def check_approval(self, state: AgentState) -> AgentState:
-        """审批检查: 轮询等待最多30秒,超时则拒绝"""
+    @staticmethod
+    def _extract_tool_name(action_type: str) -> str:
+        """从 action_type（如 tool_call_export_data / guard_write_file）提取工具名"""
+        for prefix in ("tool_call_", "guard_"):
+            if action_type.startswith(prefix):
+                return action_type[len(prefix):]
+        return action_type
+
+    def is_session_unlocked(self, session_id: str, tool_name: str) -> bool:
+        """方向B-5：检查会话内是否已解锁该工具（一次审批、N 次复用）"""
+        with self._unlock_lock:
+            unlocks = self._session_unlocks.get(session_id, {})
+            return tool_name in unlocks
+
+    def record_session_unlock(self, session_id: str, tool_name: str) -> None:
+        """方向B-5：审批通过后记录会话级解锁，后续同类工具复用"""
         import time
+        with self._unlock_lock:
+            self._session_unlocks.setdefault(session_id, {})[tool_name] = time.time()
+
+    def check_approval(self, state: AgentState) -> AgentState:
+        """异步审批检查：已批准/已解锁/低风险立即放行；仍待审的立即返回"待人工审批"。
+
+        设计变更（原 30 秒同步轮询 → 异步）：
+        - 原设计：同步阻塞 30 秒/请求等待人工点击，超时自动拒绝。管理员实际上
+          不可能在 30 秒内完成"看到→打开面板→审查→批准"，导致人工审批流
+          在同步轮询下永远无法成功（HTTP 请求挂起 60 秒+后全部超时拒绝）。
+        - 新设计：需要人工审批的请求持久 pending（不拒绝），立即返回提示；
+          管理员任意时间在审批面板批准（approve 端点同步授予能力+解锁会话）；
+          用户重试时命中会话解锁（B-5）自动放行。
+        """
         approval_requests = state["approval_requests"]
         approval_status = {}
-        
-        max_wait = 30  # 最大等待秒数
-        poll_interval = 2  # 轮询间隔
-        waited = 0
+        session_id = state.get("session_id", "default")
+        pending_human = []  # 待人工审批的 (request_id, tool_name, risk)
 
         for request in approval_requests:
             request_id = request.get("request_id", "")
-            # 从数据库实时查状态
-            while waited < max_wait:
-                request_data = self.approval_engine.get_request(request_id)
-                if request_data and request_data.status == "approved":
-                    approval_status[request_id] = "approved"
-                    break
-                elif request_data and request_data.status == "rejected":
-                    approval_status[request_id] = "rejected"
-                    break
-                elif request_data and request_data.status == "auto_approved":
-                    approval_status[request_id] = "auto_approved"
-                    break
-                # 如果风险低,自动审批通过(无需等待人工)
-                risk = request.get("risk_level", "none")
-                if risk in ["none", "low"]:
-                    self.approval_engine.approve_request(request_id, "system", "auto: low risk")
-                    approval_status[request_id] = "auto_approved"
-                    break
-                # 轮询等待
-                time.sleep(poll_interval)
-                waited += poll_interval
-            else:
-                # 超时: 拒绝
-                approval_status[request_id] = "timeout"
-                self.approval_engine.reject_request(request_id, "system", "审批超时自动拒绝")
+            action_type = request.get("action_type", "")
+            tool_name = self._extract_tool_name(action_type)
 
-        all_approved = all(status in ["approved", "auto_approved"] for status in approval_status.values())
+            # 方向B-5：会话内已解锁该工具（此前人工审批过）→ 直接放行
+            # 能力令牌已在此前审批通过时授予，无需重复
+            if self.is_session_unlocked(session_id, tool_name):
+                # 系统代批用 super_admin 角色（approve_request 的角色层级检查
+                # 会拒绝低层级代批，导致审批单永远停留在 pending）
+                self.approval_engine.approve_request(
+                    request_id, "system", "super_admin",
+                    "session unlock (B-5: 一次审批 N 次复用)"
+                )
+                approval_status[request_id] = "auto_approved"
+                continue
+
+            # 风险低 → 自动审批通过（无需人工）
+            risk = request.get("risk_level", "none")
+            risk_str = risk.value if hasattr(risk, "value") else str(risk)
+            if risk_str in ("none", "low"):
+                self.approval_engine.approve_request(
+                    request_id, "system", "super_admin", "auto: low risk"
+                )
+                approval_status[request_id] = "auto_approved"
+                # 方向B-2：注意——"低风险自动通过"不授予能力令牌。
+                # 能力治理只信任人工审批（或其会话解锁），不信任风险分级：
+                # 风险误判为 low 的危险工具在 tool_execution 仍会被令牌默认 deny。
+                continue
+
+            # 查询当前状态：管理员可能已批准（用户重试场景）
+            request_data = self.approval_engine.get_request(request_id)
+            if request_data is not None:
+                if request_data.status == "approved":
+                    approval_status[request_id] = "approved"
+                    # 方向B-5：审批通过后记录会话级解锁
+                    self.record_session_unlock(session_id, tool_name)
+                    # 方向B-2：人工审批通过 → 授予该工具所需能力（限定范围）
+                    self.capability_tokens.grant_for_tool(session_id, tool_name)
+                    continue
+                if request_data.status == "auto_approved":
+                    approval_status[request_id] = "auto_approved"
+                    self.capability_tokens.grant_for_tool(session_id, tool_name)
+                    self.record_session_unlock(session_id, tool_name)
+                    continue
+                if request_data.status == "rejected":
+                    approval_status[request_id] = "rejected"
+                    continue
+
+            # 仍 pending → 人工审批流（异步）：不阻塞、不拒绝，持久等待管理员处理
+            approval_status[request_id] = "pending"
+            pending_human.append({
+                "request_id": request_id,
+                "tool_name": tool_name,
+                "risk_level": risk_str,
+            })
+
+        all_approved = all(
+            status in ("approved", "auto_approved") for status in approval_status.values()
+        )
+        any_rejected = any(status == "rejected" for status in approval_status.values())
 
         return {
             **state,
             "approval_status": approval_status,
-            "can_proceed": all_approved,
+            "can_proceed": all_approved and not any_rejected and not pending_human,
+            "pending_human_approval": pending_human,
             "current_step": "approval_check_completed",
         }

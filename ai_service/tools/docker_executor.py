@@ -42,6 +42,15 @@ NETWORK_WHITELIST = [
     "knowledge.internal",  # 内部知识库
 ]
 
+# 沙箱工作目录（受限真执行：read_file 仅允许读取该目录下的文件）
+SANDBOX_WORKSPACE = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "data", "workspace",
+)
+
+# 只读文件大小上限（字节）
+MAX_READ_BYTES = 4096
+
 
 @dataclass
 class ToolResult:
@@ -178,7 +187,7 @@ class DockerToolExecutor:
 
         try:
             if tool_name == "read_file":
-                output = self._sim_read_file(args)
+                output = self._local_read_file(args)
             elif tool_name == "search_knowledge":
                 output = self._sim_search_knowledge(args)
             elif tool_name == "send_email":
@@ -211,25 +220,44 @@ class DockerToolExecutor:
                 sandbox_mode="local",
             )
 
-    # ==================== 本地模拟工具实现 ====================
+    # ==================== 本地受限真执行实现 ====================
 
-    def _sim_read_file(self, args: dict) -> str:
-        """模拟读取文件（返回示例内容）"""
-        path = args.get("path", "")
+    def _ensure_workspace(self) -> str:
+        """确保沙箱工作目录存在，并放入示例文件（受限真执行）"""
+        if not os.path.isdir(SANDBOX_WORKSPACE):
+            os.makedirs(SANDBOX_WORKSPACE, exist_ok=True)
+        # 首次执行时放一个示例文件，供 read_file 真实读取
+        sample = os.path.join(SANDBOX_WORKSPACE, "welcome.txt")
+        if not os.path.isfile(sample):
+            with open(sample, "w", encoding="utf-8") as f:
+                f.write("SafeAgent 沙箱工作区\n")
+                f.write("这是受限真执行环境，仅允许读取本目录下的文件。\n")
+        return SANDBOX_WORKSPACE
 
-        # 安全校验：禁止路径遍历
-        if ".." in path:
-            return "[拒绝] 路径包含非法字符"
+    def _local_read_file(self, args: dict) -> str:
+        """受限真执行：白名单路径内真实读取文件（禁止路径遍历/绝对路径逃逸）"""
+        path = args.get("file_path") or args.get("path", "")
 
-        file_samples = {
-            "/etc/config.json": '{"app_name": "SafeAgent", "version": "4.0"}',
-            "/data/report_2026.txt": "2026年度政务工作报告\n城市治理: 优秀\n智慧服务: 良好",
-            "/var/log/system.log": "[INFO] 系统启动完成\n[INFO] 安全模块加载成功",
-        }
-        if path in file_samples:
-            return file_samples[path]
+        # 安全校验：禁止路径遍历、绝对路径、盘符
+        if not path or ".." in path or path.startswith(("/", "\\")) or ":" in path:
+            return "[安全拦截] 路径非法或越权"
 
-        return f"[沙箱] 文件 '{path}' 不存在或无权访问（模拟环境）"
+        workspace = self._ensure_workspace()
+        workspace_real = os.path.realpath(workspace)
+        full_path = os.path.realpath(os.path.join(workspace, path))
+
+        # 白名单约束：解析后的真实路径必须落在沙箱工作目录内
+        if not full_path.startswith(workspace_real + os.sep) and full_path != workspace_real:
+            return "[安全拦截] 路径越权（不在白名单目录内）"
+
+        if not os.path.isfile(full_path):
+            return f"[沙箱] 文件 '{path}' 不存在"
+
+        try:
+            with open(full_path, "r", encoding="utf-8") as f:
+                return f.read(MAX_READ_BYTES)
+        except Exception as e:
+            return f"[错误] 读取失败: {e}"
 
     def _sim_search_knowledge(self, args: dict) -> str:
         """模拟知识库搜索"""

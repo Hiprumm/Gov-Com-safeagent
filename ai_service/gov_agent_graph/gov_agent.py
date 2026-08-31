@@ -12,6 +12,14 @@ from models.schemas import RiskLevel
 from gov_agent_graph.security_layer import SecurityLayer
 from config import settings
 from storage import get_storage
+# 方向A：创新点接入 graph
+from security.plan_ir import PlanIRBuilder, InterventionAction
+from security.sequence_risk_evaluator import SequenceRiskEvaluator
+from security.operation_guard import OperationGuard, OperationIntent
+# 方向A-5：输出过滤——response_generation 后对 final_response 做敏感数据脱敏
+from security.output_filter import OutputFilter
+# 方向A-4：受限真执行——tool_execution 调用沙箱执行器（白名单路径 + 子进程超时）
+from tools.docker_executor import docker_executor
 
 
 class ConversationManager:
@@ -20,6 +28,24 @@ class ConversationManager:
 
     def create_session(self) -> str:
         return self.storage.create_session()
+
+    def ensure_session(self, session_id: str) -> str:
+        """确保 session_id 存在，不存在则创建（保留外部传入 ID）"""
+        if not session_id:
+            return self.storage.create_session()
+        if self.storage.get_session(session_id) is None:
+            # 创建一个使用给定 ID 的会话记录，避免外键约束失败
+            now = datetime.now().isoformat()
+            try:
+                with self.storage._get_conn() as conn:
+                    conn.execute(
+                        "INSERT OR IGNORE INTO sessions (session_id, created_at, updated_at) VALUES (?, ?, ?)",
+                        (session_id, now, now),
+                    )
+            except Exception:
+                # 若插入失败（如重复），回退到新建会话
+                return self.storage.create_session()
+        return session_id
 
     def add_message(self, session_id: str, role: str, content: str, message_type: str = 'text'):
         self.storage.add_message(session_id, role, content, message_type)
@@ -495,6 +521,12 @@ class GovAgent:
         except Exception as e:
             print(f"[INFO] LLM initialization failed: {str(e)}, using rule-based fallback")
         
+        # 方向A：创新点接入 graph —— 实例化 Plan IR 构建器 + 序列评估器 + 操作守卫
+        self.plan_ir_builder = PlanIRBuilder()
+        self.sequence_risk_evaluator = SequenceRiskEvaluator()
+        self.operation_guard = OperationGuard()
+        # 方向A-5：输出过滤器（response_generation 后对响应做敏感数据脱敏）
+        self.output_filter = OutputFilter()
         self.graph = self._build_graph()
     
     def _build_graph(self) -> StateGraph:
@@ -504,6 +536,8 @@ class GovAgent:
         workflow.add_node("risk_assessment", self.risk_assessment)
         workflow.add_node("decision_making", self.decision_making)
         workflow.add_node("tool_selection", self.tool_selection)
+        workflow.add_node("plan_ir_build", self._build_plan_ir)
+        workflow.add_node("sequence_risk_eval", self._sequence_risk_eval)
         workflow.add_node("tool_evaluation", self.security_layer.evaluate_tool_call)
         workflow.add_node("approval_check", self.security_layer.check_approval)
         workflow.add_node("tool_execution", self.tool_execution)
@@ -526,7 +560,14 @@ class GovAgent:
             {"tool": "tool_selection", "direct": "response_generation"}
         )
         
-        workflow.add_edge("tool_selection", "tool_evaluation")
+        # 方向A：tool_selection → plan_ir_build → sequence_risk_eval → (route) → tool_evaluation
+        workflow.add_edge("tool_selection", "plan_ir_build")
+        workflow.add_edge("plan_ir_build", "sequence_risk_eval")
+        workflow.add_conditional_edges(
+            "sequence_risk_eval",
+            self._route_after_sequence_risk,
+            {"block": "block_response", "proceed": "tool_evaluation"}
+        )
         
         workflow.add_conditional_edges(
             "tool_evaluation",
@@ -537,7 +578,8 @@ class GovAgent:
         workflow.add_conditional_edges(
             "approval_check",
             self._route_after_approval,
-            {"approved": "tool_execution", "rejected": "block_response"}
+            # pending → block_response（生成"待人工审批"提示，非拦截语义）
+            {"approved": "tool_execution", "rejected": "block_response", "pending": "block_response"}
         )
         
         # T4: ReAct 循环——tool_execution 后可回到 decision_making 做下一轮迭代
@@ -547,7 +589,10 @@ class GovAgent:
             {"block": "block_response", "continue": "decision_making", "end": "response_generation"}
         )
         
-        workflow.add_edge("response_generation", END)
+        # 方向A-5：response_generation 后接 output_filter（输出层敏感数据脱敏）
+        workflow.add_node("output_filter", self.output_filter_node)
+        workflow.add_edge("response_generation", "output_filter")
+        workflow.add_edge("output_filter", END)
         workflow.add_edge("block_response", END)
         
         return workflow.compile()
@@ -574,6 +619,9 @@ class GovAgent:
     def _route_after_approval(self, state: AgentState) -> str:
         if state["can_proceed"]:
             return "approved"
+        # 异步审批：有待人工审批的请求 → pending（立即返回提示，不阻塞不拒绝）
+        if state.get("pending_human_approval"):
+            return "pending"
         return "rejected"
 
     def _route_after_execution(self, state: AgentState) -> str:
@@ -726,7 +774,8 @@ class GovAgent:
         if any(keyword in user_input for keyword in ["查询", "查找", "搜索", "获取", "读取"]):
             tool_calls.append({
                 "name": "read_file",
-                "args": {"file_path": "/data/docs/gov_doc.txt"}
+                # 方向A-4：改为白名单内相对路径（原绝对路径 /data/docs/gov_doc.txt 会被沙箱拦截）
+                "args": {"file_path": "welcome.txt"}
             })
         
         if any(keyword in user_input for keyword in ["执行", "运行", "启动", "操作"]):
@@ -744,7 +793,8 @@ class GovAgent:
         if any(keyword in user_input for keyword in ["导出", "下载", "备份"]):
             tool_calls.append({
                 "name": "export_data",
-                "args": {"format": "csv", "query": "SELECT * FROM users"}
+                # 方向B-3：fallback 不再硬编码危险参数（原 SELECT * FROM users 会导出全部用户）
+                "args": {"format": "csv", "query": "SELECT * FROM public_reports LIMIT 10"}
             })
         
         return tool_calls
@@ -768,7 +818,43 @@ class GovAgent:
             "tool_calls": selected_tools,
             "current_step": "tool_selection_completed",
         }
-    
+
+    def _build_plan_ir(self, state: AgentState) -> AgentState:
+        """方向A-1：从工具调用序列构建 Plan IR（创新点接入 graph）"""
+        tool_calls = state.get("tool_calls", [])
+        if not tool_calls:
+            return {**state, "plan_ir": None, "current_step": "plan_ir_skipped"}
+        session_id = state.get("session_id") or "default"
+        plan_id = f"{session_id}-iter{state.get('react_iteration', 0)}"
+        plan = self.plan_ir_builder.build_from_calls(
+            plan_id=plan_id,
+            user_query=state.get("user_input", ""),
+            raw_calls=tool_calls,
+        )
+        print(f"[方向A-1] Plan IR 构建: plan_id={plan.plan_id}, steps={len(plan.calls)}, "
+              f"caps={[sorted(c.capabilities) for c in plan.calls]}")
+        return {**state, "plan_ir": plan, "current_step": "plan_ir_built"}
+
+    def _sequence_risk_eval(self, state: AgentState) -> AgentState:
+        """方向A-2：序列级风险评估，高危序列（如 read_file→export_data）触发阻断"""
+        plan = state.get("plan_ir")
+        if plan is None:
+            return {**state, "sequence_risk_assessment": None,
+                    "current_step": "sequence_risk_skipped"}
+        assessment = self.sequence_risk_evaluator.assess(plan)
+        assessment_dict = assessment.to_dict()
+        print(f"[方向A-2] 序列评估: intervention={assessment.intervention.value}, "
+              f"risk={assessment.overall_risk_level.value}, score={assessment.overall_risk_score:.3f}")
+        return {**state, "sequence_risk_assessment": assessment_dict,
+                "current_step": "sequence_risk_evaluated"}
+
+    def _route_after_sequence_risk(self, state: AgentState) -> str:
+        """序列评估后路由：intervention=BLOCK → block_response，否则 → tool_evaluation"""
+        assessment = state.get("sequence_risk_assessment")
+        if assessment and assessment.get("intervention") == InterventionAction.BLOCK.value:
+            return "block"
+        return "proceed"
+
     def tool_execution(self, state: AgentState) -> AgentState:
         tool_calls = state["tool_calls"]
         session_id = state.get("session_id", "default")
@@ -790,11 +876,59 @@ class GovAgent:
             tool_name = tool_call.get("name", "")
             tool_args = tool_call.get("args", {})
 
+            # 方向B-2：能力令牌校验 — 默认最小权限，未授权能力一律拒绝。
+            # 这是检测层失效时的兜底防线：即使 input_detection 被绕过、
+            # 风险评估被误判，能力不足的工具调用仍会被拒绝（默认 deny）。
+            token_check = self.security_layer.capability_tokens.check(session_id, tool_name)
+            print(f"[方向B-2] capability_token: tool={tool_name}, allowed={token_check.allowed}, "
+                  f"missing={sorted(token_check.missing_capabilities) if not token_check.allowed else '-'}, "
+                  f"check_ms={token_check.duration_ms:.3f}")
+            if not token_check.allowed:
+                result = {
+                    "tool_name": tool_name,
+                    "args": tool_args,
+                    "result": f"[capability_token 拒绝] {token_check.reason}",
+                    "status": "blocked",
+                    "blocked_by": "capability_token",
+                    "missing_capabilities": sorted(token_check.missing_capabilities),
+                    "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "react_iteration": react_iteration,
+                }
+                execution_results.append(result)
+                continue
+
+            # 方向A-3：operation_guard 参数级校验（执行前最后一道防线）
+            intent = OperationIntent(
+                tool_name=tool_name,
+                parameters=tool_args,
+                session_id=session_id,
+                user_input=state.get("user_input", ""),
+            )
+            guard_result = self.operation_guard.check_intent(intent)
+            print(f"[方向A-3] operation_guard: tool={tool_name}, allowed={guard_result.allowed}, "
+                  f"requires_approval={guard_result.requires_approval}, blocked_by={guard_result.blocked_by}")
+            if not guard_result.allowed:
+                result = {
+                    "tool_name": tool_name,
+                    "args": tool_args,
+                    "result": f"[operation_guard 拦截] {guard_result.reason}",
+                    "status": "blocked",
+                    "blocked_by": guard_result.blocked_by,
+                    "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "react_iteration": react_iteration,
+                }
+                execution_results.append(result)
+                continue
+
+            # 方向A-4：受限真执行（Docker 沙箱可用则 Docker，否则白名单路径本地真执行）
+            tool_result = docker_executor.execute(tool_name, tool_args)
             result = {
                 "tool_name": tool_name,
                 "args": tool_args,
-                "result": f"模拟执行工具 [{tool_name}] 成功",
-                "status": "success",
+                "result": tool_result.output if tool_result.success else tool_result.error,
+                "status": "success" if tool_result.success else "error",
+                "sandbox_mode": tool_result.sandbox_mode,
+                "duration_ms": round(tool_result.duration_ms, 1),
                 "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 "react_iteration": react_iteration,
             }
@@ -806,7 +940,7 @@ class GovAgent:
                 session_id=session_id,
                 tool_name=tool_name,
                 result=result,
-                success=True,
+                success=tool_result.success,
             )
 
             # 审计：记录工具返回值（审计完整性-返回值）
@@ -927,7 +1061,48 @@ class GovAgent:
             "aigc_metadata": labeled["metadata"],
             "current_step": "completed",
         }
-    
+
+    # 方向A-5：输出过滤节点——response_generation 后对 final_response 做敏感数据脱敏
+    def output_filter_node(self, state: AgentState) -> AgentState:
+        """对最终响应做敏感数据脱敏（PII / 密钥 / 银行卡 / JWT / 私网 IP）
+
+        - 默认仅脱敏不阻断（保留前4后4位，中间 *** ）
+        - 记审计日志（action_type=output_filter，含脱敏摘要，不含原始敏感值）
+        """
+        final_response = state.get("final_response", "") or ""
+        session_id = state.get("session_id", "default")
+
+        if not final_response:
+            return {**state, "output_filter_result": {"filtered_count": 0, "by_type": {}, "has_critical": False}}
+
+        result = self.output_filter.sanitize(final_response)
+        audit_summary = result.to_audit_dict()
+
+        # 仅在发生脱敏时记审计，避免无谓日志
+        if result.filtered_count > 0:
+            risk_level = RiskLevel.HIGH if result.has_critical else RiskLevel.MEDIUM
+            self.security_layer.audit_logger.create_log(
+                user_id="user",
+                user_role="user",
+                agent_id="gov_agent",
+                action_type="output_filter",
+                action_details={
+                    "filtered_count": audit_summary["filtered_count"],
+                    "by_type": audit_summary["by_type"],
+                    "has_critical": audit_summary["has_critical"],
+                    "original_length": len(final_response),
+                    "filtered_length": len(result.filtered),
+                },
+                risk_level=risk_level,
+                session_id=session_id,
+            )
+
+        return {
+            **state,
+            "final_response": result.filtered,
+            "output_filter_result": audit_summary,
+        }
+
     def _fallback_response(self, user_input: str, tool_results: List[Dict[str, Any]]) -> str:
         """当LLM不可用时，使用规则模板生成有意义的回复"""
         input_lower = user_input.strip().lower()
@@ -1013,6 +1188,33 @@ class GovAgent:
         )
     
     def block_response(self, state: AgentState) -> AgentState:
+        # 异步审批流：待人工审批（非拦截语义）→ 友好提示，请求持久 pending
+        pending_approvals = state.get("pending_human_approval") or []
+        if pending_approvals:
+            lines = []
+            for p in pending_approvals:
+                lines.append(
+                    f"- 工具 {p.get('tool_name', '?')}（风险等级: {p.get('risk_level', '?')}，"
+                    f"审批单号: {p.get('request_id', '?')}）"
+                )
+            pending_message = f"""
+您的请求需要人工审批后才能执行。
+
+待审批事项:
+{chr(10).join(lines)}
+
+说明:
+- 审批请求已提交，管理员可在"安全检测 - 审批管理"页面处理
+- 批准后重新发送本请求即可自动执行（同一会话内无需重复审批）
+- 如有疑问请联系系统管理员
+"""
+            return {
+                **state,
+                "final_response": pending_message,
+                "can_proceed": False,
+                "current_step": "approval_pending",
+            }
+
         risk_level = state["risk_level"]
         detection_results = state.get("detection_results", [])
         session_id = state.get("session_id", "default")
@@ -1097,6 +1299,7 @@ class GovAgent:
             "tool_execution_results": [],
             "approval_requests": [],
             "approval_status": {},
+            "pending_human_approval": [],
             "plugin_scan_results": [],
             "conversation_history": conversation_history,
             "current_step": "start",
@@ -1125,8 +1328,12 @@ class GovAgent:
             "risk_level": result.get("risk_level", RiskLevel.NONE).value,
             "can_proceed": result.get("can_proceed", False),
             "current_step": result.get("current_step"),
+            # 异步审批：待人工审批事项（current_step=approval_pending 时非空）
+            "pending_human_approval": result.get("pending_human_approval", []),
             "detection_results": [r.dict() for r in result.get("detection_results", [])],
             "tool_risk_results": [r.dict() for r in result.get("tool_risk_results", [])],
+            # 方向A-4：工具真实执行结果（沙箱执行器的 output/status/sandbox_mode）
+            "tool_execution_results": result.get("tool_execution_results", []),
             "llm_response": result.get("llm_response"),
             "session_id": session_id,
             "conversation_history": self.conversation_manager.get_history(session_id),
@@ -1142,7 +1349,10 @@ class GovAgent:
     def run(self, user_input: str, input_source: str = "user_input", session_id: Optional[str] = None) -> Dict[str, Any]:
         if not session_id:
             session_id = self.conversation_manager.create_session()
-        
+        else:
+            # 外部传入的 session_id 可能尚未在 DB 中创建，确保存在以避免外键失败
+            session_id = self.conversation_manager.ensure_session(session_id)
+
         return self.run_with_history(session_id, user_input, input_source)
     
     def process_file_message(self, session_id: str, file_data: str, file_type: str, filename: str) -> Dict[str, Any]:

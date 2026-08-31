@@ -122,6 +122,8 @@ class CrossSourceCorrelator:
         self._events: Dict[str, List[SourceEvent]] = {}
         # 已报告的威胁（去重）
         self._reported_threats: Set[str] = set()
+        # 按 session_id 存储已检测到的威胁对象（供 summary 查询使用）
+        self._session_threats: Dict[str, List["CorrelatedThreat"]] = {}
         self._max_events_per_session = 200
 
     def record_event(
@@ -213,6 +215,11 @@ class CrossSourceCorrelator:
                 continue
 
             self._reported_threats.add(threat_id)
+
+            # 同步存入 session 威胁列表，便于后续 summary 查询
+            if session_id not in self._session_threats:
+                self._session_threats[session_id] = []
+            self._session_threats[session_id].append(threat)
 
             attack_chain = self._build_attack_chain(pattern, window_events)
             severity = self._calc_severity(combined_confidence, len(window_events))
@@ -341,40 +348,36 @@ class CrossSourceCorrelator:
             if e.risk_level not in ("none",):
                 sources[e.source]["risk_events"] += 1
 
-        # 查找与此session相关的威胁
-        threats = [
-            {
-                "pattern": t.pattern.value,
-                "severity": t.severity,
-                "confidence": t.confidence,
-                "attack_chain": t.attack_chain,
-                "detected_at": t.detected_at.isoformat(),
-            }
-            for tid, t_list in [(tid, []) for tid in self._reported_threats]
-            # 简化处理，匹配 session 前缀
-            for tid in self._reported_threats
-            if tid.startswith(session_id)
-        ]
-
-        # 实际获取威胁详情
-        all_threats = []
-        for tid in self._reported_threats:
-            if tid.startswith(session_id):
-                all_threats.append(tid)
+        # 收集与此 session 相关的威胁详情
+        session_threats = self._session_threats.get(session_id, [])
+        threats = []
+        for t in session_threats:
+            threats.append({
+                "pattern": getattr(t.pattern, "value", str(t.pattern)),
+                "severity": getattr(t, "severity", None),
+                "confidence": getattr(t, "confidence", 0.0),
+                "attack_chain": getattr(t, "attack_chain", []),
+                "detected_at": getattr(t.detected_at, "isoformat", lambda: str(t.detected_at))(),
+                "involved_sources": getattr(t, "involved_sources", []),
+            })
 
         return {
             "session_id": session_id,
             "total_events": len(events),
             "sources": sources,
+            "unique_sources": len(sources),
             "risk_events": sum(1 for e in events if e.risk_level not in ("none",)),
             "multi_source_events": len(sources) >= 2,
-            "threat_count": len(all_threats),
+            "threat_count": len(threats),
+            "threats": threats,
         }
 
     def clear_session(self, session_id: str):
         """清除某个 Session 的事件"""
         if session_id in self._events:
             del self._events[session_id]
+        if session_id in self._session_threats:
+            del self._session_threats[session_id]
         # 清除相关威胁记录
         to_remove = [tid for tid in self._reported_threats if tid.startswith(session_id)]
         for tid in to_remove:

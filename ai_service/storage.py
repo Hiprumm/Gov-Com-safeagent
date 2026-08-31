@@ -260,17 +260,9 @@ class Storage:
                 rows = conn.execute(
                     "SELECT * FROM approval_requests WHERE status = 'pending' ORDER BY created_at DESC"
                 ).fetchall()
-                return [dict(r) for r in rows]
-
-    def list_approvals_by_session(self, session_id: str) -> list:
-        """获取指定会话的所有审批记录"""
-        with self._lock:
-            with self._get_conn() as conn:
-                rows = conn.execute(
-                    "SELECT * FROM approval_requests WHERE session_id = ? ORDER BY created_at DESC",
-                    (session_id,)
-                ).fetchall()
-                return [dict(r) for r in rows]
+                # _row_to_dict 解析 tool_args 等 JSON 列（裸 dict 会留 JSON 字符串，
+                # 导致 ApprovalRequest 校验失败）
+                return [self._row_to_dict(r) for r in rows]
 
     # ==================== 会话管理 ====================
 

@@ -45,6 +45,11 @@ _CODE_REVIEW_PATTERNS = [
     r"(?:编写|生成|开发).{0,15}(?:安全测试|防护|检测|过滤).{0,10}(?:用例|脚本|规则|代码)",
     r"(?:评估|检查|验证).{0,15}(?:系统.*安全|防御.*能力|检测.*准确|误报|漏报)",
     r"(?:安全研究|安全分析|威胁建模|风险评估|合规检查)",
+    # 新增（P2 误报治理，第 8 轮基线 BO-004/SN-001）：
+    # "请帮我检查这段shell脚本是否有安全问题" / "编写测试代码验证SQL注入防护机制（参数化查询）"
+    r"(?:检查|审查|分析).{0,12}(?:这段|这个|该).{0,8}(?:代码|脚本|程序|shell)",
+    r"(?:检查|审查|分析).{0,15}(?:脚本|代码|程序).{0,10}(?:是否|有没有|有无).{0,8}(?:安全|问题|漏洞|风险)",
+    r"(?:编写|生成).{0,12}测试代码.{0,20}(?:验证|测试|检验).{0,10}(?:防护|防御|注入|机制)",
 ]
 
 # ======== Unicode 对抗样本规范化映射 ========
@@ -256,6 +261,7 @@ class InputDetectionService:
         session_id: str = "default",
         source_url: str = "",
         filename: str = "",
+        skip_llm: bool = False,
     ) -> DetectionResult:
         # ======== 第零层：Unicode 对抗样本规范化预处理 ========
         normalized_text, norm_ops = _normalize_unicode(text)
@@ -326,7 +332,7 @@ class InputDetectionService:
         # ======== 第五层：LLM语义分类（分级触发 + 降级策略） ========
         # 触发策略（不浪费配额，但覆盖关键盲点）：
         #   ① risk=NONE 但来源是 web_scrape/uploaded_doc/knowledge_retrieval（间接注入隐患）
-        #   ② risk=NONE 但文本长度>300（长文本藏隐式指令）
+        #   ② risk=NONE 但文本长度>20（覆盖短文本jailbreak，如权威冒充/侦察型伪装）
         #   ③ risk=LOW/MEDIUM 待确认（防漏过隐蔽攻击 + 防误拦业务请求）
         #   ④ risk=HIGH 但场景是"安全审查上下文"（防误拦正常安全测试请求）
         # 不触发：risk=CRITICAL（直接拦）或 risk=HIGH（非安全审查，规则已足够）
@@ -337,20 +343,20 @@ class InputDetectionService:
         should_trigger_llm = False
         trigger_reason = ""
         is_review_ctx = self._is_code_review_context(decoded_text)
-        if self.llm_classifier.enabled:
+        if self.llm_classifier.enabled and not skip_llm:
             if max_risk == RiskLevel.NONE:
                 if source in ("web_scrape", "uploaded_doc", "knowledge_retrieval"):
                     should_trigger_llm = True
                     trigger_reason = "间接注入高发源+无规则命中，需语义复核"
-                elif len(decoded_text) > 300:
+                elif len(decoded_text) > 20:
                     should_trigger_llm = True
-                    trigger_reason = "长文本+无规则命中，抽查隐式指令"
+                    trigger_reason = "输入+无规则命中，语义复核防jailbreak/伪装攻击"
             elif max_risk in (RiskLevel.LOW, RiskLevel.MEDIUM):
                 should_trigger_llm = True
                 trigger_reason = "低中风险待确认，语义强化"
-            elif max_risk == RiskLevel.HIGH and is_review_ctx:
+            elif max_risk in (RiskLevel.HIGH, RiskLevel.CRITICAL) and is_review_ctx:
                 should_trigger_llm = True
-                trigger_reason = "安全审查上下文+高风险，防误拦复核"
+                trigger_reason = "安全审查上下文+高/危急风险，防误拦复核"
 
         if should_trigger_llm:
             try:
@@ -365,7 +371,14 @@ class InputDetectionService:
                         final_attack_type = llm_attack
                 elif max_risk in (RiskLevel.MEDIUM, RiskLevel.HIGH, RiskLevel.CRITICAL):
                     # LLM未检出但原有中高风险：保守拦截，不因LLM放行而降级
-                    all_evidence.append(f"LLM-语义分类: 未检出但保守拦截（{trigger_reason}）")
+                    # 例外：安全审查上下文（用户在审查代码而非攻击）+ LLM复核无恶意 → 降级放行留痕
+                    # （第 9 轮误报治理：BO-004"检查shell脚本安全问题"/SN-001"验证注入防护机制"）
+                    if is_review_ctx and llm_risk == RiskLevel.NONE:
+                        max_risk = RiskLevel.LOW
+                        max_confidence = min(max_confidence, 0.35)
+                        all_evidence.append("LLM-语义分类: 安全审查上下文复核无恶意，降级放行留痕")
+                    else:
+                        all_evidence.append(f"LLM-语义分类: 未检出但保守拦截（{trigger_reason}）")
                 # risk=LOW/NONE 且 LLM未检出：维持原判定（LOW维持，NONE放行）
             except Exception:
                 # LLM异常时分级降级（绝不放行已有中高风险）
