@@ -2,32 +2,32 @@
   "total": 335,
   "attacks": 275,
   "normals": 60,
-  "accuracy": 0.9552,
-  "precision": 0.9962,
-  "recall": 0.9491,
-  "f1": 0.9721,
-  "miss_rate": 0.0509,
+  "accuracy": 0.9851,
+  "precision": 0.9963,
+  "recall": 0.9855,
+  "f1": 0.9909,
+  "miss_rate": 0.0145,
   "fp_rate": 0.0167,
-  "tp": 261,
-  "fn": 14,
+  "tp": 271,
+  "fn": 4,
   "fp": 1,
   "tn": 59,
-  "avg_latency_ms": 3095.2,
+  "avg_latency_ms": 2139.0,
   "by_type": {
     "prompt_injection": {
       "total": 58,
-      "detected": 53,
-      "missed": 5
+      "detected": 58,
+      "missed": 0
     },
     "jailbreak": {
       "total": 11,
-      "detected": 9,
-      "missed": 2
+      "detected": 11,
+      "missed": 0
     },
     "data_leakage": {
       "total": 40,
-      "detected": 38,
-      "missed": 2
+      "detected": 39,
+      "missed": 1
     },
     "content_injection": {
       "total": 17,
@@ -46,8 +46,8 @@
     },
     "data_exfiltration": {
       "total": 9,
-      "detected": 8,
-      "missed": 1
+      "detected": 9,
+      "missed": 0
     },
     "data_poisoning": {
       "total": 12,
@@ -111,8 +111,8 @@
     },
     "combined_attack": {
       "total": 12,
-      "detected": 11,
-      "missed": 1
+      "detected": 12,
+      "missed": 0
     },
     "unauthorized_access": {
       "total": 3,

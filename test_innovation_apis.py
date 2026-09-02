@@ -150,7 +150,8 @@ def test_scenarios():
 
     if scenarios:
         sid = scenarios[0].get("scenario_id") or scenarios[0].get("id")
-        r2 = requests.post(f"{BASE}/api/scenarios/{sid}/run", timeout=30)
+        # 场景演练=10步×2次LLM调用（决策+生成），冷缓存下约35-60s，timeout需留足
+        r2 = requests.post(f"{BASE}/api/scenarios/{sid}/run", timeout=180)
         d2 = r2.json()
         report = d2.get("report", {})
         ok2 = r2.status_code == 200 and d2.get("success") is True
