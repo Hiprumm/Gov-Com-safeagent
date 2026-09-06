@@ -320,14 +320,14 @@ const clearChat = () => {
   createNewSession()
 }
 
-const recallMessage = async (message: Message) => {
+const recallMessage = async (message: Message, keepEdit = false) => {
   if (!sessionId.value) {
     // 本地没有会话，直接在前端处理
     const idx = messages.value.findIndex(m => m.id === message.id)
     if (idx >= 0) {
       inputMessage.value = message.content
       messages.value = messages.value.slice(0, idx)
-      if (editingMessageId.value === message.id) {
+      if (!keepEdit && editingMessageId.value === message.id) {
         editingMessageId.value = null
       }
     }
@@ -356,7 +356,8 @@ const recallMessage = async (message: Message) => {
     }))
 
     inputMessage.value = message.content
-    editingMessageId.value = null
+    // 编辑流程需保持 editingMessageId（按钮切为「重新发送」），撤回流程则清空
+    if (!keepEdit) editingMessageId.value = null
   } catch (error) {
     console.error('Failed to recall message:', error)
   }
@@ -365,7 +366,7 @@ const recallMessage = async (message: Message) => {
 const editMessage = async (message: Message) => {
   inputMessage.value = message.content
   editingMessageId.value = message.id
-  await recallMessage(message)
+  await recallMessage(message, true)
 }
 
 const cancelEdit = () => {

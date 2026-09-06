@@ -9,31 +9,40 @@
   --font-body: 'Noto Sans SC', -apple-system, BlinkMacSystemFont, sans-serif;
   --font-mono: 'JetBrains Mono', 'Fira Code', 'Consolas', monospace;
 
-  /* 背景层级 — 非纯黑，降亮度策略 */
-  --bg-base: #0B1120;
-  --bg-surface: #111827;
-  --bg-elevated: #1E293B;
-  --bg-hover: #334155;
+  /* ===== 浅色主题（默认）— RGB 三元组，供 Tailwind rgb(var()/alpha) 引用 ===== */
+  /* 背景层级 — 冷灰白，政企办公感 */
+  --c-base: 248 250 252;        /* #F8FAFC slate-50 */
+  --c-surface: 255 255 255;     /* #FFFFFF */
+  --c-elevated: 241 245 249;    /* #F1F5F9 slate-100 */
+  --c-hover: 226 232 240;       /* #E2E8F0 slate-200 */
 
-  /* 文字层级 — 非纯白，降光晕 */
-  --text-primary: #E2E8F0;
-  --text-secondary: #94A3B8;
-  --text-muted: #64748B;
-  --text-disabled: #475569;
+  /* 文字层级 — 深蓝灰，白底高对比 */
+  --c-primary: 15 23 42;        /* #0F172A slate-900 */
+  --c-secondary: 71 85 105;     /* #475569 slate-600 */
+  --c-muted: 100 116 139;       /* #64748B slate-500 */
+  --c-disabled: 148 163 184;    /* #94A3B8 slate-400 */
 
   /* 边框 */
-  --border-default: #1E293B;
-  --border-hover: #334155;
-  --border-active: #06B6D4;
+  --c-border-default: 226 232 240;  /* #E2E8F0 */
+  --c-border-hover: 203 213 225;    /* #CBD5E1 */
+  --c-border-active: 8 145 178;     /* #0891B2 cyan-600 */
 
-  /* 语义色 — 去饱和适配深色背景 */
-  --color-safe: #10B981;
-  --color-low: #3B82F6;
-  --color-medium: #F59E0B;
-  --color-high: #F97316;
-  --color-critical: #EF4444;
-  --color-accent: #06B6D4;
-  --color-accent2: #8B5CF6;
+  /* 语义色 — 白底加深保证对比度 */
+  --c-safe: 5 150 105;          /* #059669 emerald-600 */
+  --c-low: 37 99 235;           /* #2563EB blue-600 */
+  --c-medium: 217 119 6;        /* #D97706 amber-600 */
+  --c-high: 234 88 12;          /* #EA580C orange-600 */
+  --c-critical: 220 38 38;      /* #DC2626 red-600 */
+  --c-accent: 8 145 178;        /* #0891B2 cyan-600 */
+  --c-accent2: 124 58 237;      /* #7C3AED violet-600 */
+
+  /* 阴影 — 浅色下轻阴影 */
+  --shadow-sm: 0 1px 2px 0 rgba(0, 0, 0, 0.05);
+  --shadow-md: 0 4px 6px -1px rgba(0, 0, 0, 0.07), 0 2px 4px -2px rgba(0, 0, 0, 0.05);
+  --shadow-lg: 0 10px 15px -3px rgba(0, 0, 0, 0.08), 0 4px 6px -4px rgba(0, 0, 0, 0.05);
+  --shadow-xl: 0 20px 25px -5px rgba(0, 0, 0, 0.1), 0 8px 10px -6px rgba(0, 0, 0, 0.06);
+  /* 强调光晕 — 用于聚焦/激活状态 */
+  --shadow-glow: 0 0 0 1px rgba(8, 145, 178, 0.35), 0 0 20px rgba(8, 145, 178, 0.15);
 
   /* 圆角阶梯 — 参考 Material Design 3 shape scale */
   --radius-sm: 4px;
@@ -41,14 +50,6 @@
   --radius-lg: 12px;
   --radius-xl: 16px;
   --radius-2xl: 20px;
-
-  /* 阴影阶梯 — 深色主题适配（低透明度黑，多层叠加增加层次感） */
-  --shadow-sm: 0 1px 2px 0 rgba(0, 0, 0, 0.3);
-  --shadow-md: 0 4px 6px -1px rgba(0, 0, 0, 0.4), 0 2px 4px -2px rgba(0, 0, 0, 0.3);
-  --shadow-lg: 0 10px 15px -3px rgba(0, 0, 0, 0.5), 0 4px 6px -4px rgba(0, 0, 0, 0.3);
-  --shadow-xl: 0 20px 25px -5px rgba(0, 0, 0, 0.5), 0 8px 10px -6px rgba(0, 0, 0, 0.3);
-  /* 强调光晕 — 用于聚焦/激活状态 */
-  --shadow-glow: 0 0 0 1px rgba(6, 182, 212, 0.35), 0 0 20px rgba(6, 182, 212, 0.18);
 
   /* 字号阶梯 — 参考 Material Design 3 type scale */
   --text-xs: 0.75rem;     /* 12px */
@@ -73,12 +74,52 @@
   text-rendering: optimizeLegibility;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
+
+  color-scheme: light;
 }
 
-/* ======== 深色背景全局 ======== */
+/* ===== 深色主题 — html.dark 生效（原有深色设计值） ===== */
+.dark {
+  /* 背景层级 — 非纯黑，降亮度策略 */
+  --c-base: 11 17 32;          /* #0B1120 */
+  --c-surface: 17 24 39;       /* #111827 */
+  --c-elevated: 30 41 59;      /* #1E293B */
+  --c-hover: 51 65 85;         /* #334155 */
+
+  /* 文字层级 — 非纯白，降光晕 */
+  --c-primary: 226 232 240;    /* #E2E8F0 */
+  --c-secondary: 148 163 184;  /* #94A3B8 */
+  --c-muted: 100 116 139;      /* #64748B */
+  --c-disabled: 71 85 105;     /* #475569 */
+
+  /* 边框 */
+  --c-border-default: 30 41 59;    /* #1E293B */
+  --c-border-hover: 51 65 85;      /* #334155 */
+  --c-border-active: 6 182 212;    /* #06B6D4 */
+
+  /* 语义色 — 去饱和适配深色背景 */
+  --c-safe: 16 185 129;        /* #10B981 */
+  --c-low: 59 130 246;         /* #3B82F6 */
+  --c-medium: 245 158 11;      /* #F59E0B */
+  --c-high: 249 115 22;        /* #F97316 */
+  --c-critical: 239 68 68;     /* #EF4444 */
+  --c-accent: 6 182 212;       /* #06B6D4 */
+  --c-accent2: 139 92 246;     /* #8B5CF6 */
+
+  /* 阴影 — 深色下低透明度黑多层叠加增加层次感 */
+  --shadow-sm: 0 1px 2px 0 rgba(0, 0, 0, 0.3);
+  --shadow-md: 0 4px 6px -1px rgba(0, 0, 0, 0.4), 0 2px 4px -2px rgba(0, 0, 0, 0.3);
+  --shadow-lg: 0 10px 15px -3px rgba(0, 0, 0, 0.5), 0 4px 6px -4px rgba(0, 0, 0, 0.3);
+  --shadow-xl: 0 20px 25px -5px rgba(0, 0, 0, 0.5), 0 8px 10px -6px rgba(0, 0, 0, 0.3);
+  --shadow-glow: 0 0 0 1px rgba(6, 182, 212, 0.35), 0 0 20px rgba(6, 182, 212, 0.18);
+
+  color-scheme: dark;
+}
+
+/* ======== 全局背景（跟随主题变量） ======== */
 body {
-  background-color: var(--bg-base);
-  color: var(--text-primary);
+  background-color: rgb(var(--c-base));
+  color: rgb(var(--c-primary));
 }
 
 /* ======== 自定义滚动条 ======== */
@@ -90,11 +131,11 @@ body {
   background: transparent;
 }
 ::-webkit-scrollbar-thumb {
-  background: var(--bg-hover);
+  background: rgb(var(--c-hover));
   border-radius: 3px;
 }
 ::-webkit-scrollbar-thumb:hover {
-  background: #475569;
+  background: rgb(var(--c-disabled));
 }
 
 /* ======== 表格数字等宽 ======== */
@@ -158,9 +199,9 @@ body {
 .skeleton {
   background: linear-gradient(
     90deg,
-    rgba(30, 41, 59, 0.5) 25%,
-    rgba(51, 65, 85, 0.6) 50%,
-    rgba(30, 41, 59, 0.5) 75%
+    rgb(var(--c-elevated)) 25%,
+    rgb(var(--c-hover)) 50%,
+    rgb(var(--c-elevated)) 75%
   );
   background-size: 200% 100%;
   animation: shimmer 1.5s ease-in-out infinite;
@@ -221,6 +262,6 @@ a {
 
 /* ======== 焦点可见性 ======== */
 :focus-visible {
-  outline: 2px solid var(--color-accent);
+  outline: 2px solid rgb(var(--c-accent));
   outline-offset: 2px;
 }

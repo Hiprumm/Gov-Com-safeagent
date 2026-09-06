@@ -75,34 +75,15 @@ interface KBPoisoningResult {
 }
 
 // 插件扫描
-const activeTab = ref<'detect' | 'plugin' | 'approval' | 'kb_poisoning' | 'risk_profile' | 'bypass'>('detect')
+const activeTab = ref<'detect' | 'plugin' | 'kb_poisoning' | 'risk_profile' | 'bypass'>('detect')
 const pluginCode = ref('')
 const pluginFileName = ref('')
 const pluginResult = ref<PluginScanResult | null>(null)
 const pluginLoading = ref(false)
 const pluginError = ref('')
 
-// 审批
-interface ApprovalItem {
-  request_id: string
-  user_id: string
-  user_role: string
-  action_type: string
-  action_details: Record<string, any>
-  risk_level: string
-  status: string
-}
-const pendingApprovals = ref<ApprovalItem[]>([])
-const approvalMessage = ref('')
-const activeSecurityTab = ref<'detect' | 'plugin' | 'approval'>('detect')
-
 // ====== WebSocket 实时通信（替代轮询） ======
 const { connect: wsConnect, disconnect: wsDisconnect, onEvent, connectionStatus } = useWebSocket()
-
-// 审批 Tab: WebSocket 自动订阅 approvals 频道（后端默认已订阅）
-onEvent('approval_update', () => {
-  fetchPendingApprovals()
-})
 
 // 风险画像 Tab: WebSocket 实时告警
 onEvent('risk_alert', () => {
@@ -110,47 +91,6 @@ onEvent('risk_alert', () => {
     fetchSessionRisk()
   }
 })
-
-// 审批相关
-const fetchPendingApprovals = async () => {
-  try {
-    const res = await axios.get('/ai/security/approval/pending')
-    pendingApprovals.value = res.data.pending || []
-  } catch (e) {
-    // 静默失败
-  }
-}
-
-const approveRequest = async (requestId: string) => {
-  approvalMessage.value = ''
-  try {
-    const res = await axios.post(`/ai/security/approval/approve/${requestId}`)
-    if (res.data.success) {
-      approvalMessage.value = `请求 ${requestId} 已通过`
-      fetchPendingApprovals()
-    }
-  } catch (e: any) {
-    approvalMessage.value = `操作失败: ${e.response?.data?.detail || e.message}`
-  }
-}
-
-const rejectRequest = async (requestId: string) => {
-  approvalMessage.value = ''
-  try {
-    const res = await axios.post(`/ai/security/approval/reject/${requestId}`)
-    if (res.data.success) {
-      approvalMessage.value = `请求 ${requestId} 已驳回`
-      fetchPendingApprovals()
-    }
-  } catch (e: any) {
-    approvalMessage.value = `操作失败: ${e.response?.data?.detail || e.message}`
-  }
-}
-
-const riskColor = (level: string) => {
-  const map: Record<string, string> = { none: 'gray', low: 'green', medium: 'yellow', high: 'orange', critical: 'red' }
-  return map[level] || 'gray'
-}
 
 const detectInput = async () => {
   if (!inputText.value.trim()) return
@@ -623,16 +563,6 @@ onMounted(() => {
         插件 / Skill 扫描
       </button>
       <button
-        @click="activeTab = 'approval'; fetchPendingApprovals()"
-        :class="[
-          'flex-1 sm:flex-initial whitespace-nowrap px-3 py-2 text-sm font-medium rounded-lg transition-all flex-shrink-0 active:scale-95',
-          activeTab === 'approval' ? 'bg-elevated text-accent shadow-md' : 'text-muted hover:text-secondary'
-        ]"
-      >
-        审批管理
-        <span v-if="pendingApprovals.length" class="ml-1 px-1.5 py-0.5 bg-critical text-white text-xs rounded-full">{{ pendingApprovals.length }}</span>
-      </button>
-      <button
         @click="activeTab = 'kb_poisoning'"
         :class="[
           'flex-1 sm:flex-initial whitespace-nowrap px-3 py-2 text-sm font-medium rounded-lg transition-all flex-shrink-0 active:scale-95',
@@ -912,71 +842,6 @@ onMounted(() => {
           </svg>
         </div>
         <p class="text-muted">粘贴插件代码，扫描供应链安全风险</p>
-      </div>
-    </div>
-
-    <!-- ========== 审批管理Tab ========== -->
-    <div v-if="activeTab === 'approval'">
-      <div v-if="approvalMessage" :class="[
-        'p-3 rounded-lg mb-4 text-sm',
-        approvalMessage.includes('失败') ? 'bg-critical/10 text-critical border border-critical/20' : 'bg-safe/10 text-safe border border-safe/20'
-      ]">
-        {{ approvalMessage }}
-      </div>
-
-      <div v-if="pendingApprovals.length === 0" class="text-center py-12">
-        <div class="w-16 h-16 bg-elevated rounded-full flex items-center justify-center mx-auto mb-4">
-          <svg class="w-8 h-8 text-disabled" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
-          </svg>
-        </div>
-        <p class="text-muted">暂无待审批请求</p>
-        <p class="text-xs text-disabled mt-1">3秒自动轮询，有高危工具调用时会显示</p>
-      </div>
-
-      <div v-else class="space-y-3">
-        <div
-          v-for="req in pendingApprovals"
-          :key="req.request_id"
-          class="bg-elevated border border-border-default rounded-xl p-4 shadow-sm animate-card-in"
-        >
-          <div class="flex items-start justify-between mb-3">
-            <div>
-              <p class="font-medium text-primary">{{ req.action_type?.replace('tool_call_', '') || '工具调用' }}</p>
-              <p class="text-xs text-muted mt-1">请求ID: {{ req.request_id }}</p>
-            </div>
-            <span :class="[
-              'px-2 py-0.5 text-xs font-medium rounded-full',
-              riskColor(req.risk_level) === 'red' ? 'bg-critical/15 text-critical border border-critical/30' :
-              riskColor(req.risk_level) === 'orange' ? 'bg-high/15 text-high border border-high/30' :
-              riskColor(req.risk_level) === 'yellow' ? 'bg-medium/15 text-medium border border-medium/30' :
-              'bg-safe/15 text-safe border border-safe/30'
-            ]">
-              {{ req.risk_level }}
-            </span>
-          </div>
-
-          <div class="text-xs text-muted mb-3">
-            <p v-if="req.action_details && Object.keys(req.action_details).length">
-              {{ JSON.stringify(req.action_details).slice(0, 100) }}
-            </p>
-          </div>
-
-          <div class="flex gap-2">
-            <button
-              @click="approveRequest(req.request_id)"
-              class="flex-1 py-2 text-sm bg-gradient-to-r from-safe to-low text-white rounded-lg hover:opacity-90 transition-all active:scale-95"
-            >
-              通过
-            </button>
-            <button
-              @click="rejectRequest(req.request_id)"
-              class="flex-1 py-2 text-sm bg-gradient-to-r from-critical to-low text-white rounded-lg hover:opacity-90 transition-all active:scale-95"
-            >
-              驳回
-            </button>
-          </div>
-        </div>
       </div>
     </div>
 

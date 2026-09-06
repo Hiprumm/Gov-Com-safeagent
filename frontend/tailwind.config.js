@@ -9,42 +9,46 @@ export default {
     },
     extend: {
       colors: {
-        // 背景层级
-        base: '#0B1120',
-        surface: '#111827',
-        elevated: '#1E293B',
-        hover: '#334155',
+        // 主题感知色 — 引用 style.css 中 :root(浅色)/.dark(深色) 的 CSS 变量
+        // RGB 三元组格式，支持 bg-critical/10 透明度写法
+        // 注意：页面底色 key 命名 'canvas'，不能叫 'base'——
+        // 否则与默认字号 scale 的 text-base 撞名，Tailwind 会同时生成
+        // 「字号」与「base 颜色」两个同名工具类，导致文字颜色被污染成背景色。
+        canvas: 'rgb(var(--c-base) / <alpha-value>)',
+        surface: 'rgb(var(--c-surface) / <alpha-value>)',
+        elevated: 'rgb(var(--c-elevated) / <alpha-value>)',
+        hover: 'rgb(var(--c-hover) / <alpha-value>)',
         // 文字层级
-        primary: '#E2E8F0',
-        secondary: '#94A3B8',
-        muted: '#64748B',
-        disabled: '#475569',
+        primary: 'rgb(var(--c-primary) / <alpha-value>)',
+        secondary: 'rgb(var(--c-secondary) / <alpha-value>)',
+        muted: 'rgb(var(--c-muted) / <alpha-value>)',
+        disabled: 'rgb(var(--c-disabled) / <alpha-value>)',
         // 边框
-        'border-default': '#1E293B',
-        'border-hover': '#334155',
-        'border-active': '#06B6D4',
+        'border-default': 'rgb(var(--c-border-default) / <alpha-value>)',
+        'border-hover': 'rgb(var(--c-border-hover) / <alpha-value>)',
+        'border-active': 'rgb(var(--c-border-active) / <alpha-value>)',
         // 语义色
-        safe: '#10B981',
-        low: '#3B82F6',
-        medium: '#F59E0B',
-        high: '#F97316',
-        critical: '#EF4444',
-        accent: '#06B6D4',
-        accent2: '#8B5CF6',
+        safe: 'rgb(var(--c-safe) / <alpha-value>)',
+        low: 'rgb(var(--c-low) / <alpha-value>)',
+        medium: 'rgb(var(--c-medium) / <alpha-value>)',
+        high: 'rgb(var(--c-high) / <alpha-value>)',
+        critical: 'rgb(var(--c-critical) / <alpha-value>)',
+        accent: 'rgb(var(--c-accent) / <alpha-value>)',
+        accent2: 'rgb(var(--c-accent2) / <alpha-value>)',
       },
       fontFamily: {
         display: ['Noto Sans SC', 'sans-serif'],
         body: ['Noto Sans SC', 'sans-serif'],
         mono: ['JetBrains Mono', 'Fira Code', 'monospace'],
       },
-      // 深色主题阴影 — 使用低透明度黑，多层叠加增加层次感
+      // 阴影 — 同样走 CSS 变量，浅色/深色各自适配
       boxShadow: {
-        sm: '0 1px 2px 0 rgba(0, 0, 0, 0.3)',
-        md: '0 4px 6px -1px rgba(0, 0, 0, 0.4), 0 2px 4px -2px rgba(0, 0, 0, 0.3)',
-        lg: '0 10px 15px -3px rgba(0, 0, 0, 0.5), 0 4px 6px -4px rgba(0, 0, 0, 0.3)',
-        xl: '0 20px 25px -5px rgba(0, 0, 0, 0.5), 0 8px 10px -6px rgba(0, 0, 0, 0.3)',
+        sm: 'var(--shadow-sm)',
+        md: 'var(--shadow-md)',
+        lg: 'var(--shadow-lg)',
+        xl: 'var(--shadow-xl)',
         // 强调光晕 — 用于聚焦/激活状态，呼应品牌色
-        glow: '0 0 0 1px rgba(6, 182, 212, 0.35), 0 0 20px rgba(6, 182, 212, 0.18)',
+        glow: 'var(--shadow-glow)',
       },
       keyframes: {
         'card-in': {

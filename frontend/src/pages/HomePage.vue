@@ -3,11 +3,12 @@ import { ref, computed, onMounted, onUnmounted } from 'vue'
 import {
   Menu, Search, BarChart3, Zap,
   ShieldX, Clock, AlertTriangle, ShieldCheck,
-  MessageSquare, Shield, Settings, FileText,
+  MessageSquare, Shield, Settings, FileText, ClipboardCheck,
   Sun, Moon,
 } from 'lucide-vue-next'
 import ChatPanel from '@/components/chat/ChatPanel.vue'
 import SecurityPanel from '@/components/security/SecurityPanel.vue'
+import ApprovalPanel from '@/components/approval/ApprovalPanel.vue'
 import AuditPanel from '@/components/audit/AuditPanel.vue'
 import ToolPanel from '@/components/tools/ToolPanel.vue'
 import { useToast } from '@/composables/useToast'
@@ -19,6 +20,7 @@ const { isDark, toggleTheme } = useTheme()
 const tabIconMap: Record<string, any> = {
   chat: MessageSquare,
   security: Shield,
+  approval: ClipboardCheck,
   tools: Settings,
   audit: FileText,
 }
@@ -40,7 +42,8 @@ const { success, info } = useToast()
 const tabs = [
   { name: 'chat', label: '智能问答', sub: '全链路安全执行', icon: 'chat', group: '日常操作' },
   { name: 'security', label: '安全检测', sub: '输入 + 供应链', icon: 'security', group: '安全运营' },
-  { name: 'tools', label: '工具管控', sub: '风险评估 + 审批', icon: 'tools', group: '安全运营' },
+  { name: 'approval', label: '审批中心', sub: '人工审批 · 令牌授予', icon: 'approval', group: '安全运营' },
+  { name: 'tools', label: '工具管控', sub: '风险评估 + 能力矩阵', icon: 'tools', group: '安全运营' },
   { name: 'audit', label: '审计追溯', sub: '过程可审计·责任可追溯', icon: 'audit', group: '合规审计' },
 ]
 
@@ -117,7 +120,7 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <div class="min-h-screen flex flex-col bg-base text-primary">
+  <div class="min-h-screen flex flex-col bg-canvas text-primary">
     <!-- ========== 顶栏 ========== -->
     <header class="h-14 bg-surface border-b border-border-default flex items-center justify-between px-3 sm:px-4 flex-shrink-0 z-20">
       <div class="flex items-center gap-2 sm:gap-3 min-w-0">
@@ -147,7 +150,7 @@ onUnmounted(() => {
         >
           <Search class="w-4 h-4" />
           <span>搜索...</span>
-          <kbd class="px-1.5 py-0.5 text-xs bg-base rounded border border-border-default font-mono">⌘K</kbd>
+          <kbd class="px-1.5 py-0.5 text-xs bg-canvas rounded border border-border-default font-mono">⌘K</kbd>
         </button>
 
         <!-- 主题切换按钮 -->
@@ -253,6 +256,7 @@ onUnmounted(() => {
         <div class="bg-surface rounded-2xl border border-border-default p-4 sm:p-6 h-full overflow-y-auto animate-card-in" :key="activeTab">
           <ChatPanel v-if="activeTab === 'chat'" />
           <SecurityPanel v-else-if="activeTab === 'security'" />
+          <ApprovalPanel v-else-if="activeTab === 'approval'" />
           <ToolPanel v-else-if="activeTab === 'tools'" />
           <AuditPanel v-else-if="activeTab === 'audit'" />
         </div>
@@ -279,7 +283,7 @@ onUnmounted(() => {
                 class="flex-1 bg-transparent text-primary placeholder:text-disabled outline-none text-sm"
                 autofocus
               />
-              <kbd class="px-1.5 py-0.5 text-xs bg-base rounded border border-border-default font-mono text-muted">ESC</kbd>
+              <kbd class="px-1.5 py-0.5 text-xs bg-canvas rounded border border-border-default font-mono text-muted">ESC</kbd>
             </div>
             <!-- 命令列表 -->
             <div class="max-h-[400px] overflow-y-auto p-2">

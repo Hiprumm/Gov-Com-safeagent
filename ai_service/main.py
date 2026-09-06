@@ -551,6 +551,25 @@ async def get_pending_approvals():
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/api/security/approval/history")
+async def get_approval_history(limit: int = 50):
+    """获取最近的审批记录（全部状态），供审批中心"已处理"列表使用
+
+    同 pending：静态段路由必须注册在 /{request_id} 参数路由之前。
+    """
+    try:
+        from storage import get_storage
+        limit = max(1, min(limit, 200))
+        records = get_storage().list_recent_approvals(limit=limit)
+        # 状态统计
+        stats: dict = {}
+        for r in records:
+            stats[r.get("status", "unknown")] = stats.get(r.get("status", "unknown"), 0) + 1
+        return {"records": records, "count": len(records), "stats": stats}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.get("/api/security/approval/{request_id}", response_model=ApprovalRequest)
 async def get_approval(request_id: str):
     try:

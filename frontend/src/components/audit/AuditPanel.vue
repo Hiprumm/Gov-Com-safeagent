@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, onMounted } from 'vue'
+import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
 import axios from 'axios'
 
 interface AuditLog {
@@ -99,6 +99,16 @@ const closeDetail = () => {
   detailVisible.value = false
   currentLog.value = null
 }
+
+// 详情弹窗支持 Esc 关闭（标准模态交互）
+function escHandler(e: KeyboardEvent) {
+  if (e.key === 'Escape') closeDetail()
+}
+watch(detailVisible, (v) => {
+  if (v) window.addEventListener('keydown', escHandler)
+  else window.removeEventListener('keydown', escHandler)
+})
+onUnmounted(() => window.removeEventListener('keydown', escHandler))
 
 const formatDetails = (obj: any): string => {
   if (obj === null || obj === undefined) return '-'

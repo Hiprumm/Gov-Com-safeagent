@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, onMounted } from 'vue'
+import { ref, computed, onMounted, onUnmounted } from 'vue'
 import axios from 'axios'
 
 // ---------- ECharts modular registration ----------
@@ -48,6 +48,9 @@ const PAGE_BG = '#0f172a'
 
 // ---------- Fetch data ----------
 onMounted(async () => {
+  // 本页为深色看板设计（图表配色固定）：进入时强制深色，离开时恢复用户偏好
+  document.documentElement.classList.remove('light')
+  document.documentElement.classList.add('dark')
   try {
     const { data } = await axios.get('/api/evaluation/report')
     report.value = data
@@ -57,6 +60,15 @@ onMounted(async () => {
   } finally {
     loading.value = false
   }
+})
+
+onUnmounted(() => {
+  const saved = localStorage.getItem('theme')
+  const t = saved === 'light' || saved === 'dark'
+    ? saved
+    : (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light')
+  document.documentElement.classList.remove('light', 'dark')
+  document.documentElement.classList.add(t)
 })
 
 // ---------- Derived helpers ----------

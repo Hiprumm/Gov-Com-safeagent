@@ -264,6 +264,16 @@ class Storage:
                 # 导致 ApprovalRequest 校验失败）
                 return [self._row_to_dict(r) for r in rows]
 
+    def list_recent_approvals(self, limit: int = 50) -> list:
+        """获取最近的审批记录（全部状态），供审批中心历史列表使用"""
+        with self._lock:
+            with self._get_conn() as conn:
+                rows = conn.execute(
+                    "SELECT * FROM approval_requests ORDER BY updated_at DESC LIMIT ?",
+                    (limit,),
+                ).fetchall()
+                return [self._row_to_dict(r) for r in rows]
+
     # ==================== 会话管理 ====================
 
     def create_session(self) -> str:
