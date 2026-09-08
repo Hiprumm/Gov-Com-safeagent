@@ -62,6 +62,9 @@ class ConversationManager:
     def delete_session(self, session_id: str):
         self.storage.delete_session(session_id)
 
+    def rename_session(self, session_id: str, title: str) -> bool:
+        return self.storage.rename_session(session_id, title)
+
 
 class FileProcessor:
     def __init__(self):
@@ -1361,7 +1364,8 @@ class GovAgent:
         if processed["detection_required"] and processed["content"]:
             detection_result = self.security_layer.input_detector.detect_single_input(
                 processed["content"],
-                source="uploaded_doc"
+                source="uploaded_doc",
+                session_id=session_id,
             )
             
             if detection_result.risk_level in [RiskLevel.HIGH, RiskLevel.CRITICAL]:

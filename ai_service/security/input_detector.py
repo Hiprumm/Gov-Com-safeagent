@@ -203,7 +203,7 @@ class InputDetectionService:
 
     @classmethod
     def _is_trusted_url(cls, url: str) -> bool:
-        """检查URL是否属于政府/教育可信域名白名单"""
+        """检查URL是否属于政府/教育可信域名白名单（内置后缀 + 策略中心可配置后缀）"""
         from urllib.parse import urlparse
         try:
             parsed = urlparse(url)
@@ -211,6 +211,14 @@ class InputDetectionService:
             for suffix in cls._TRUSTED_DOMAIN_SUFFIXES:
                 if domain.endswith(suffix):
                     return True
+            # 策略中心在线配置的可信后缀（热生效）
+            try:
+                from security.policy_manager import get_policy_manager
+                for suffix in get_policy_manager().trusted_suffixes():
+                    if domain.endswith(suffix):
+                        return True
+            except Exception:
+                pass
         except Exception:
             pass
         return False
@@ -343,7 +351,14 @@ class InputDetectionService:
         should_trigger_llm = False
         trigger_reason = ""
         is_review_ctx = self._is_code_review_context(decoded_text)
-        if self.llm_classifier.enabled and not skip_llm:
+        # 策略中心可在线关闭 LLM 语义分类层（热生效，无需重启）
+        llm_policy_enabled = True
+        try:
+            from security.policy_manager import get_policy_manager
+            llm_policy_enabled = get_policy_manager().llm_classifier_enabled
+        except Exception:
+            pass
+        if self.llm_classifier.enabled and llm_policy_enabled and not skip_llm:
             if max_risk == RiskLevel.NONE:
                 if source in ("web_scrape", "uploaded_doc", "knowledge_retrieval"):
                     should_trigger_llm = True

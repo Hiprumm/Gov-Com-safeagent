@@ -99,12 +99,21 @@ class SecurityLayer:
                     ))
 
         # ======== 当前输入检测（原有逻辑，包含第6层 check_before_write） ========
-        current_detection = self.input_detector.detect_single_input(user_input, input_source)
+        current_detection = self.input_detector.detect_single_input(
+            user_input, input_source, session_id=session_id or "default"
+        )
         detection_results.append(current_detection)
 
         # 合并风险等级：当前输入风险 vs 历史记忆风险
         all_risks = [current_detection.risk_level, memory_read_risk]
         final_risk = max(all_risks, key=lambda r: self._RISK_ORDER[r.value])
+
+        # 拦截阈值由安全策略中心统一管控（medium/high/critical 热配置）
+        try:
+            from security.policy_manager import get_policy_manager
+            _should_block = get_policy_manager().should_block(final_risk)
+        except Exception:
+            _should_block = final_risk in [RiskLevel.HIGH, RiskLevel.CRITICAL]
 
         # 审计日志
         self.audit_logger.create_log(
@@ -120,8 +129,8 @@ class SecurityLayer:
             },
             risk_level=final_risk,
             detection_result=current_detection,
-            is_blocked=final_risk in [RiskLevel.HIGH, RiskLevel.CRITICAL],
-            blocking_reason=f"检测到{final_risk.value}风险" if final_risk in [RiskLevel.HIGH, RiskLevel.CRITICAL] else None,
+            is_blocked=_should_block,
+            blocking_reason=f"检测到{final_risk.value}风险，触发拦截阈值策略" if _should_block else None,
             session_id=session_id,
         )
 
@@ -158,7 +167,7 @@ class SecurityLayer:
             **state,
             "detection_results": detection_results,
             "risk_level": final_risk,
-            "can_proceed": final_risk not in [RiskLevel.HIGH, RiskLevel.CRITICAL],
+            "can_proceed": not _should_block,
             "guard_results": [],
             "runtime_trace": [],
             "anomaly_alerts": [],

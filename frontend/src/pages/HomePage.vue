@@ -1,27 +1,36 @@
 <script setup lang="ts">
-import { ref, computed, onMounted, onUnmounted } from 'vue'
+import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
 import {
   Menu, Search, BarChart3, Zap,
   ShieldX, Clock, AlertTriangle, ShieldCheck,
   MessageSquare, Shield, Settings, FileText, ClipboardCheck,
-  Sun, Moon,
+  Sun, Moon, LayoutDashboard, Swords, SlidersHorizontal, Activity,
 } from 'lucide-vue-next'
 import ChatPanel from '@/components/chat/ChatPanel.vue'
+import DashboardPanel from '@/components/dashboard/DashboardPanel.vue'
+import RedTeamPanel from '@/components/redteam/RedTeamPanel.vue'
+import PolicyPanel from '@/components/policy/PolicyPanel.vue'
+import RuntimePanel from '@/components/runtime/RuntimePanel.vue'
 import SecurityPanel from '@/components/security/SecurityPanel.vue'
 import ApprovalPanel from '@/components/approval/ApprovalPanel.vue'
 import AuditPanel from '@/components/audit/AuditPanel.vue'
 import ToolPanel from '@/components/tools/ToolPanel.vue'
 import { useToast } from '@/composables/useToast'
 import { useTheme } from '@/composables/useTheme'
+import { useDashboard, useDashboardRealtime } from '@/composables/useDashboard'
 
 const { isDark, toggleTheme } = useTheme()
 
 // 图标映射 — 统一图标系统，避免内联 SVG 重复
 const tabIconMap: Record<string, any> = {
   chat: MessageSquare,
+  dashboard: LayoutDashboard,
+  redteam: Swords,
+  runtime: Activity,
   security: Shield,
-  approval: ClipboardCheck,
   tools: Settings,
+  approval: ClipboardCheck,
+  policy: SlidersHorizontal,
   audit: FileText,
 }
 const kpiIconMap: Record<string, any> = {
@@ -41,13 +50,35 @@ const { success, info } = useToast()
 
 const tabs = [
   { name: 'chat', label: '智能问答', sub: '全链路安全执行', icon: 'chat', group: '日常操作' },
+  { name: 'dashboard', label: '风险看板', sub: '安全态势实时总览', icon: 'dashboard', group: '安全运营' },
+  { name: 'runtime', label: '运行时监控', sub: '执行链路 · 人工熔断', icon: 'runtime', group: '安全运营' },
   { name: 'security', label: '安全检测', sub: '输入 + 供应链', icon: 'security', group: '安全运营' },
-  { name: 'approval', label: '审批中心', sub: '人工审批 · 令牌授予', icon: 'approval', group: '安全运营' },
+  { name: 'redteam', label: '红队测试', sub: '攻防对抗 · 批量回归', icon: 'redteam', group: '安全运营' },
   { name: 'tools', label: '工具管控', sub: '风险评估 + 能力矩阵', icon: 'tools', group: '安全运营' },
+  { name: 'approval', label: '审批中心', sub: '人工审批 · 令牌授予', icon: 'approval', group: '安全运营' },
   { name: 'audit', label: '审计追溯', sub: '过程可审计·责任可追溯', icon: 'audit', group: '合规审计' },
+  { name: 'policy', label: '策略配置', sub: '阈值/开关 · 热生效', icon: 'policy', group: '系统配置' },
 ]
 
 const currentTab = computed(() => tabs.find(t => t.name === activeTab.value))
+
+// 面板组件映射：KeepAlive 缓存各面板实例，切换模块不销毁状态
+// （会话/选中项/测试历史在 tab 间保留，仅页面刷新时重置）
+const panelMap: Record<string, any> = {
+  chat: ChatPanel,
+  dashboard: DashboardPanel,
+  redteam: RedTeamPanel,
+  runtime: RuntimePanel,
+  security: SecurityPanel,
+  approval: ApprovalPanel,
+  tools: ToolPanel,
+  policy: PolicyPanel,
+  audit: AuditPanel,
+}
+
+// 入场动画交替类名：类名变化才会重新触发 animation（见 style.css animate-card-in-b）
+const animFlip = ref(false)
+watch(activeTab, () => { animFlip.value = !animFlip.value })
 
 // 面包屑
 const breadcrumbs = computed(() => [
@@ -56,13 +87,19 @@ const breadcrumbs = computed(() => [
   { label: currentTab.value?.label || '' },
 ])
 
-// 状态总览KPI（模拟数据，实际可从API获取）
-const statusKPIs = ref([
-  { label: '今日拦截', value: 47, color: 'critical', icon: 'block' },
-  { label: '待审批', value: 3, color: 'medium', icon: 'pending' },
-  { label: '风险事件', value: 12, color: 'high', icon: 'warning' },
-  { label: '系统健康', value: '99.8%', color: 'safe', icon: 'health' },
-])
+// 状态总览KPI — 实时来自 /api/dashboard/overview（30s 轮询 + WebSocket 即时刷新）
+const { overview } = useDashboard()
+useDashboardRealtime()
+
+const statusKPIs = computed(() => {
+  const kpi = overview.value?.kpi
+  return [
+    { label: '今日拦截', value: kpi?.today_blocked ?? '—', color: 'critical', icon: 'block' },
+    { label: '待审批', value: kpi?.pending_approvals ?? '—', color: 'medium', icon: 'pending' },
+    { label: '风险事件', value: kpi?.risk_events_today ?? '—', color: 'high', icon: 'warning' },
+    { label: '24h拦截率', value: kpi ? `${kpi.blocked_rate_24h}%` : '—', color: 'safe', icon: 'health' },
+  ]
+})
 
 // 命令面板
 const commandItems = computed(() => {
@@ -120,7 +157,7 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <div class="min-h-screen flex flex-col bg-canvas text-primary">
+  <div class="h-screen flex flex-col bg-canvas text-primary overflow-hidden">
     <!-- ========== 顶栏 ========== -->
     <header class="h-14 bg-surface border-b border-border-default flex items-center justify-between px-3 sm:px-4 flex-shrink-0 z-20">
       <div class="flex items-center gap-2 sm:gap-3 min-w-0">
@@ -179,7 +216,7 @@ onUnmounted(() => {
     </header>
 
     <!-- ========== 面包屑 + 状态总览 ========== -->
-    <div class="bg-surface/50 border-b border-border-default px-4 sm:px-6 py-3">
+    <div class="bg-surface/50 border-b border-border-default px-4 sm:px-6 py-3 flex-shrink-0">
       <!-- 面包屑 -->
       <div class="flex items-center gap-2 text-sm mb-3">
         <template v-for="(crumb, idx) in breadcrumbs" :key="idx">
@@ -252,13 +289,14 @@ onUnmounted(() => {
         </div>
       </nav>
 
-      <main class="flex-1 overflow-hidden p-3 sm:p-6">
-        <div class="bg-surface rounded-2xl border border-border-default p-4 sm:p-6 h-full overflow-y-auto animate-card-in" :key="activeTab">
-          <ChatPanel v-if="activeTab === 'chat'" />
-          <SecurityPanel v-else-if="activeTab === 'security'" />
-          <ApprovalPanel v-else-if="activeTab === 'approval'" />
-          <ToolPanel v-else-if="activeTab === 'tools'" />
-          <AuditPanel v-else-if="activeTab === 'audit'" />
+      <main class="flex-1 overflow-hidden p-3 sm:p-6 min-h-0">
+        <div
+          class="bg-surface rounded-2xl border border-border-default p-4 sm:p-6 h-full overflow-hidden"
+          :class="animFlip ? 'animate-card-in-b' : 'animate-card-in'"
+        >
+          <KeepAlive>
+            <component :is="panelMap[activeTab]" />
+          </KeepAlive>
         </div>
       </main>
     </div>

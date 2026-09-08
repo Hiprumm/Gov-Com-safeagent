@@ -504,6 +504,41 @@ const switchSession = async (sessionItem: SessionItem) => {
   }
 }
 
+const copySessionId = async (session: SessionItem) => {
+  try {
+    await navigator.clipboard.writeText(session.session_id)
+    toast.success(`会话 ID 已复制：${session.session_id.slice(0, 8)}…`)
+  } catch {
+    // clipboard API 不可用时降级为 execCommand
+    const ta = document.createElement('textarea')
+    ta.value = session.session_id
+    ta.style.position = 'fixed'
+    ta.style.opacity = '0'
+    document.body.appendChild(ta)
+    ta.select()
+    document.execCommand('copy')
+    document.body.removeChild(ta)
+    toast.success('会话 ID 已复制')
+  }
+}
+
+const renameSession = async (session: SessionItem) => {
+  const current = session.title || `会话 ${session.session_id.slice(0, 8)}`
+  const input = window.prompt('重命名会话（留空恢复为未命名）：', current)
+  // 用户取消
+  if (input === null) return
+  try {
+    await axios.post('/ai/agent/rename_session', null, {
+      params: { session_id: session.session_id, title: input }
+    })
+    const s = sessions.value.find(x => x.session_id === session.session_id)
+    if (s) s.title = input.trim() || null
+    toast.success(input.trim() ? `已重命名为「${input.trim()}」` : '已恢复为未命名会话')
+  } catch (e: any) {
+    toast.error(e.response?.data?.detail || '重命名失败')
+  }
+}
+
 const deleteSession = async (sessionItem: SessionItem) => {
   const title = sessionItem.title || '会话 ' + sessionItem.session_id.slice(0, 8)
   if (!window.confirm(`确定删除历史会话「${title}」吗？删除后不可恢复。`)) return
@@ -561,7 +596,7 @@ onMounted(() => {
           </svg>
         </button>
       </div>
-      <div class="flex-1 overflow-y-auto p-2">
+      <div class="flex-1 overflow-y-auto min-h-0 p-2">
         <button
           @click="createNewSession(); showSessionSidebar = false"
           class="w-full p-3 mb-2 text-left bg-accent/10 text-accent rounded-lg hover:bg-accent/20 transition-all active:scale-95 flex items-center gap-2"
@@ -600,15 +635,35 @@ onMounted(() => {
                 {{ session.updated_at ? session.updated_at.slice(0, 10) : '' }}
                 {{ session.updated_at ? ' ' + session.updated_at.slice(11, 16) : '' }}
               </span>
-              <button
-                @click.stop="deleteSession(session)"
-                class="p-1 text-disabled hover:text-red-500 hover:bg-red-500/10 rounded transition-all active:scale-95"
-                title="删除会话"
-              >
-                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"></path>
-                </svg>
-              </button>
+              <div class="flex items-center gap-0.5">
+                <button
+                  @click.stop="renameSession(session)"
+                  class="p-1 text-disabled hover:text-accent hover:bg-accent/10 rounded transition-all active:scale-95"
+                  title="重命名会话"
+                >
+                  <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z"></path>
+                  </svg>
+                </button>
+                <button
+                  @click.stop="copySessionId(session)"
+                  class="p-1 text-disabled hover:text-accent hover:bg-accent/10 rounded transition-all active:scale-95"
+                  title="复制会话 ID"
+                >
+                  <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path>
+                  </svg>
+                </button>
+                <button
+                  @click.stop="deleteSession(session)"
+                  class="p-1 text-disabled hover:text-red-500 hover:bg-red-500/10 rounded transition-all active:scale-95"
+                  title="删除会话"
+                >
+                  <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"></path>
+                  </svg>
+                </button>
+              </div>
             </div>
           </button>
         </div>
@@ -759,7 +814,7 @@ onMounted(() => {
     </div>
 
     <!-- 工具栏 -->
-    <div class="bg-surface border-t border-border-default p-4">
+    <div class="bg-surface border-t border-border-default p-4 flex-shrink-0">
       <!-- 功能按钮 -->
       <div class="flex items-center gap-2 mb-3">
         <button

@@ -28,6 +28,7 @@ from security.kb_poisoning_detector import KBPoisoningDetector
 from security.session_risk_accumulator import SessionRiskAccumulator, session_risk_accumulator
 from security.adversarial_mutator import BypassTester
 from security.cross_source_correlator import CrossSourceCorrelator, get_cross_source_correlator
+from security.policy_manager import get_policy_manager
 from plugins.plugin_scanner import PluginScanner
 from security.mcp_scanner import MCPScanner
 from security.skill_analyzer import SkillAnalyzer
@@ -124,9 +125,22 @@ operation_guard = get_operation_guard()
 audit_logger = AuditLogger()
 metrics_calculator = EvaluationMetricsCalculator()
 gov_agent = GovAgent()
+# 安全策略中枢（管控台在线配置，热生效）
+policy_manager = get_policy_manager()
 
 
-# ======== 启动清理空会话 ========
+def _apply_policy_hot():
+    """将策略热应用到模块级检测实例（LLM 分类层开关等）"""
+    try:
+        llm_available = bool(getattr(input_detector.llm_classifier, "api_key", ""))
+        input_detector.llm_classifier.enabled = (
+            policy_manager.llm_classifier_enabled and llm_available
+        )
+    except Exception as e:
+        print(f"[POLICY] LLM 开关热应用失败: {e}")
+
+
+# ======== 启动清理空会话 + 应用安全策略 ========
 @app.on_event("startup")
 async def startup_cleanup():
     try:
@@ -137,6 +151,15 @@ async def startup_cleanup():
             print(f"[STARTUP] 已清理 {cleaned} 个空会话")
     except Exception as e:
         print(f"[STARTUP] 清理空会话时出错: {e}")
+    try:
+        _apply_policy_hot()
+        # 按策略留存天数清理过期审计日志
+        removed = audit_logger.apply_retention_policy(policy_manager.retention_days)
+        print(f"[STARTUP] 安全策略 v{policy_manager.get_policy()['policy_version']} 已加载，"
+              f"LLM分类层={'开' if input_detector.llm_classifier.enabled else '关'}，"
+              f"清理过期日志 {removed} 条")
+    except Exception as e:
+        print(f"[STARTUP] 应用安全策略时出错: {e}")
 
 
 @app.get("/")
@@ -160,6 +183,9 @@ async def detect_single(text: str, source: str = "user_input", session_id: Optio
         # （修复：原实现未传 session_id，导致所有请求累积到 "default" session，正常样本被污染）
         result = input_detector.detect_single_input(text, source, session_id=session_id or "default")
 
+        # 拦截判定：阈值由安全策略中心统一管控（medium/high/critical 可热配置）
+        blocked = policy_manager.should_block(result.risk_level) if hasattr(result, 'risk_level') else False
+
         # 记录审计日志
         audit_logger.create_log(
             user_id="anonymous", user_role="user", agent_id="security_panel",
@@ -167,10 +193,13 @@ async def detect_single(text: str, source: str = "user_input", session_id: Optio
             action_details={"source": source, "text_preview": text[:100], "session_id": session_id},
             risk_level=result.risk_level if hasattr(result, 'risk_level') else RiskLevel.NONE,
             detection_result=result,
-            is_blocked=result.risk_level in [RiskLevel.HIGH, RiskLevel.CRITICAL] if hasattr(result, 'risk_level') else False,
+            is_blocked=blocked,
         )
 
-        return result
+        # 响应附带当前策略下的实际拦截结论（阈值可在策略中心热配置，前端勿硬编码）
+        resp = result.dict() if hasattr(result, "dict") else dict(result)
+        resp["is_blocked"] = blocked
+        return resp
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -189,14 +218,14 @@ async def detect_file(request: FileDetectionRequest):
                 source="uploaded_doc"
             )
 
-            # 记录审计日志
+            # 记录审计日志（拦截阈值走安全策略中心）
             audit_logger.create_log(
                 user_id="anonymous", user_role="user", agent_id="security_panel",
                 action_type="file_detection",
                 action_details={"filename": request.filename, "file_type": request.file_type},
                 risk_level=result.risk_level,
                 detection_result=result,
-                is_blocked=result.risk_level in [RiskLevel.HIGH, RiskLevel.CRITICAL],
+                is_blocked=policy_manager.should_block(result.risk_level),
             )
 
             return {
@@ -1052,6 +1081,206 @@ async def audit_statistics(
 
 
 # ============================================================================
+# 安全管控台：风险看板聚合接口（KPI + 攻击分布 + 7日趋势 + 最近风险事件）
+# ============================================================================
+
+def _parse_log_ts(ts):
+    """审计日志时间戳 → naive datetime（解析失败返回 None）"""
+    if isinstance(ts, str):
+        try:
+            return datetime.fromisoformat(ts.replace("Z", "+00:00")).replace(tzinfo=None)
+        except ValueError:
+            return None
+    if ts is not None and hasattr(ts, "replace"):
+        try:
+            return ts.replace(tzinfo=None)
+        except Exception:
+            return None
+    return None
+
+
+@app.get("/api/dashboard/overview")
+async def dashboard_overview():
+    """风险看板总览：一次聚合返回 KPI 卡片、攻击类型分布、7 日趋势、最近风险事件
+
+    直接读 storage 原始行（detection_result 等 JSON 列已解析为 dict）；
+    audit_logger._dict_to_log 重建日志时不携带 detection_result，故不走该路径。
+    """
+    try:
+        from datetime import timedelta
+        from storage import get_storage
+
+        storage = get_storage()
+        log_dicts = storage.get_audit_logs_recent(limit=5000)
+
+        now = datetime.now()
+        today_str = now.strftime("%Y-%m-%d")
+        cutoff_24h = now - timedelta(hours=24)
+        cutoff_7d = now - timedelta(days=7)
+
+        today_blocked = 0
+        today_risk_events = 0
+        blocked_24h = 0
+        total_24h = 0
+        attack_dist: Dict[str, int] = {}
+        risk_level_dist = {"low": 0, "medium": 0, "high": 0, "critical": 0}
+
+        # 7 日趋势桶（日期键 MM-DD）
+        trend_map: Dict[str, Dict[str, Any]] = {}
+        for i in range(7):
+            day = (now - timedelta(days=6 - i)).strftime("%m-%d")
+            trend_map[day] = {"date": day, "total": 0, "blocked": 0}
+
+        recent_events: List[Dict[str, Any]] = []
+        risk_order = ("medium", "high", "critical")
+
+        for d in log_dicts:
+            ts = _parse_log_ts(d.get("timestamp"))
+            risk_level = d.get("risk_level", "none")
+            if hasattr(risk_level, "value"):
+                risk_level = risk_level.value
+            is_blocked = bool(d.get("is_blocked"))
+            det = d.get("detection_result") or {}
+            attack_type = det.get("attack_type") if isinstance(det, dict) else None
+            if hasattr(attack_type, "value"):
+                attack_type = attack_type.value
+
+            if ts:
+                if ts.strftime("%Y-%m-%d") == today_str:
+                    if is_blocked:
+                        today_blocked += 1
+                    if risk_level in risk_order:
+                        today_risk_events += 1
+                if ts >= cutoff_24h:
+                    total_24h += 1
+                    if is_blocked:
+                        blocked_24h += 1
+                if ts >= cutoff_7d:
+                    day_key = ts.strftime("%m-%d")
+                    if day_key in trend_map:
+                        trend_map[day_key]["total"] += 1
+                        if is_blocked:
+                            trend_map[day_key]["blocked"] += 1
+                    if attack_type:
+                        attack_dist[attack_type] = attack_dist.get(attack_type, 0) + 1
+                    if risk_level in risk_level_dist:
+                        risk_level_dist[risk_level] += 1
+
+            # 日志按时间倒序，取前 10 条中高风险作为最近事件
+            if risk_level in risk_order and len(recent_events) < 10:
+                details = d.get("action_details") or {}
+                preview = ""
+                if isinstance(details, dict):
+                    preview = details.get("text_preview") or details.get("original_text") or ""
+                recent_events.append({
+                    "log_id": d.get("log_id", ""),
+                    "timestamp": d.get("timestamp"),
+                    "risk_level": risk_level,
+                    "attack_type": attack_type,
+                    "action_type": d.get("action_type", ""),
+                    "is_blocked": is_blocked,
+                    "preview": str(preview)[:120],
+                })
+
+        try:
+            pending_approvals = len(storage.list_pending_approvals())
+        except Exception:
+            pending_approvals = 0
+
+        return {
+            "success": True,
+            "kpi": {
+                "today_blocked": today_blocked,
+                "pending_approvals": pending_approvals,
+                "risk_events_today": today_risk_events,
+                "blocked_rate_24h": round(blocked_24h / total_24h * 100, 1) if total_24h else 0.0,
+            },
+            "attack_distribution": dict(sorted(attack_dist.items(), key=lambda x: -x[1])),
+            "risk_level_distribution": risk_level_dist,
+            "trend_7d": list(trend_map.values()),
+            "recent_events": recent_events,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ============================================================================
+# 安全管控台：安全策略中心（在线配置 · 热生效 · 版本化）
+# ============================================================================
+
+@app.get("/api/security/policy")
+async def get_security_policy():
+    """获取当前安全策略配置 + 版本 + 能力可用性"""
+    try:
+        policy = policy_manager.get_policy()
+        llm_key_present = bool(getattr(input_detector.llm_classifier, "api_key", ""))
+        return {
+            "success": True,
+            "policy": policy,
+            "capabilities": {
+                # LLM 分类层实际生效 = 策略开关 且 API Key 可用
+                "llm_classifier_effective": input_detector.llm_classifier.enabled,
+                "llm_api_key_present": llm_key_present,
+            },
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.put("/api/security/policy")
+async def update_security_policy(request: dict):
+    """更新安全策略（热生效，自动递增 policy_version）
+
+    可更新字段：llm_classifier_enabled / block_threshold /
+    audit_retention_days / trusted_domain_suffixes
+    """
+    try:
+        changes = request.get("policy") if isinstance(request.get("policy"), dict) else request
+        old_policy = policy_manager.get_policy()
+        new_policy = policy_manager.update_policy(changes)
+
+        # 热应用：LLM 分类层开关
+        _apply_policy_hot()
+
+        # 留存天数变更：立即按新策略清理一次
+        retention_changed = (
+            new_policy["audit_retention_days"] != old_policy["audit_retention_days"]
+        )
+        removed = 0
+        if retention_changed:
+            removed = audit_logger.apply_retention_policy(new_policy["audit_retention_days"])
+
+        audit_logger.create_log(
+            user_id="admin", user_role="admin", agent_id="policy_center",
+            action_type="policy_update",
+            action_details={
+                "changes": changes,
+                "policy_version": new_policy["policy_version"],
+                "retention_cleaned": removed,
+            },
+            risk_level=RiskLevel.LOW,
+            is_blocked=False,
+        )
+
+        return {
+            "success": True,
+            "policy": new_policy,
+            "capabilities": {
+                "llm_classifier_effective": input_detector.llm_classifier.enabled,
+                "llm_api_key_present": bool(getattr(input_detector.llm_classifier, "api_key", "")),
+            },
+            "retention_cleaned": removed,
+            "message": f"策略已更新至 v{new_policy['policy_version']}，即时生效",
+        }
+    except ValueError as ve:
+        raise HTTPException(status_code=400, detail=str(ve))
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ============================================================================
 # T5 合规标准对接：合规报告 / 关键词库 / AIGC标识 / 哈希链校验
 # ============================================================================
 
@@ -1378,6 +1607,22 @@ async def delete_conversation(session_id: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.post("/api/agent/rename_session")
+async def rename_session(session_id: str, title: str):
+    """重命名历史会话（title 传空字符串恢复为未命名）"""
+    try:
+        if len(title) > 100:
+            raise HTTPException(status_code=400, detail="会话标题过长（上限 100 字符）")
+        ok = gov_agent.conversation_manager.rename_session(session_id, title)
+        if not ok:
+            raise HTTPException(status_code=404, detail="会话不存在")
+        return {"success": True, "session_id": session_id, "title": title.strip() or None}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.post("/api/agent/recall_messages")
 async def recall_messages(session_id: str, message_id: int):
     """撤回/编辑消息：删除指定消息及之后的所有消息"""
@@ -1565,7 +1810,7 @@ async def detect_kb_poisoning_pdf(request: FileDetectionRequest):
                 "file_type": request.file_type,
             },
             risk_level=result.risk_level,
-            is_blocked=result.risk_level in [RiskLevel.HIGH, RiskLevel.CRITICAL],
+            is_blocked=policy_manager.should_block(result.risk_level),
         )
 
         return {
@@ -1749,6 +1994,8 @@ async def run_pssu_assess(request: dict):
         target_defense = request.get("target_defense", "input_detector")
         max_iterations = int(request.get("max_iterations", 8))
         success_threshold = float(request.get("success_threshold", 0.8))
+        # 可选种子载荷：以用户当前测试文本为起点做自适应进化
+        seed_payload = request.get("seed_payload") or None
 
         # 风险等级 → 0-1 风险分（PSSU 依据 risk_score 判断攻击是否突破防御）
         risk_map = {
@@ -1770,7 +2017,11 @@ async def run_pssu_assess(request: dict):
             })
 
         runner = PSSURunner(max_iterations=max_iterations, success_threshold=success_threshold)
-        result = runner.assess_defense(target_defense=target_defense, defense_fn=defense_fn)
+        result = runner.assess_defense(
+            target_defense=target_defense,
+            defense_fn=defense_fn,
+            seed_payloads=[seed_payload] if seed_payload else None,
+        )
         summary = runner.summary(result)
 
         # 记录审计日志

@@ -151,13 +151,15 @@ class PSSURunner:
 
     def assess_defense(self, target_defense: str,
                        defense_fn: Callable[[str], Tuple[bool, float, Dict]],
-                       attacker_types: Optional[List[AttackerType]] = None) -> PSSUResult:
+                       attacker_types: Optional[List[AttackerType]] = None,
+                       seed_payloads: Optional[List[str]] = None) -> PSSUResult:
         """评估目标防御的自适应攻击鲁棒性
 
         Args:
             target_defense: 目标防御名称（如 "input_detector"）
             defense_fn: 防御回调函数，输入 payload，返回 (blocked, risk_score, metadata)
             attacker_types: 启用的攻击器类型（默认仅 SEARCH）
+            seed_payloads: 额外注入初始种群的种子载荷（如用户当前测试的攻击文本）
 
         Returns:
             PSSUResult 评估结果
@@ -171,6 +173,9 @@ class PSSURunner:
         if AttackerType.SEARCH in attacker_types:
             search_attacker = SearchAttacker()
             population = search_attacker.initial_population()
+            # 种子载荷排在种群最前：以用户指定文本为起点做自适应进化
+            if seed_payloads:
+                population = [s for s in seed_payloads if s and s.strip()] + list(population)
 
             for iteration in range(1, self.max_iterations + 1):
                 iter_start = time.perf_counter()

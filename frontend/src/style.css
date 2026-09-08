@@ -116,6 +116,13 @@
   color-scheme: dark;
 }
 
+/* ======== 全局高度链 — 从 html 到组件逐级闭合，确保 ChatPanel h-full 有效 ======== */
+html, body, #app {
+  height: 100%;
+  overflow: hidden;
+  margin: 0;
+}
+
 /* ======== 全局背景（跟随主题变量） ======== */
 body {
   background-color: rgb(var(--c-base));
@@ -169,6 +176,11 @@ body {
   }
 }
 .animate-card-in {
+  animation: cardFadeIn 0.25s ease-out backwards;
+}
+/* 与 animate-card-in 相同动画的副本：KeepAlive 缓存面板后，切换 tab 时
+   在同一元素上交替类名以重新触发入场动画（同类名移除再加回不会重播） */
+.animate-card-in-b {
   animation: cardFadeIn 0.25s ease-out backwards;
 }
 

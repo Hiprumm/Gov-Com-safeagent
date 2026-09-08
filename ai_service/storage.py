@@ -91,6 +91,12 @@ class Storage:
                     FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
                 );
 
+                CREATE TABLE IF NOT EXISTS policy_config (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
                 CREATE INDEX IF NOT EXISTS idx_audit_timestamp ON audit_logs(timestamp);
                 CREATE INDEX IF NOT EXISTS idx_audit_user ON audit_logs(user_id);
                 CREATE INDEX IF NOT EXISTS idx_audit_risk ON audit_logs(risk_level);
@@ -364,6 +370,36 @@ class Storage:
         with self._lock:
             with self._get_conn() as conn:
                 conn.execute("DELETE FROM sessions WHERE session_id = ?", (session_id,))
+
+    def rename_session(self, session_id: str, title: str) -> bool:
+        """重命名会话（title 为空字符串时恢复为未命名 NULL）"""
+        with self._lock:
+            with self._get_conn() as conn:
+                cursor = conn.execute(
+                    "UPDATE sessions SET title = ?, updated_at = updated_at WHERE session_id = ?",
+                    (title.strip() or None, session_id),
+                )
+                return cursor.rowcount > 0
+
+    # ==================== 安全策略配置 ====================
+
+    def get_policy_config(self) -> Dict[str, str]:
+        """读取全部策略配置（value 为 JSON 字符串，由调用方解析）"""
+        with self._get_conn() as conn:
+            rows = conn.execute("SELECT key, value FROM policy_config").fetchall()
+        return {r["key"]: r["value"] for r in rows}
+
+    def update_policy_config(self, items: Dict[str, Any]) -> None:
+        """批量 upsert 策略配置（value 自动 JSON 序列化）"""
+        now = datetime.now().isoformat()
+        with self._lock:
+            with self._get_conn() as conn:
+                for key, value in items.items():
+                    conn.execute(
+                        """INSERT INTO policy_config (key, value, updated_at) VALUES (?, ?, ?)
+                           ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at""",
+                        (key, json.dumps(value, ensure_ascii=False), now),
+                    )
 
     # ==================== 工具方法 ====================
 
