@@ -71,14 +71,22 @@ class DockerToolExecutor:
 
     @property
     def docker_available(self) -> bool:
-        """检查 Docker 是否可用"""
+        """检查 Docker 且沙箱镜像是否就绪（否则直接走本地受限执行）"""
         if self._docker_available is None:
             try:
                 result = subprocess.run(
                     ["docker", "version", "--format", "{{.Server.Version}}"],
                     capture_output=True, text=True, timeout=5
                 )
-                self._docker_available = result.returncode == 0
+                if result.returncode != 0:
+                    self._docker_available = False
+                else:
+                    # 守护进程在但镜像缺失时，仍走本地执行：避免每次调用都尝试拉取/失败
+                    img = subprocess.run(
+                        ["docker", "image", "inspect", SANDBOX_IMAGE],
+                        capture_output=True, text=True, timeout=5
+                    )
+                    self._docker_available = img.returncode == 0
             except (FileNotFoundError, subprocess.TimeoutExpired):
                 self._docker_available = False
         return self._docker_available
@@ -158,10 +166,21 @@ class DockerToolExecutor:
                     sandbox_mode="docker",
                 )
             else:
+                stderr = (proc.stderr or "").strip()
+                # 基础设施故障（沙箱镜像缺失 / 守护进程不可达）→ 降级为本地受限执行，
+                # 与"未安装 Docker"时行为一致；避免因环境问题导致所有工具执行直接失败。
+                infra_fail = any(k in stderr for k in (
+                    "Unable to find image", "No such image", "manifest unknown",
+                    "Cannot connect to the Docker daemon", "error during connect",
+                ))
+                if infra_fail:
+                    self._docker_available = False
+                    print(f"[沙箱] Docker 不可用（{stderr[:80]}），降级为本地受限执行")
+                    return self._execute_local(tool_name, args)
                 return ToolResult(
                     success=False,
                     tool_name=tool_name,
-                    error=proc.stderr.strip() or f"Exit code {proc.returncode}",
+                    error=stderr or f"Exit code {proc.returncode}",
                     duration_ms=elapsed,
                     sandbox_mode="docker",
                 )
@@ -198,6 +217,8 @@ class DockerToolExecutor:
                 output = self._sim_draft_document(args)
             elif tool_name == "generate_report":
                 output = self._sim_generate_report(args)
+            elif tool_name == "export_data":
+                output = self._sim_export_data(args)
             else:
                 return ToolResult(
                     success=False,
@@ -310,6 +331,19 @@ class DockerToolExecutor:
             return res["text"]
         except Exception as e:  # noqa: BLE001
             return f"[报表助手] 生成服务暂不可用: {e}"
+
+    def _sim_export_data(self, args: dict) -> str:
+        """导出类工具（沙箱模式：不产生真实外发，仅生成导出回执，供演示与审计）"""
+        fmt = str(args.get("format") or "csv").strip()
+        query = str(args.get("query") or args.get("scope") or "").strip()
+        target = str(args.get("target") or args.get("path") or "").strip()
+        return "\n".join([
+            "[导出回执] 导出任务已完成（沙箱模式：数据不离开本机）",
+            f"- 数据范围: {query or '未指定'}",
+            f"- 输出格式: {fmt}",
+            f"- 输出位置: {target or '受控导出目录（未配置外部地址）'}",
+            "- 说明: 本次调用已经过人工审批与能力令牌校验，并已写入审计链。",
+        ])
 
     def _sim_send_email(self, args: dict) -> str:
         """模拟发送邮件（仅记录，不实际发送）"""

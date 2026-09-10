@@ -933,6 +933,30 @@ class GovAgent:
         # T4: 累积所有迭代的执行结果（不是替换）
         execution_results = list(state.get("tool_execution_results", []))
 
+        # 去重护栏：同一请求内"同名同参数"的工具不再重复执行。
+        # 判定口径为"此前是否已尝试过"（成功或失败都算）——失败重试同样无意义，
+        # 且会形成重试风暴（如沙箱环境异常时 LLM 反复下发同一调用）把请求拖到迭代上限超时。
+        def _tool_sig(name: str, args: dict) -> str:
+            return f"{name}|{json.dumps(args or {}, sort_keys=True, ensure_ascii=False)}"
+
+        _attempted_sigs = {
+            _tool_sig(r.get("tool_name", ""), r.get("args", {}) or {})
+            for r in execution_results
+        }
+        _pending_calls = [
+            tc for tc in tool_calls
+            if _tool_sig(tc.get("name", ""), tc.get("args", {}) or {}) not in _attempted_sigs
+        ]
+        if not _pending_calls:
+            # 本次要调用的工具此前均已尝试过 → 直接结束 ReAct 循环（不再重复执行）
+            return {
+                **state,
+                "tool_execution_results": execution_results,
+                "should_continue_react": False,
+                "current_step": "tool_execution_completed",
+            }
+        tool_calls = _pending_calls
+
         for tool_call in tool_calls:
             tool_name = tool_call.get("name", "")
             tool_args = tool_call.get("args", {})
