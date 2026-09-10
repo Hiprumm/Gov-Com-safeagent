@@ -62,17 +62,45 @@ _LOCK = threading.Lock()
 
 
 def _load_jwt_secret() -> bytes:
-    """加载 JWT 签名密钥：优先 .env 配置；未配置则随机生成并告警（重启后旧令牌失效）。"""
+    """加载 JWT 签名密钥。
+
+    优先级：.env 的 AUTH_JWT_SECRET → data/jwt_secret.key（持久化，权限 0600）→ 临时随机。
+    持久化可避免"未配置密钥时每次重启令全部令牌失效"（生产仍建议在 .env 显式配置密钥，
+    以便多副本共享同一密钥）。
+    """
     secret = str(getattr(settings, "AUTH_JWT_SECRET", "") or "")
     if secret:
         return secret.encode("utf-8")
-    generated = secrets.token_bytes(32)
     try:
-        print("[AUTH][WARN] 未配置 AUTH_JWT_SECRET，已生成临时密钥；"
-              "重启后所有令牌失效。生产环境请在 .env 配置固定密钥。")
+        import os
+        base = os.path.dirname(os.path.abspath(__file__))
+        path = os.path.join(base, "data", "jwt_secret.key")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        if os.path.exists(path):
+            with open(path, "rb") as f:
+                data = f.read().strip()
+            if data:
+                print("[AUTH] 使用已持久化的签名密钥 data/jwt_secret.key"
+                      "（建议在 .env 配置 AUTH_JWT_SECRET 以便多实例共享）")
+                return data
+        gen = secrets.token_bytes(32)
+        with open(path, "wb") as f:
+            f.write(gen)
+        try:
+            os.chmod(path, 0o600)
+        except Exception:
+            pass
+        print("[AUTH][WARN] 未配置 AUTH_JWT_SECRET，已生成并持久化到 data/jwt_secret.key；"
+              "生产环境请在 .env 配置固定密钥。")
+        return gen
     except Exception:
-        pass
-    return generated
+        generated = secrets.token_bytes(32)
+        try:
+            print("[AUTH][WARN] 未配置 AUTH_JWT_SECRET 且无法持久化，已使用临时密钥；"
+                  "重启后所有令牌失效。")
+        except Exception:
+            pass
+        return generated
 
 
 _JWT_SECRET: bytes = _load_jwt_secret()

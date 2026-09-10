@@ -22,9 +22,16 @@ axios.interceptors.response.use(
   (response) => response,
   (error) => {
     const status = error.response?.status
+    const reqUrl = error.config?.url || ''
     let msg: string
     if (status === 401) {
-      // 401：登录失败或令牌失效，已由认证层（登录页/守卫）统一引导，此处不再重复弹窗
+      // 令牌失效/未登录：清理本地令牌并强制回登录页（会话过期自动兜底，避免界面"假登录"）
+      if (!reqUrl.includes('/auth/login') && !reqUrl.includes('/auth/mfa/verify')) {
+        try { localStorage.removeItem('auth_token') } catch { /* ignore */ }
+        if (router.currentRoute.value.path !== '/login') {
+          router.replace('/login')
+        }
+      }
       msg = '登录已失效，请重新登录'
     } else if (status === 429) {
       msg = '请求过于频繁，请稍后再试'

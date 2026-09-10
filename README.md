@@ -248,31 +248,59 @@ python -m uvicorn main:app --host 0.0.0.0 --port 8080 --workers 2
 
 ```bash
 # === 必填 ===
-ZHIPU_API_KEY=your_zhipu_api_key_here   # 智谱 AI API Key
+ZHIPU_API_KEY=your_zhipu_api_key_here   # 智谱 AI API Key（或改用内网 OpenAI 兼容端点）
 
-# === 可选 ===
-HOST=0.0.0.0                             # 服务监听地址
-PORT=8080                                # 服务端口
-LOG_LEVEL=INFO                           # 日志级别
-DEBUG=false                              # 调试模式
+# === 认证与会话（生产务必配置） ===
+AUTH_JWT_SECRET=                        # 令牌签名密钥；留空会持久化到 data/jwt_secret.key（多实例必须显式配置同一值）
+AUTH_TOKEN_TTL_SECONDS=28800            # 访问令牌有效期（秒），默认 8 小时
+AUTH_LOGIN_MAX_FAILS=5                  # 连续登录失败上限
+AUTH_LOGIN_LOCK_SECONDS=300             # 达到上限后的锁定时长（秒）
+AUTH_PASSWORD_MIN_LEN=8                 # 口令最小长度
+AUTH_PASSWORD_REQUIRE_COMPLEXITY=true   # 需含大小写/数字/符号中至少三类
+AUTH_MFA_ENABLED=true                   # 是否允许用户启用 MFA(TOTP)
+AUTH_SSO_TRUSTED_HEADER=                # 受信网关头名（如 X-Remote-User）；配置后启用 SSO 免密登录
 
-# === 鉴权（公网部署时启用） ===
-AUTH_ENABLED=false
-AUTH_API_KEY=your_custom_api_key
+# === 服务间鉴权（生产建议启用） ===
+AUTH_ENABLED=false                      # 置 true 后所有接口需 X-API-Key
+AUTH_API_KEY=your_custom_api_key        # 服务间密钥（SDK/网关调用方使用）
 
-# === 限流 ===
+# === 存储 ===
+STORAGE_BACKEND=sqlite                  # sqlite（默认）| postgres（生产推荐）
+POSTGRES_DSN=                           # 形如 postgresql://user:pwd@host:5432/db；留空用下方分项
+POSTGRES_HOST=localhost
+POSTGRES_PORT=5432
+POSTGRES_DB=safeagent
+POSTGRES_USER=safeagent
+POSTGRES_PASSWORD=
+
+# === 限流与请求体 ===
 RATE_LIMIT_ENABLED=false
 RATE_LIMIT_REQUESTS=30                  # 每分钟请求数
 RATE_LIMIT_WINDOW=60                    # 时间窗口（秒）
+MAX_REQUEST_SIZE_MB=50
+
+# === 其他 ===
+HOST=0.0.0.0
+PORT=8080
+LOG_LEVEL=INFO
+DEBUG=false
+ALLOWED_ORIGINS=http://localhost:5173   # CORS 白名单（逗号分隔，生产收敛为实际域名）
+AUDIT_RETENTION_DAYS=180                # 审计日志留存天数
 ```
 
-### 5.2 Docker Compose 端口
+> **生产上线必读**：[部署与安全加固指南.md](部署与安全加固指南.md)（配置基线、鉴权模型、已知限制、上线检查清单）。
 
-| 服务 | 端口 | 说明 |
+### 5.2 推荐部署拓扑
+
+仓库**不含** Docker 编排文件，生产建议按下述拓扑自行编排（示例）：
+
+| 组件 | 端口 | 说明 |
 |------|------|------|
-| Nginx | 80 | 前端 + API 反向代理 |
-| AI Service | 8080 | FastAPI 后端（可直连） |
-| Tool Sandbox | — | 不暴露端口，仅内部调用 |
+| 反向代理（Nginx 等） | 443/80 | TLS 终止 + 静态托管前端 `frontend/dist` + 转发 `/api` `/ai` `/ws` |
+| AI Service | 8080 | FastAPI 后端（统一鉴权 / 检测 / 治理 / 审计） |
+| PostgreSQL | 5432 | 生产存储后端（`STORAGE_BACKEND=postgres`）；SQLite 仅单机/演示 |
+
+> 反向代理需透传 `X-Auth-Token`、`X-API-Key` 与来源 IP，并放通 WebSocket 升级。
 
 ---
 

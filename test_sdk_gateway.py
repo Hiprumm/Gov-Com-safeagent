@@ -171,7 +171,18 @@ try:
     else:
         raise RuntimeError("gateway 未在 60s 内就绪")
 
+    # 身份贯穿：网关会透传客户端请求头，登录令牌随请求转发到上游（统一鉴权中间件要求已登录）
+    try:
+        _lr = httpx.post("http://127.0.0.1:8080/api/auth/login",
+                         json={"username": "admin", "password": "admin123"}, timeout=10)
+        _TOKEN = (_lr.json() or {}).get("token", "")
+    except Exception:
+        _TOKEN = ""
+    check("网关:获取上游登录令牌（身份贯穿）", bool(_TOKEN), "gateway 透传 X-Auth-Token")
+
     with httpx.Client(timeout=180) as c:
+        if _TOKEN:
+            c.headers["X-Auth-Token"] = _TOKEN
         # --- ① 恶意请求在网关被阻断（403，不达上游）---
         r = c.post(f"{GATEWAY}/api/agent/run", params={"user_input": ATTACK})
         v = r.json().get("verdict", {})

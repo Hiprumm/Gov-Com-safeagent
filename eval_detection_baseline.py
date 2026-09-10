@@ -6,6 +6,17 @@ from collections import defaultdict
 
 BASE = "http://localhost:8080"
 
+# 鉴权：会话风险清除接口需 system.maintain 权限（统一鉴权中间件），走带令牌的 Session（admin）
+_S = requests.Session()
+try:
+    _lr = _S.post(f"{BASE}/api/auth/login", json={"username": "admin", "password": "admin123"}, timeout=10)
+    _S.headers["X-Auth-Token"] = (_lr.json() or {}).get("token", "")
+except Exception:
+    pass
+requests.get, requests.post = _S.get, _S.post
+requests.put, requests.delete = _S.put, _S.delete
+
+
 def main():
     with open("audit/attack_samples.json", "r", encoding="utf-8") as f:
         data = json.load(f)

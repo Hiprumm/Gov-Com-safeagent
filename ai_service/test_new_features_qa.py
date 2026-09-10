@@ -403,14 +403,48 @@ check("K7 user 检索收敛 scope=self", st == 200 and d.get("scope") == "self",
 st, d = call("POST", "/api/audit/logs/search", body={})
 check("K8 审计检索匿名被拒(401)", st == 401, (st, str(d)[:120]))
 
-# ==================== H. 登录锁定（放在最后，避免影响其它用例） ====================
+# ==================== L. 统一鉴权中间件覆盖 ====================
+for m, p, b in [
+    ("PUT", "/api/security/policy", {"policy": {}}),
+    ("POST", "/api/security/tool_management/toggle", {"enabled": True}),
+    ("POST", "/api/security/runtime/terminate/qa_probe", None),
+    ("POST", "/api/security/operation_guard/clear/qa_probe", None),
+    ("POST", "/api/security/session_risk/clear/qa_probe", None),
+    ("POST", "/api/security/cross_source/clear/qa_probe", None),
+    ("POST", "/api/kb/rebuild", None),
+    ("POST", "/api/optimization/tune", {}),
+    ("POST", "/api/agent/delete_session?session_id=qa_probe", None),
+    ("POST", "/api/agent/chat?user_input=hi&session_id=qa_probe", None),
+]:
+    st, d = call(m, p, body=b)
+    check(f"L1 匿名被拒 {p.split('?')[0]}", st == 401, (st, str(d)[:80]))
+
+st, d = call("PUT", "/api/security/policy", token=tokens.get("operator", ""), body={"policy": {}})
+check("L2 operator 无 policy.manage 被拒(403)", st == 403, (st, str(d)[:100]))
+st, d = call("POST", "/api/security/runtime/terminate/qa_probe", token=tokens.get("auditor", ""))
+check("L3 auditor 无 runtime.terminate 被拒(403)", st == 403, (st, str(d)[:100]))
+st, d = call("POST", "/api/optimization/tune", token=tokens.get("user", ""), body={})
+check("L4 user 无 security.scan 被拒(403)", st == 403, (st, str(d)[:100]))
+st, d = call("GET", "/api/security/tool_management/status")
+cur = d.get("enabled") if isinstance(d, dict) else True
+st, d = call("POST", "/api/security/tool_management/toggle", token=admin_tk, body={"enabled": bool(cur)})
+check("L5 admin 可操作工具管控（原值回写）", st == 200 and d.get("enabled") == bool(cur), (st, d))
+st, d = call("POST", "/api/agent/delete_session?session_id=qa_probe_none", token=admin_tk)
+check("L6 登录后可管理会话", st == 200, (st, str(d)[:100]))
+
+# ==================== H. 登录锁定（独立账号：登录失败计数在进程内存，跨运行会残留） ====================
+call("DELETE", "/api/admin/users/qa_lock_probe", token=admin_tk)
+st, d = call("POST", "/api/admin/users", token=admin_tk,
+             body={"username": "qa_lock_probe", "password": "QaLock#2026", "role": "user"})
+check("H0 创建锁定测试账号", isinstance(d, dict) and d.get("success") is True, d)
 lock_codes = []
 for _ in range(5):
-    st, d = call("POST", "/api/auth/login", body={"username": "qa_probe", "password": "definitely-wrong"})
+    st, d = call("POST", "/api/auth/login", body={"username": "qa_lock_probe", "password": "definitely-wrong"})
     lock_codes.append(st)
 check("H1 连续失败触发锁定(423)", 423 in lock_codes, lock_codes)
-st, d = call("POST", "/api/auth/login", body={"username": "qa_probe", "password": "NewProbe#2026"})
+st, d = call("POST", "/api/auth/login", body={"username": "qa_lock_probe", "password": "QaLock#2026"})
 check("H2 锁定期内正确口令也被拒(423)", st == 423, (st, d))
+call("DELETE", "/api/admin/users/qa_lock_probe", token=admin_tk)
 
 # ==================== 清理 ====================
 st, d = call("DELETE", "/api/admin/users/qa_probe", token=admin_tk)

@@ -164,6 +164,73 @@ def _apply_policy_hot():
         print(f"[POLICY] LLM 开关热应用失败: {e}")
 
 
+# ==================== 统一鉴权中间件（生产化） ====================
+# 设计动机：此前靠"每个端点手写 guard"，新增端点极易漏（审计复查实测仍有 11 个改数据端点可被匿名调用）。
+# 改为声明式集中管控：把「方法 + 路径前缀 → 所需权限」登记到一张表，新增端点只加一行，杜绝漏写。
+# 取值：
+#   - "<perm>"        需登录且具备该权限点（权限点来自 permission_engine，单一事实来源）
+#   - "login"         任何已登录账号
+#   - "integration"   服务间调用：登录令牌 或 已配置的 X-API-Key（供 SDK / 网关）
+_PROTECTED_ROUTES: List[tuple] = [
+    # ---- 安全策略与安全控制（改这些等于改防线本身）----
+    ("PUT", "/api/security/policy", "policy.manage"),
+    ("POST", "/api/security/tool_management/toggle", "tools.manage"),
+    ("POST", "/api/security/runtime/terminate", "runtime.terminate"),
+    ("POST", "/api/security/operation_guard/clear", "system.maintain"),
+    ("POST", "/api/security/session_risk/clear", "system.maintain"),
+    ("POST", "/api/security/cross_source/clear", "system.maintain"),
+    ("POST", "/api/kb/rebuild", "system.maintain"),
+    # ---- 检测调优 / 对抗评测 / 回放（安全分析类）----
+    ("POST", "/api/optimization/", "security.scan"),
+    ("POST", "/api/security/bypass_test", "security.scan"),
+    ("POST", "/api/security/bypass_batch_test", "security.scan"),
+    ("POST", "/api/security/pssu/assess", "security.scan"),
+    ("POST", "/api/scenarios/", "security.scan"),
+    ("POST", "/api/replay/", "security.scan"),
+    # ---- 会话管理（用户操作）----
+    ("POST", "/api/agent/new_session", "login"),
+    ("POST", "/api/agent/clear_session", "login"),
+    ("POST", "/api/agent/delete_session", "login"),
+    ("POST", "/api/agent/rename_session", "login"),
+    ("POST", "/api/agent/recall_messages", "login"),
+    # ---- 智能体执行入口（会真实执行工具）→ 登录 或 服务间 API Key ----
+    ("POST", "/api/agent/chat", "integration"),
+    ("POST", "/api/agent/run", "integration"),
+    ("POST", "/api/agent/file_upload", "integration"),
+]
+
+
+@app.middleware("http")
+async def unified_authorization_middleware(request: Request, call_next):
+    """统一鉴权：按 _PROTECTED_ROUTES 表校验（未登记的路径不干预）。"""
+    path = request.url.path
+    method = request.method.upper()
+    need: Optional[str] = None
+    for m, prefix, perm in _PROTECTED_ROUTES:
+        if m == method and path.startswith(prefix):
+            need = perm
+            break
+    if need is None:
+        return await call_next(request)
+
+    # 服务间调用：已配置 API Key 且请求头匹配
+    if (need == "integration" and settings.AUTH_API_KEY
+            and request.headers.get("X-API-Key") == settings.AUTH_API_KEY):
+        return await call_next(request)
+
+    identity = current_identity(request.headers.get("X-Auth-Token"))
+    if not identity:
+        return JSONResponse(status_code=401, content={"detail": "未登录或登录已失效"})
+    if need in ("login", "integration"):
+        return await call_next(request)
+    if not permission_engine.has_permission(identity.get("role"), need):
+        return JSONResponse(
+            status_code=403,
+            content={"detail": f"无权限：需要 {need} 权限（当前角色 {identity.get('role')}）"},
+        )
+    return await call_next(request)
+
+
 # ======== 启动清理空会话 + 应用安全策略 ========
 @app.on_event("startup")
 async def startup_cleanup():
@@ -192,6 +259,14 @@ async def startup_cleanup():
               f"清理过期日志 {removed} 条")
     except Exception as e:
         print(f"[STARTUP] 应用安全策略时出错: {e}")
+    # 生产加固巡检：演示账号仍使用默认口令时显式告警（避免带默认口令上线）
+    try:
+        default_pw_users = [u for u in DEMO_USERS if verify_password(u, "admin123")]
+        if default_pw_users:
+            print("[STARTUP][WARN] 以下账号仍在使用默认口令 admin123，生产环境请立即修改或停用："
+                  + ", ".join(default_pw_users))
+    except Exception as e:
+        print(f"[STARTUP] 默认口令巡检出错: {e}")
 
 
 @app.get("/")
@@ -465,14 +540,18 @@ async def get_runtime_anomalies(session_id: str):
 
 
 @app.post("/api/security/runtime/terminate/{session_id}")
-async def terminate_session(session_id: str, reason: str = "手动终止"):
-    """一键终止会话——中断智能体ReAct循环"""
+async def terminate_session(request: Request, session_id: str, reason: str = "手动终止"):
+    """一键终止会话——中断智能体ReAct循环（需 runtime.terminate 权限，审计归责到真实操作人）"""
     try:
+        actor = current_identity(request.headers.get("X-Auth-Token")) or {}
         termination_id = gov_agent.security_layer.runtime_monitor.terminate(session_id, reason)
         audit_logger.create_log(
-            user_id="admin", user_role="admin", agent_id="gov_agent",
+            user_id=actor.get("username") or "unknown",
+            user_role=actor.get("role") or "unknown",
+            agent_id="gov_agent",
             action_type="manual_termination",
-            action_details={"session_id": session_id, "reason": reason},
+            action_details={"session_id": session_id, "reason": reason,
+                            "department": actor.get("department", "")},
             risk_level=RiskLevel.HIGH,
             is_blocked=True,
             blocking_reason=f"手动终止: {reason}",
