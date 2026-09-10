@@ -1,5 +1,6 @@
 import sys
 import os
+import re
 import uuid
 import base64
 import json
@@ -464,11 +465,12 @@ class GovAgent:
             from langchain_core.prompts import ChatPromptTemplate
             from langchain_core.output_parsers import JsonOutputParser
             
-            api_key = settings.ZHIPU_API_KEY or os.environ.get("ZHIPUAI_API_KEY") or os.environ.get("ZHIPU_API_KEY")
-            if api_key:
-                from langchain_community.chat_models import ChatZhipuAI
-                self.llm = ChatZhipuAI(model="glm-4", temperature=0, zhipuai_api_key=api_key)
-                self.llm_available = True
+            from llm_runtime import load_config
+            from llm_providers import build_chat_model
+            self.llm = build_chat_model(load_config())
+            self.llm_available = self.llm is not None
+            # 链模板始终构建：模型接入可在「系统状态-模型接入」中配置并热启用（refresh_llm）
+            if True:
                 
                 self.prompt_template = ChatPromptTemplate.from_messages([
                     ("system", """你是一个面向政企场景的安全智能体。请结合对话历史和之前的工具执行结果，分析用户输入，判断是否需要调用工具。
@@ -486,6 +488,8 @@ class GovAgent:
 - execute_command: 执行系统命令，参数: command
 - export_data: 导出数据，参数: format, query
 - search_knowledge: 搜索知识库，参数: query
+- draft_document: 起草公文/通知/请示/报告等（拟稿助手），参数: document_type(文种), subject(标题主题), outline(可选要点)
+- generate_report: 生成结构化报表（报表/汇总/台账/月报），参数: report_name(报表名), report_type(类型), columns(表头), rows(数据记录), note(口径说明)
 
 输出格式：
 {{"tool_calls": [], "reasoning": "直接回答用户问题"}}
@@ -518,9 +522,10 @@ class GovAgent:
                 ])
                 
                 self.parser = JsonOutputParser()
-                print("[INFO] LLM initialized with Zhipu API")
+            if self.llm_available:
+                print("[INFO] LLM 对话主链已启用（可在 系统状态-模型接入 中热更新）")
             else:
-                print("[INFO] ZHIPU_API_KEY not set, using rule-based fallback")
+                print("[INFO] 未配置模型接入：对话主链使用规则回退（可到 系统状态-模型接入 配置内网模型）")
         except Exception as e:
             print(f"[INFO] LLM initialization failed: {str(e)}, using rule-based fallback")
         
@@ -531,6 +536,19 @@ class GovAgent:
         # 方向A-5：输出过滤器（response_generation 后对响应做敏感数据脱敏）
         self.output_filter = OutputFilter()
         self.graph = self._build_graph()
+
+    def refresh_llm(self, cfg: dict = None) -> bool:
+        """模型接入配置保存后热刷新对话主链模型（无需重启），返回是否可用"""
+        try:
+            from llm_runtime import load_config
+            from llm_providers import build_chat_model
+            llm = build_chat_model(cfg or load_config())
+            self.llm = llm
+            self.llm_available = llm is not None
+            return self.llm_available
+        except Exception:  # noqa: BLE001
+            self.llm_available = False
+            return False
     
     def _build_graph(self) -> StateGraph:
         workflow = StateGraph(AgentState)
@@ -773,8 +791,57 @@ class GovAgent:
     
     def _fallback_tool_selection(self, user_input: str) -> List[Dict[str, Any]]:
         tool_calls = []
-        
-        if any(keyword in user_input for keyword in ["查询", "查找", "搜索", "获取", "读取"]):
+
+        # 拟稿类请求 → 触发拟稿助手（内部已依据知识库起草，含 AIGC 标识与人工核定提示）
+        draft_hint = re.search(
+            r"(起草|草拟|拟稿|代拟|帮我写|请写|写一份|拟一份|代写).{0,40}(通知|请示|报告|函|纪要|简报|汇报|方案|说明|汇报材料|公开信|工作总结)",
+            user_input,
+        )
+        if draft_hint:
+            subject = user_input.strip().strip("。！？；;")[:80]
+            # 尽力识别文种
+            doc_type = "通知"
+            for t in ("公开信", "工作总结", "汇报材料", "请示", "纪要", "简报", "报告", "汇报", "函", "方案", "通知"):
+                if t in subject:
+                    doc_type = t
+                    break
+            tool_calls.append({
+                "name": "draft_document",
+                "args": {"document_type": doc_type, "subject": subject},
+            })
+            return tool_calls
+
+        # 报表/统计类请求 → 触发报表助手（据口径/数据生成结构化报表）
+        report_hint = re.search(r"(生成|做|做一份|出一份|汇总|统计|列出).{0,30}(报表|汇总表|台账|月报|统计表|数据表)", user_input)
+        if report_hint:
+            name = user_input.strip().strip("。！？；;")
+            name = re.sub(r"^(请|帮我|帮我用AI|让AI)\s*", "", name)[:60]
+            rtype = "汇总表"
+            for t in ("台账", "月报", "统计表", "汇总表"):
+                if t in name:
+                    rtype = t
+                    break
+            tool_calls.append({
+                "name": "generate_report",
+                "args": {"report_name": name, "report_type": rtype},
+            })
+            return tool_calls
+
+        # 政务知识/制度类提问 → 优先走知识库语义检索（本地 RAG，命中政务沙盒语料）
+        kb_hint = ["依据知识库", "查一下", "查知识库", "知识库", "参考制度", "按制度",
+                   "政策", "办事", "办理", "申请条件", "怎么申请", "如何申请",
+                   "报销", "差旅", "标准", "流程", "规定", "规范", "制度", "红线",
+                   "公租房", "公积金", "社保", "盖章", "用印", "采购", "公文", "审批流程"]
+        is_kb_query = any(k in user_input for k in kb_hint)
+        if is_kb_query:
+            tool_calls.append({
+                "name": "search_knowledge",
+                "args": {"query": user_input}
+            })
+
+        # 通用"查询/查找/读取"且非知识类提问 → 才走文件读取（避免与知识检索冲突）
+        if (any(keyword in user_input for keyword in ["查询", "查找", "搜索", "获取", "读取"])
+                and not is_kb_query):
             tool_calls.append({
                 "name": "read_file",
                 # 方向A-4：改为白名单内相对路径（原绝对路径 /data/docs/gov_doc.txt 会被沙箱拦截）
@@ -809,7 +876,7 @@ class GovAgent:
         for tool_call in tool_calls:
             tool_name = tool_call.get("name", "")
             
-            if tool_name in ["read_file", "search_knowledge"]:
+            if tool_name in ["read_file", "search_knowledge", "draft_document", "generate_report"]:
                 selected_tools.append(tool_call)
             elif tool_name in ["write_file", "execute_command"]:
                 selected_tools.append(tool_call)
@@ -954,12 +1021,14 @@ class GovAgent:
                         think_text = s.reasoning
                         break
                 self.security_layer.audit_logger.create_log(
-                    user_id="user",
-                    user_role="user",
+                    user_id=state.get("user_id") or "user",
+                    user_role=state.get("user_role") or "user",
                     agent_id="gov_agent",
                     action_type="tool_execution",
                     action_details={"tool_name": tool_name, "tool_args": tool_args,
-                                    "status": "success"},
+                                    "status": "success",
+                                    "department": state.get("department") or "",
+                                    "actor_name": state.get("display_name") or state.get("user_id") or "user"},
                     risk_level=RiskLevel.NONE,
                     is_blocked=False,
                     session_id=session_id,
@@ -1021,13 +1090,15 @@ class GovAgent:
                 labeled = apply_aigc_label(final_response, aigc_metadata)
                 
                 self.security_layer.audit_logger.create_log(
-                    user_id="user",
-                    user_role="user",
+                    user_id=state.get("user_id") or "user",
+                    user_role=state.get("user_role") or "user",
                     agent_id="gov_agent",
                     action_type="response_generation",
                     action_details={"response_length": len(final_response),
                                     "aigc_labeled": True,
-                                    "content_id": aigc_metadata["content_id"]},
+                                    "content_id": aigc_metadata["content_id"],
+                                    "department": state.get("department") or "",
+                                    "actor_name": state.get("display_name") or state.get("user_id") or "user"},
                     risk_level=RiskLevel.NONE,
                     session_id=session_id,
                 )
@@ -1047,13 +1118,15 @@ class GovAgent:
         labeled = apply_aigc_label(final_response, aigc_metadata)
         
         self.security_layer.audit_logger.create_log(
-            user_id="user",
-            user_role="user",
+            user_id=state.get("user_id") or "user",
+            user_role=state.get("user_role") or "user",
             agent_id="gov_agent",
             action_type="response_generation",
             action_details={"response_length": len(final_response),
                             "aigc_labeled": True,
-                            "content_id": aigc_metadata["content_id"]},
+                            "content_id": aigc_metadata["content_id"],
+                            "department": state.get("department") or "",
+                            "actor_name": state.get("display_name") or state.get("user_id") or "user"},
             risk_level=RiskLevel.NONE,
             session_id=session_id,
         )
@@ -1085,8 +1158,8 @@ class GovAgent:
         if result.filtered_count > 0:
             risk_level = RiskLevel.HIGH if result.has_critical else RiskLevel.MEDIUM
             self.security_layer.audit_logger.create_log(
-                user_id="user",
-                user_role="user",
+                user_id=state.get("user_id") or "user",
+                user_role=state.get("user_role") or "user",
                 agent_id="gov_agent",
                 action_type="output_filter",
                 action_details={
@@ -1095,6 +1168,8 @@ class GovAgent:
                     "has_critical": audit_summary["has_critical"],
                     "original_length": len(final_response),
                     "filtered_length": len(result.filtered),
+                    "department": state.get("department") or "",
+                    "actor_name": state.get("display_name") or state.get("user_id") or "user",
                 },
                 risk_level=risk_level,
                 session_id=session_id,
@@ -1286,13 +1361,20 @@ class GovAgent:
             "current_step": "blocked",
         }
     
-    def run_with_history(self, session_id: str, user_input: str, input_source: str = "user_input") -> Dict[str, Any]:
+    def run_with_history(self, session_id: str, user_input: str, input_source: str = "user_input",
+                         user: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         conversation_history = self.conversation_manager.get_history(session_id)
-        
+        identity = user or {}
+
         initial_state: AgentState = {
             "user_input": user_input,
             "input_source": input_source,
             "session_id": session_id,
+            # 操作者身份：贯穿 agent 审计/审批到真实登录账号+部门
+            "user_id": identity.get("username") or "user",
+            "user_role": identity.get("role") or "user",
+            "department": identity.get("department") or "",
+            "display_name": identity.get("display_name") or identity.get("username") or "user",
             "detection_results": [],
             "risk_level": RiskLevel.NONE,
             "risk_summary": None,
@@ -1349,16 +1431,18 @@ class GovAgent:
             "aigc_metadata": result.get("aigc_metadata", None),
         }
     
-    def run(self, user_input: str, input_source: str = "user_input", session_id: Optional[str] = None) -> Dict[str, Any]:
+    def run(self, user_input: str, input_source: str = "user_input", session_id: Optional[str] = None,
+            user: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         if not session_id:
             session_id = self.conversation_manager.create_session()
         else:
             # 外部传入的 session_id 可能尚未在 DB 中创建，确保存在以避免外键失败
             session_id = self.conversation_manager.ensure_session(session_id)
 
-        return self.run_with_history(session_id, user_input, input_source)
-    
-    def process_file_message(self, session_id: str, file_data: str, file_type: str, filename: str) -> Dict[str, Any]:
+        return self.run_with_history(session_id, user_input, input_source, user=user)
+
+    def process_file_message(self, session_id: str, file_data: str, file_type: str, filename: str,
+                             user: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         processed = self.file_processor.process_file(file_data, file_type, filename)
         
         if processed["detection_required"] and processed["content"]:
@@ -1385,7 +1469,7 @@ class GovAgent:
         
         self.conversation_manager.add_message(session_id, "user", f"[文件上传] {filename}")
         
-        return self.run_with_history(session_id, user_input, "uploaded_doc")
+        return self.run_with_history(session_id, user_input, "uploaded_doc", user=user)
     
     def get_conversation_history(self, session_id: str) -> Dict[str, Any]:
         history = self.conversation_manager.get_history(session_id)

@@ -4,7 +4,7 @@ import {
   Menu, Search, BarChart3, Zap,
   ShieldX, Clock, AlertTriangle, ShieldCheck,
   MessageSquare, Shield, Settings, FileText, ClipboardCheck,
-  Sun, Moon, LayoutDashboard, Swords, SlidersHorizontal, Activity,
+  Sun, Moon, LayoutDashboard, Swords, SlidersHorizontal, Activity, Server, LogIn, LogOut,
 } from 'lucide-vue-next'
 import ChatPanel from '@/components/chat/ChatPanel.vue'
 import DashboardPanel from '@/components/dashboard/DashboardPanel.vue'
@@ -15,6 +15,11 @@ import SecurityPanel from '@/components/security/SecurityPanel.vue'
 import ApprovalPanel from '@/components/approval/ApprovalPanel.vue'
 import AuditPanel from '@/components/audit/AuditPanel.vue'
 import ToolPanel from '@/components/tools/ToolPanel.vue'
+import SystemStatusPanel from '@/components/system/SystemStatusPanel.vue'
+import NotificationBell from '@/components/notify/NotificationBell.vue'
+import GuideBanner from '@/components/onboarding/GuideBanner.vue'
+import { useAuth } from '@/composables/useAuth'
+import { useRouter } from 'vue-router'
 import { useToast } from '@/composables/useToast'
 import { useTheme } from '@/composables/useTheme'
 import { useDashboard, useDashboardRealtime } from '@/composables/useDashboard'
@@ -31,6 +36,7 @@ const tabIconMap: Record<string, any> = {
   tools: Settings,
   approval: ClipboardCheck,
   policy: SlidersHorizontal,
+  system: Server,
   audit: FileText,
 }
 const kpiIconMap: Record<string, any> = {
@@ -58,9 +64,53 @@ const tabs = [
   { name: 'approval', label: '审批中心', sub: '人工审批 · 令牌授予', icon: 'approval', group: '安全运营' },
   { name: 'audit', label: '审计追溯', sub: '过程可审计·责任可追溯', icon: 'audit', group: '合规审计' },
   { name: 'policy', label: '策略配置', sub: '阈值/开关 · 热生效', icon: 'policy', group: '系统配置' },
+  { name: 'system', label: '系统状态', sub: '自检 · 数据维护', icon: 'system', group: '系统配置' },
 ]
 
 const currentTab = computed(() => tabs.find(t => t.name === activeTab.value))
+
+// ---- 账号 / 角色体系（强制登录）：只有登录用户能进入本工作台，导航按角色收敛 ----
+const router = useRouter()
+const { currentUser, initAuth, logout } = useAuth()
+
+const ROLE_ALLOWED_TABS: Record<string, string[]> = {
+  admin: tabs.map(t => t.name),
+  operator: ['chat', 'dashboard', 'runtime', 'security', 'tools', 'approval', 'audit'],
+  auditor: ['chat', 'dashboard', 'audit', 'approval'],
+  manager: ['chat', 'dashboard', 'audit', 'approval'],
+  user: ['chat', 'dashboard', 'audit'],
+}
+const visibleTabs = computed(() => {
+  const role = currentUser.value?.role || ''
+  const allow = ROLE_ALLOWED_TABS[role] || []
+  return tabs.filter(t => allow.includes(t.name))
+})
+// 登录角色切换后，若当前模块不在其权限内则回落至智能问答
+watch(currentUser, () => {
+  if (!currentUser.value) {
+    // 登录态丢失（token 被服务端清理/过期）→ 回到登录页
+    if (router.currentRoute.value.path !== '/login') router.replace('/login')
+    return
+  }
+  const allow = ROLE_ALLOWED_TABS[currentUser.value.role] || []
+  if (!allow.includes(activeTab.value)) activeTab.value = 'chat'
+})
+const userLogout = () => { logout() }
+const roleLabel = (r?: string) =>
+  ({ admin: '管理员', operator: '安全运维', auditor: '合规审计', manager: '部门负责人', user: '业务用户' } as Record<string, string>)[r || ''] || ''
+
+// ---- 首次使用引导（P1-3） ----
+const showGuide = ref(true)
+try { if (localStorage.getItem('guide_done')) showGuide.value = false } catch { /* ignore */ }
+const dismissGuide = () => {
+  showGuide.value = false
+  try { localStorage.setItem('guide_done', '1') } catch { /* ignore */ }
+}
+const guideGoto = (tab: string) => { switchTab(tab) }
+const showGuideAgain = () => {
+  showGuide.value = true
+  try { localStorage.removeItem('guide_done') } catch { /* ignore */ }
+}
 
 // 面板组件映射：KeepAlive 缓存各面板实例，切换模块不销毁状态
 // （会话/选中项/测试历史在 tab 间保留，仅页面刷新时重置）
@@ -73,6 +123,7 @@ const panelMap: Record<string, any> = {
   approval: ApprovalPanel,
   tools: ToolPanel,
   policy: PolicyPanel,
+  system: SystemStatusPanel,
   audit: AuditPanel,
 }
 
@@ -101,11 +152,21 @@ const statusKPIs = computed(() => {
   ]
 })
 
+// 数据收敛视角标签（由后端按当前登录角色返回）
+const dataScopeLabel = computed(() => {
+  const s = overview.value?.scope
+  if (!s) return ''
+  if (s.scope === 'all') return '全平台视角'
+  if (s.scope === 'self') return '仅本人视角'
+  return `本部门视角：${s.department || ''}`.trim()
+})
+
 // 命令面板
 const commandItems = computed(() => {
   const allItems = [
-    ...tabs.map(t => ({ label: t.label, sub: t.sub, action: () => switchTab(t.name), type: '导航' })),
+    ...visibleTabs.value.map(t => ({ label: t.label, sub: t.sub, action: () => switchTab(t.name), type: '导航' })),
     { label: '评测报告', sub: '查看检测评测结果', action: () => window.open('/evaluation', '_self'), type: '导航' },
+    { label: '新手引导', sub: '重新查看首次使用引导', action: () => { showGuideAgain() }, type: '操作' },
     { label: '刷新数据', sub: '重新加载当前面板', action: () => { success('数据已刷新') }, type: '操作' },
     { label: '折叠侧边栏', sub: '切换侧边栏显示', action: () => toggleSidebar(), type: '操作' },
   ]
@@ -147,6 +208,7 @@ function handleKeydown(e: KeyboardEvent) {
 
 onMounted(() => {
   checkMobile()
+  initAuth()
   window.addEventListener('resize', checkMobile)
   window.addEventListener('keydown', handleKeydown)
 })
@@ -200,6 +262,50 @@ onUnmounted(() => {
           <Moon v-else class="w-5 h-5 text-secondary" />
         </button>
 
+        <!-- 通知中心 -->
+        <NotificationBell />
+
+        <!-- 后台管理（仅系统管理员） -->
+        <button
+          v-if="currentUser?.role === 'admin'"
+          @click="router.push('/admin/users')"
+          class="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-accent/10 text-accent border border-accent/20 text-xs sm:text-sm font-medium hover:bg-accent/20 transition-colors active:scale-95 flex-shrink-0"
+          title="进入用户与组织管理后台"
+        >
+          <Settings class="w-4 h-4 flex-shrink-0" />
+          <span class="hidden sm:inline">后台管理</span>
+        </button>
+
+        <!-- 用户身份 / 登录 -->
+        <template v-if="currentUser">
+          <div
+            class="flex items-center gap-1.5 px-1.5 sm:px-2 py-1 rounded-full bg-elevated/60 border border-border-default"
+            :title="`${currentUser.display_name}（${roleLabel(currentUser.role)}）`"
+          >
+            <span class="w-6 h-6 rounded-full bg-gradient-to-br from-accent to-low flex items-center justify-center text-white text-xs font-bold flex-shrink-0">
+              {{ currentUser.display_name.slice(0, 1) }}
+            </span>
+            <span class="hidden lg:inline text-xs font-medium text-primary max-w-[96px] truncate">{{ currentUser.display_name }}</span>
+            <span class="hidden xl:inline text-[10px] px-1.5 py-0.5 rounded-full bg-accent/10 text-accent font-medium">{{ roleLabel(currentUser.role) }}</span>
+          </div>
+          <button
+            @click="userLogout"
+            class="p-1.5 rounded-lg hover:bg-hover transition-colors text-muted hover:text-critical flex-shrink-0 active:scale-95"
+            title="退出登录"
+          >
+            <LogOut class="w-4 h-4" />
+          </button>
+        </template>
+        <button
+          v-else
+          @click="router.push('/login')"
+          class="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-accent/10 text-accent border border-accent/20 text-xs sm:text-sm font-medium hover:bg-accent/20 transition-colors active:scale-95 flex-shrink-0"
+          title="重新登录"
+        >
+          <LogIn class="w-4 h-4 flex-shrink-0" />
+          <span class="hidden sm:inline">重新登录</span>
+        </button>
+
         <div class="flex items-center gap-1.5 px-2 sm:px-2.5 py-1 rounded-full bg-safe/10 border border-safe/20">
           <span class="w-2 h-2 rounded-full bg-safe animate-pulse"></span>
           <span class="text-xs text-safe font-medium hidden sm:inline">系统运行中</span>
@@ -217,7 +323,7 @@ onUnmounted(() => {
 
     <!-- ========== 面包屑 + 状态总览 ========== -->
     <div class="bg-surface/50 border-b border-border-default px-4 sm:px-6 py-3 flex-shrink-0">
-      <!-- 面包屑 -->
+      <!-- 面包屑 + 数据视角 -->
       <div class="flex items-center gap-2 text-sm mb-3">
         <template v-for="(crumb, idx) in breadcrumbs" :key="idx">
           <div v-if="idx > 0" class="text-disabled">/</div>
@@ -225,6 +331,15 @@ onUnmounted(() => {
             {{ crumb.label }}
           </span>
         </template>
+        <div class="ml-auto"></div>
+        <span
+          v-if="dataScopeLabel"
+          class="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full border text-[11px] font-medium bg-accent/10 text-accent border-accent/25"
+          title="按当前登录角色收敛：admin/operator/auditor=全平台，manager=本部门，user=仅本人"
+        >
+          <span class="w-1.5 h-1.5 rounded-full bg-current opacity-70"></span>
+          {{ dataScopeLabel }}
+        </span>
       </div>
       <!-- KPI 状态条 -->
       <div class="grid grid-cols-2 lg:grid-cols-4 gap-3">
@@ -244,6 +359,9 @@ onUnmounted(() => {
         </div>
       </div>
     </div>
+
+    <!-- ========== 首次使用引导横幅 ========== -->
+    <GuideBanner v-if="showGuide" @close="dismissGuide" @goto="guideGoto" />
 
     <!-- ========== 移动端侧边栏遮罩 ========== -->
     <div
@@ -268,7 +386,7 @@ onUnmounted(() => {
       >
         <div class="flex-1 py-3 overflow-y-auto">
           <button
-            v-for="(tab, idx) in tabs"
+            v-for="(tab, idx) in visibleTabs"
             :key="tab.name"
             @click="switchTab(tab.name)"
             :class="[
@@ -291,7 +409,7 @@ onUnmounted(() => {
 
       <main class="flex-1 overflow-hidden p-3 sm:p-6 min-h-0">
         <div
-          class="bg-surface rounded-2xl border border-border-default p-4 sm:p-6 h-full overflow-hidden"
+          class="bg-surface rounded-2xl border border-border-default p-4 sm:p-6 h-full overflow-x-hidden overflow-y-auto"
           :class="animFlip ? 'animate-card-in-b' : 'animate-card-in'"
         >
           <KeepAlive>
@@ -353,5 +471,6 @@ onUnmounted(() => {
     <footer class="h-8 bg-surface border-t border-border-default flex items-center justify-center flex-shrink-0">
       <p class="text-xs text-muted truncate px-2">面向政企场景的大模型智能体安全关键技术研究 · SafeAgent v5.0</p>
     </footer>
+
   </div>
 </template>

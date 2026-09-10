@@ -88,6 +88,25 @@ ws_manager = ConnectionManager()
 
 # ==================== 便捷推送函数 ====================
 
+# ==================== 通知持久化与外部渠道（站内信 / Webhook） ====================
+
+def _emit_notification(type_: str, title: str, message: str, level: str = "info", data: dict = None):
+    """事件同时写入站内通知并触发 Webhook 投递（均尽力而为，不影响主流程）"""
+    try:
+        from storage import get_storage
+        get_storage().add_notification(type_, title, message, level)
+    except Exception:
+        pass
+    try:
+        from notify_webhook import fire_webhook_background
+        fire_webhook_background({
+            "type": type_, "title": title, "message": message,
+            "level": level, "data": data or {},
+        })
+    except Exception:
+        pass
+
+
 async def push_approval_update(request_id: str, action: str, risk_level: str = "unknown",
                                 detail: dict = None):
     """
@@ -110,6 +129,19 @@ async def push_approval_update(request_id: str, action: str, risk_level: str = "
         }
     }
     await ws_manager.broadcast_to_channel("approvals", event)
+    # 站内信 + Webhook
+    action_cn = {
+        "created": "新增待审批", "approved": "审批已批准",
+        "auto_approved": "低风险自动批准", "rejected": "审批被驳回",
+    }.get(action, action)
+    detail_txt = dict(detail or {})
+    tool = detail_txt.get("tool_name") or detail_txt.get("_tool_name") or ""
+    _emit_notification(
+        "approval", f"审批 {action_cn}",
+        f"审批单 {request_id[:18]}" + (f" · 工具 {tool}" if tool else ""),
+        level=risk_level if risk_level in ("low", "medium", "high", "critical") else "medium",
+        data={"request_id": request_id, "action": action, **detail_txt},
+    )
 
 
 async def push_risk_alert(session_id: str, risk_level: str, message: str,
@@ -136,6 +168,15 @@ async def push_risk_alert(session_id: str, risk_level: str, message: str,
         }
     }
     await ws_manager.broadcast_to_channel("risk_alerts", event)
+    # 仅中高风险写站内信，避免噪音
+    if risk_level in ("medium", "high", "critical"):
+        _emit_notification(
+            "risk_alert", "风险告警",
+            f"会话 {session_id[:12]} · {message[:120]}"
+            + (f" · {attack_type}" if attack_type else ""),
+            level=risk_level,
+            data={"session_id": session_id, "risk_level": risk_level, "attack_type": attack_type},
+        )
 
 
 async def push_detection_event(source: str, risk_level: str, attack_type: str = None,
@@ -162,6 +203,14 @@ async def push_detection_event(source: str, risk_level: str, attack_type: str = 
         }
     }
     await ws_manager.broadcast_to_channel("detections", event)
+    # 高危/严重检测事件写站内信
+    if risk_level in ("high", "critical"):
+        _emit_notification(
+            "detection", f"检测事件：{attack_type or source or 'unknown'}",
+            evidence[:160] if evidence else f"来源 {source} · 置信度 {confidence:.2f}",
+            level=risk_level,
+            data={"source": source, "risk_level": risk_level, "attack_type": attack_type},
+        )
 
 
 # ==================== WebSocket 路由处理 ====================

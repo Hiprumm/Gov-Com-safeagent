@@ -409,6 +409,56 @@ const fmtTime = (iso: string) => {
     return iso
   }
 }
+
+// ---------- 报告导出 ----------
+const downloadMarkdown = () => {
+  const r = report.value
+  if (!r) return
+  const m = r.metrics || {}
+  const pct = (v?: number) => (typeof v === 'number' ? `${(v * 100).toFixed(2)}%` : '--')
+  const L: string[] = []
+  L.push('# 政企大模型智能体安全平台 — 检测效果评测报告')
+  L.push('')
+  L.push(`- 报告生成时间：${fmtTime(r.generated_at)}`)
+  L.push(`- 评测样本总数：${m.total ?? '--'} 条`)
+  L.push('')
+  L.push('## 一、总体指标')
+  L.push('')
+  L.push('| 指标 | 数值 |')
+  L.push('| --- | --- |')
+  L.push(`| 混淆矩阵 | TP=${m.tp ?? '--'}，TN=${m.tn ?? '--'}，FP=${m.fp ?? '--'}，FN=${m.fn ?? '--'} |`)
+  L.push(`| 准确率 Accuracy | ${pct(m.accuracy)} |`)
+  L.push(`| 精确率 Precision | ${pct(m.precision)} |`)
+  L.push(`| 召回率 Recall | ${pct(m.recall)} |`)
+  L.push(`| F1 分数 | ${pct(m.f1_score)} |`)
+  if (m.false_positive_rate != null) L.push(`| 误报率 | ${pct(m.false_positive_rate)} |`)
+  L.push('')
+  const cls = r.classification || {}
+  const byType: Record<string, any> = cls.by_type || {}
+  const types = Object.keys(byType).filter(k => k !== 'normal')
+  if (types.length) {
+    L.push('## 二、分类别检测效果（近 7 日样本）')
+    L.push('')
+    L.push('| 攻击类型 | 样本数 | 检出数 |')
+    L.push('| --- | --- | --- |')
+    for (const t of types) {
+      const item = byType[t]
+      L.push(`| ${t} | ${item?.total ?? '--'} | ${item?.detected ?? '--'} |`)
+    }
+    L.push('')
+  }
+  const blob = new Blob([L.join('\n')], { type: 'text/markdown;charset=utf-8' })
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = 'SafeAgent-安全评测报告.md'
+  a.click()
+  URL.revokeObjectURL(url)
+}
+
+const printReport = () => {
+  window.print()
+}
 </script>
 
 <template>
@@ -425,11 +475,23 @@ const fmtTime = (iso: string) => {
             <p :style="{ color: TEXT_DIM, fontSize: '13px' }">政企大模型智能体安全检测效果评估</p>
           </div>
         </div>
-        <a
-          href="/"
-          :style="{ padding: '8px 16px', background: '#1e3a5f', color: BLUE_LIGHT, borderRadius: '8px', textDecoration: 'none', fontSize: '14px', fontWeight: 500, border: '1px solid #1e40af', transition: 'all .2s' }"
-          class="hover:bg-blue-900/30"
-        >← 返回主页</a>
+        <div :style="{ display: 'flex', alignItems: 'center', gap: '10px', flexWrap: 'wrap' }">
+          <button
+            v-if="report"
+            @click="downloadMarkdown"
+            :style="{ padding: '8px 14px', background: '#14532d', color: '#86efac', borderRadius: '8px', fontSize: '14px', fontWeight: 500, border: '1px solid #15803d', cursor: 'pointer' }"
+          >下载 Markdown</button>
+          <button
+            v-if="report"
+            @click="printReport"
+            :style="{ padding: '8px 14px', background: '#1e3a5f', color: BLUE_LIGHT, borderRadius: '8px', fontSize: '14px', fontWeight: 500, border: '1px solid #1e40af', cursor: 'pointer' }"
+          >打印 / 存为 PDF</button>
+          <a
+            href="/"
+            :style="{ padding: '8px 16px', background: '#1e3a5f', color: BLUE_LIGHT, borderRadius: '8px', textDecoration: 'none', fontSize: '14px', fontWeight: 500, border: '1px solid #1e40af', transition: 'all .2s' }"
+            class="hover:bg-blue-900/30"
+          >← 返回主页</a>
+        </div>
       </div>
     </header>
 

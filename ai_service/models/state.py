@@ -10,6 +10,11 @@ class AgentState(TypedDict):
     user_input: str
     input_source: str
     session_id: Optional[str]
+    # 操作者身份（贯穿 agent 审计/审批到真实登录账号）
+    user_id: str
+    user_role: str
+    department: str
+    display_name: str
     detection_results: List[DetectionResult]
     risk_level: RiskLevel
     risk_summary: Optional[Dict[str, Any]]

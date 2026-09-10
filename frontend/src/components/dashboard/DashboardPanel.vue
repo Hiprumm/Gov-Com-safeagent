@@ -119,6 +119,20 @@ const attackPieOption = computed(() => {
 
 const recentEvents = computed(() => overview.value?.recent_events || [])
 
+// 数据收敛视角（all=全平台 / dept=本部门 / self=仅本人）
+const dataScope = computed(() => overview.value?.scope)
+const scopeBadge = computed(() => {
+  const s = dataScope.value
+  if (!s) return null
+  return {
+    label: s.scope === 'all' ? '全平台' : s.scope === 'self' ? '仅本人' : '本部门',
+    detail: s.scope === 'all' ? '' : s.scope === 'self' ? s.display_name : (s.department || ''),
+    cls: s.scope === 'all' ? 'bg-accent/10 text-accent border-accent/25'
+      : s.scope === 'self' ? 'bg-accent2/10 text-accent2 border-accent2/25'
+      : 'bg-medium/10 text-medium border-medium/25',
+  }
+})
+
 function riskBadgeClass(level: string): string {
   const map: Record<string, string> = {
     low: 'bg-low/10 text-low border-low/30',
@@ -153,6 +167,15 @@ async function refresh() {
           安全态势总览
         </h2>
         <p class="text-sm text-muted mt-0.5">实时聚合审计日志 · 风险事件 · 审批动态</p>
+        <div
+          v-if="scopeBadge"
+          class="mt-2 inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full border text-xs font-medium"
+          :class="scopeBadge.cls"
+          :title="dataScope?.hint"
+        >
+          <span class="w-1.5 h-1.5 rounded-full bg-current opacity-70"></span>
+          {{ scopeBadge.label }}<template v-if="scopeBadge.detail">：{{ scopeBadge.detail }}</template>
+        </div>
       </div>
       <div class="flex items-center gap-3">
         <div class="flex items-center gap-1.5 text-xs">

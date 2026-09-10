@@ -1,0 +1,13 @@
+{
+ "model": "BAAI/bge-small-zh-v1.5",
+ "docs": [
+  "内部办公流程.md",
+  "大模型安全使用规范.md",
+  "政务办事指南.md",
+  "政策法规汇编.md"
+ ],
+ "chunk_count": 19,
+ "schema_version": 2,
+ "sig": "fc7f41ffe93038c26f39acab387b5acc",
+ "built_at": "2026-09-09 15:37:23"
+}

@@ -91,9 +91,39 @@ class Storage:
                     FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
                 );
 
+                CREATE TABLE IF NOT EXISTS notifications (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    type TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    message TEXT,
+                    level TEXT DEFAULT 'info',
+                    read INTEGER DEFAULT 0,
+                    created_at TEXT NOT NULL
+                );
+
                 CREATE TABLE IF NOT EXISTS policy_config (
                     key TEXT PRIMARY KEY,
                     value TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS sys_departments (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT UNIQUE NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS sys_users (
+                    username TEXT PRIMARY KEY,
+                    password_hash TEXT NOT NULL,
+                    salt TEXT NOT NULL,
+                    display_name TEXT NOT NULL,
+                    role TEXT NOT NULL,
+                    department TEXT DEFAULT '',
+                    position TEXT DEFAULT '',
+                    status TEXT DEFAULT 'active',
+                    note TEXT DEFAULT '',
+                    created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
 
@@ -103,6 +133,8 @@ class Storage:
                 CREATE INDEX IF NOT EXISTS idx_approval_status ON approval_requests(status);
                 CREATE INDEX IF NOT EXISTS idx_conv_session ON conversation_history(session_id);
                 CREATE INDEX IF NOT EXISTS idx_sessions_updated ON sessions(updated_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_notifications_created ON notifications(created_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_users_role ON sys_users(role);
             """)
 
     # ==================== 审计日志 ====================
@@ -155,6 +187,12 @@ class Storage:
         """统计审计日志总条数"""
         with self._get_conn() as conn:
             row = conn.execute("SELECT COUNT(*) FROM audit_logs").fetchone()
+        return row[0] if row else 0
+
+    def count_approvals(self) -> int:
+        """统计审批请求总条数"""
+        with self._get_conn() as conn:
+            row = conn.execute("SELECT COUNT(*) FROM approval_requests").fetchone()
         return row[0] if row else 0
 
     def get_audit_log_by_id(self, log_id: str) -> Optional[Dict[str, Any]]:
@@ -322,6 +360,62 @@ class Storage:
             ).fetchall()
         return [dict(r) for r in rows]
 
+    # ==================== 站内通知 ====================
+
+    def add_notification(self, type_: str, title: str, message: str = "", level: str = "info") -> Optional[int]:
+        with self._lock:
+            with self._get_conn() as conn:
+                cur = conn.execute(
+                    "INSERT INTO notifications (type, title, message, level, created_at) VALUES (?, ?, ?, ?, ?)",
+                    (type_, title, message or "", level, datetime.now().isoformat()),
+                )
+                return cur.lastrowid
+
+    def list_notifications(self, limit: int = 50) -> List[Dict[str, Any]]:
+        with self._get_conn() as conn:
+            rows = conn.execute(
+                "SELECT * FROM notifications ORDER BY id DESC LIMIT ?", (limit,)
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def count_unread_notifications(self) -> int:
+        with self._get_conn() as conn:
+            row = conn.execute("SELECT COUNT(*) FROM notifications WHERE read = 0").fetchone()
+        return row[0] if row else 0
+
+    def mark_notifications_read(self, notif_id: Optional[int] = None):
+        with self._lock:
+            with self._get_conn() as conn:
+                if notif_id is not None:
+                    conn.execute("UPDATE notifications SET read = 1 WHERE id = ?", (notif_id,))
+                else:
+                    conn.execute("UPDATE notifications SET read = 1 WHERE read = 0")
+
+    def clear_notifications(self):
+        with self._lock:
+            with self._get_conn() as conn:
+                conn.execute("DELETE FROM notifications")
+
+    # ==================== 通用键值设置（policy_config 表，如 webhook/模型接入配置） ====================
+
+    def get_setting(self, key: str, default: Any = None) -> Any:
+        with self._get_conn() as conn:
+            row = conn.execute("SELECT value FROM policy_config WHERE key = ?", (key,)).fetchone()
+        if not row:
+            return default
+        try:
+            return json.loads(row["value"])
+        except (ValueError, TypeError):
+            return row["value"]
+
+    def set_setting(self, key: str, value: Any):
+        with self._lock:
+            with self._get_conn() as conn:
+                conn.execute(
+                    "INSERT OR REPLACE INTO policy_config (key, value, updated_at) VALUES (?, ?, ?)",
+                    (key, json.dumps(value, ensure_ascii=False), datetime.now().isoformat()),
+                )
+
     def cleanup_empty_sessions(self) -> int:
         """清理所有 message_count 为 0 的空会话，返回清理数量"""
         with self._lock:
@@ -400,6 +494,119 @@ class Storage:
                            ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at""",
                         (key, json.dumps(value, ensure_ascii=False), now),
                     )
+
+    # ==================== 组织 / 用户管理 ====================
+
+    def user_exists(self, username: str) -> bool:
+        with self._get_conn() as conn:
+            return conn.execute("SELECT 1 FROM sys_users WHERE username = ?", (username,)).fetchone() is not None
+
+    def count_users(self) -> int:
+        with self._get_conn() as conn:
+            return conn.execute("SELECT COUNT(*) FROM sys_users").fetchone()[0]
+
+    def upsert_user(self, username: str, password_hash: str, salt: str, display_name: str,
+                    role: str, department: str = "", position: str = "",
+                    status: str = "active", note: str = "") -> None:
+        now = datetime.now().isoformat()
+        with self._lock:
+            with self._get_conn() as conn:
+                conn.execute(
+                    """INSERT INTO sys_users (username, password_hash, salt, display_name, role,
+                                               department, position, status, note, created_at, updated_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                       ON CONFLICT(username) DO UPDATE SET
+                         password_hash = excluded.password_hash,
+                         salt = excluded.salt,
+                         display_name = excluded.display_name,
+                         role = excluded.role,
+                         department = excluded.department,
+                         position = excluded.position,
+                         status = excluded.status,
+                         note = excluded.note,
+                         updated_at = excluded.updated_at""",
+                    (username, password_hash, salt, display_name, role, department,
+                     position, status, note, now, now),
+                )
+
+    def get_user(self, username: str) -> Optional[Dict[str, Any]]:
+        with self._get_conn() as conn:
+            row = conn.execute("SELECT * FROM sys_users WHERE username = ?", (username,)).fetchone()
+        return dict(row) if row else None
+
+    def get_user_password(self, username: str) -> Optional[Dict[str, Any]]:
+        """返回 password_hash 与 salt，用于登录校验"""
+        with self._get_conn() as conn:
+            row = conn.execute(
+                "SELECT username, password_hash, salt, display_name, role, department, position, status FROM sys_users WHERE username = ?",
+                (username,),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def list_users(self) -> List[Dict[str, Any]]:
+        with self._get_conn() as conn:
+            rows = conn.execute(
+                "SELECT username, display_name, role, department, position, status, note, created_at, updated_at FROM sys_users ORDER BY role, username"
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def update_user_profile(self, username: str, display_name: str = None, role: str = None,
+                            department: str = None, position: str = None,
+                            status: str = None, note: str = None) -> bool:
+        sets, vals = [], []
+        if display_name is not None: sets.append("display_name = ?"); vals.append(display_name)
+        if role is not None: sets.append("role = ?"); vals.append(role)
+        if department is not None: sets.append("department = ?"); vals.append(department)
+        if position is not None: sets.append("position = ?"); vals.append(position)
+        if status is not None: sets.append("status = ?"); vals.append(status)
+        if note is not None: sets.append("note = ?"); vals.append(note)
+        if not sets:
+            return False
+        sets.append("updated_at = ?")
+        vals.append(datetime.now().isoformat())
+        vals.append(username)
+        with self._lock:
+            with self._get_conn() as conn:
+                cur = conn.execute(f"UPDATE sys_users SET {', '.join(sets)} WHERE username = ?", vals)
+                return cur.rowcount > 0
+
+    def update_user_password(self, username: str, password_hash: str, salt: str) -> bool:
+        with self._lock:
+            with self._get_conn() as conn:
+                cur = conn.execute(
+                    "UPDATE sys_users SET password_hash = ?, salt = ?, updated_at = ? WHERE username = ?",
+                    (password_hash, salt, datetime.now().isoformat(), username),
+                )
+                return cur.rowcount > 0
+
+    def delete_user(self, username: str) -> bool:
+        """物理删除用户（真实生产建议仅禁用 status=disabled）"""
+        with self._lock:
+            with self._get_conn() as conn:
+                cur = conn.execute("DELETE FROM sys_users WHERE username = ?", (username,))
+                return cur.rowcount > 0
+
+    # ---- 部门 ----
+    def list_departments(self) -> List[str]:
+        with self._get_conn() as conn:
+            rows = conn.execute("SELECT name FROM sys_departments ORDER BY id").fetchall()
+        return [r["name"] for r in rows]
+
+    def add_department(self, name: str) -> bool:
+        now = datetime.now().isoformat()
+        with self._lock:
+            with self._get_conn() as conn:
+                try:
+                    conn.execute("INSERT INTO sys_departments (name, created_at) VALUES (?, ?)", (name.strip(), now))
+                    return True
+                except sqlite3.IntegrityError:
+                    return False
+
+    def remove_department(self, name: str) -> bool:
+        with self._lock:
+            with self._get_conn() as conn:
+                cur = conn.execute("DELETE FROM sys_departments WHERE name = ?", (name,))
+                return cur.rowcount > 0
 
     # ==================== 工具方法 ====================
 

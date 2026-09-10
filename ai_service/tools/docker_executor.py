@@ -194,6 +194,10 @@ class DockerToolExecutor:
                 output = self._sim_send_email(args)
             elif tool_name == "query_db":
                 output = self._sim_query_db(args)
+            elif tool_name == "draft_document":
+                output = self._sim_draft_document(args)
+            elif tool_name == "generate_report":
+                output = self._sim_generate_report(args)
             else:
                 return ToolResult(
                     success=False,
@@ -260,27 +264,52 @@ class DockerToolExecutor:
             return f"[错误] 读取失败: {e}"
 
     def _sim_search_knowledge(self, args: dict) -> str:
-        """模拟知识库搜索"""
-        query = args.get("query", "")
+        """知识库语义检索（本地 RAG，政企政务沙盒语料）"""
+        query = (args.get("query") or args.get("q") or "").strip()
         if not query:
             return "[错误] 查询参数为空"
 
-        # 模拟搜索结果
-        knowledge_base = {
-            "政策": "《数字政府建设实施方案(2026-2028)》已发布",
-            "公积金": "2026年公积金缴存比例: 5%-12%",
-            "安全": "等保2.0三级要求: 访问控制/安全审计/数据加密",
-            "审批": "政府采购审批流程: 申请→部门审核→财务复核→领导签批",
-        }
+        try:
+            from knowledge.rag_engine import get_kb
+            kb = get_kb()
+            hits = kb.search(query, k=3, min_score=0.42)
+            if not hits:
+                return f"[知识库] 未在政务沙盒知识库中找到与「{query}」相关的内容"
+            lines = ["[知识库检索命中]，来源如下："]
+            for i, h in enumerate(hits, 1):
+                # 正文节选（标题 + 前 180 字）
+                snippet = h["text"].strip().replace("\n", " ")
+                if len(snippet) > 200:
+                    snippet = snippet[:200] + "…"
+                lines.append(
+                    f"{i}. 【{h['title']}】（来源《{h['source']}》，相关度 {h['score']:.2f}）\n   {snippet}"
+                )
+            lines.append("注：以上为知识库检索原文摘录，请据此作答并注明来源。")
+            return "\n".join(lines)
+        except Exception as e:  # noqa: BLE001
+            return f"[知识库] 检索服务暂不可用: {e}"
 
-        results = []
-        for kw, info in knowledge_base.items():
-            if kw in query:
-                results.append(f"[{kw}] {info}")
+    def _sim_draft_document(self, args: dict) -> str:
+        """拟稿助手：依据知识库起草公文/通知（草稿，含 AIGC 标识与人工核定提示）"""
+        try:
+            from workflows.doc_worker import draft_document
+            res = draft_document(args)
+            if not res.get("success"):
+                return f"[拟稿助手] {res.get('error', '起草失败')}"
+            return res["text"]
+        except Exception as e:  # noqa: BLE001
+            return f"[拟稿助手] 起草服务暂不可用: {e}"
 
-        if results:
-            return "\n".join(results)
-        return f"[知识库] 未找到与 '{query}' 相关的结果"
+    def _sim_generate_report(self, args: dict) -> str:
+        """报表助手：据口径/数据生成结构化报表（含 AIGC 标识与数据核对提示）"""
+        try:
+            from workflows.doc_worker import generate_report
+            res = generate_report(args)
+            if not res.get("success"):
+                return f"[报表助手] {res.get('error', '生成失败')}"
+            return res["text"]
+        except Exception as e:  # noqa: BLE001
+            return f"[报表助手] 生成服务暂不可用: {e}"
 
     def _sim_send_email(self, args: dict) -> str:
         """模拟发送邮件（仅记录，不实际发送）"""

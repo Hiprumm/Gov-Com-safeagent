@@ -56,6 +56,11 @@ TOOL_CAPABILITIES: Dict[str, FrozenSet[str]] = {
     "execute_command":  frozenset({"command_exec", "file_read", "file_write"}),
     "export_data":      frozenset({"data_transfer", "db_read"}),
     "send_email":       frozenset({"communication", "data_transfer", "network_access"}),
+    # 拟稿助手：仅在会话内生成公文草稿（检索知识库作依据、输出 AIGC 草稿），
+    # 不写盘/不外发，映射为只读能力（无需审批）。产物须人工核定后才可对外。
+    "draft_document":   frozenset({"search", "knowledge_query", "file_read"}),
+    # 报表助手：同上，仅在会话内生成报表文本，不落盘不外发。
+    "generate_report":  frozenset({"search", "knowledge_query", "file_read"}),
 }
 
 # ==================== 角色 → 默认能力集（最小权限） ====================

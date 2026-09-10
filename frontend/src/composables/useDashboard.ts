@@ -32,8 +32,19 @@ export interface RiskEvent {
   preview: string
 }
 
+export interface DashboardScope {
+  scope: 'all' | 'dept' | 'self' | string
+  username: string
+  display_name: string
+  role: string
+  department: string
+  label: string
+  hint: string
+}
+
 export interface DashboardOverview {
   success: boolean
+  scope?: DashboardScope
   kpi: DashboardKPI
   attack_distribution: Record<string, number>
   risk_level_distribution: Record<string, number>

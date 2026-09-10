@@ -39,6 +39,15 @@ from audit.evaluation_metrics import EvaluationMetricsCalculator
 from gov_agent_graph.gov_agent import GovAgent
 from websocket.manager import ws_manager, handle_ws_events, push_approval_update, push_risk_alert
 from config import settings
+from auth import (
+    DEMO_USERS,
+    verify_password,
+    create_token,
+    revoke_token,
+    get_user_by_token,
+    current_identity,
+    list_demo_accounts,
+)
 
 app = FastAPI(
     title=settings.APP_NAME,
@@ -177,7 +186,7 @@ async def detect_input(request: BatchDetectionRequest):
 
 
 @app.post("/api/security/detect_single")
-async def detect_single(text: str, source: str = "user_input", session_id: Optional[str] = None):
+async def detect_single(request: Request, text: str, source: str = "user_input", session_id: Optional[str] = None):
     try:
         # 传入 session_id，让 detect_single_input 内部的关联分析按 session 正确累积
         # （修复：原实现未传 session_id，导致所有请求累积到 "default" session，正常样本被污染）
@@ -186,11 +195,21 @@ async def detect_single(text: str, source: str = "user_input", session_id: Optio
         # 拦截判定：阈值由安全策略中心统一管控（medium/high/critical 可热配置）
         blocked = policy_manager.should_block(result.risk_level) if hasattr(result, 'risk_level') else False
 
+        # 审计到人：从登录令牌还原真实操作者，用于“本人/本部门”看板收敛
+        identity = current_identity(request.headers.get("X-Auth-Token")) if request else {}
+        actor_id = identity.get("username") or "anonymous"
+        actor_role = identity.get("role") or "user"
+        actor_dept = identity.get("department") or ""
+        actor_name = identity.get("display_name") or actor_id
+
         # 记录审计日志
         audit_logger.create_log(
-            user_id="anonymous", user_role="user", agent_id="security_panel",
+            user_id=actor_id, user_role=actor_role, agent_id="security_panel",
             action_type="input_detection",
-            action_details={"source": source, "text_preview": text[:100], "session_id": session_id},
+            action_details={
+                "source": source, "text_preview": text[:100], "session_id": session_id,
+                "department": actor_dept, "actor_name": actor_name,
+            },
             risk_level=result.risk_level if hasattr(result, 'risk_level') else RiskLevel.NONE,
             detection_result=result,
             is_blocked=blocked,
@@ -205,7 +224,7 @@ async def detect_single(text: str, source: str = "user_input", session_id: Optio
 
 
 @app.post("/api/security/detect_file")
-async def detect_file(request: FileDetectionRequest):
+async def detect_file(req: Request, request: FileDetectionRequest):
     try:
         from gov_agent_graph.gov_agent import FileProcessor
         
@@ -218,11 +237,21 @@ async def detect_file(request: FileDetectionRequest):
                 source="uploaded_doc"
             )
 
+            # 审计到人：从登录令牌还原真实操作者，用于“本人/本部门”看板收敛
+            identity = current_identity(req.headers.get("X-Auth-Token")) if req else {}
+            actor_id = identity.get("username") or "anonymous"
+            actor_role = identity.get("role") or "user"
+            actor_dept = identity.get("department") or ""
+            actor_name = identity.get("display_name") or actor_id
+
             # 记录审计日志（拦截阈值走安全策略中心）
             audit_logger.create_log(
-                user_id="anonymous", user_role="user", agent_id="security_panel",
+                user_id=actor_id, user_role=actor_role, agent_id="security_panel",
                 action_type="file_detection",
-                action_details={"filename": request.filename, "file_type": request.file_type},
+                action_details={
+                    "filename": request.filename, "file_type": request.file_type,
+                    "department": actor_dept, "actor_name": actor_name,
+                },
                 risk_level=result.risk_level,
                 detection_result=result,
                 is_blocked=policy_manager.should_block(result.risk_level),
@@ -1100,8 +1129,14 @@ def _parse_log_ts(ts):
 
 
 @app.get("/api/dashboard/overview")
-async def dashboard_overview():
+async def dashboard_overview(request: Request):
     """风险看板总览：一次聚合返回 KPI 卡片、攻击类型分布、7 日趋势、最近风险事件
+
+    按当前登录身份“角色收敛”：
+    - admin / operator / auditor → 全平台数据；
+    - manager → 仅本部门产生的检测/操作数据；
+    - user → 仅本人发起的数据。
+    未登录/无法识别时回退为全平台（兼容内部轮询与访客演示）。
 
     直接读 storage 原始行（detection_result 等 JSON 列已解析为 dict）；
     audit_logger._dict_to_log 重建日志时不携带 detection_result，故不走该路径。
@@ -1111,7 +1146,47 @@ async def dashboard_overview():
         from storage import get_storage
 
         storage = get_storage()
+
+        # ---- 解析当前登录身份，决定收敛范围 ----
+        identity = current_identity(request.headers.get("X-Auth-Token")) if request else {}
+        username = identity.get("username", "")
+        role = identity.get("role", "")
+        dept = identity.get("department", "")
+        display_name = identity.get("display_name", "")
+        # scope: all=全平台 | dept=本部门 | self=本人
+        if role in ("admin", "operator", "auditor") or not username:
+            scope = "all"
+        elif role == "manager":
+            scope = "dept"
+        else:
+            scope = "self"
+        # username -> department 反查表（用于把审计记录归属到部门）
+        user_dept_map: Dict[str, str] = {}
+        try:
+            for u in storage.list_users():
+                user_dept_map[u.get("username", "")] = u.get("department", "") or ""
+        except Exception:
+            user_dept_map = {}
+
+        def _in_scope(d: Dict[str, Any]) -> bool:
+            """审计/操作行是否在当前收敛范围可见"""
+            if scope == "all":
+                return True
+            row_user = d.get("user_id", "")
+            row_dept = user_dept_map.get(row_user, "")
+            # 兜底：网关写入的 action_details.department
+            if not row_dept:
+                ad = d.get("action_details") or {}
+                row_dept = ad.get("department", "") if isinstance(ad, dict) else ""
+            if scope == "self":
+                return bool(row_user) and row_user == username
+            if scope == "dept":
+                return bool(dept) and row_dept == dept
+            return True
+
         log_dicts = storage.get_audit_logs_recent(limit=5000)
+        # 仅统计在收敛范围内的记录
+        log_dicts = [d for d in log_dicts if _in_scope(d)]
 
         now = datetime.now()
         today_str = now.strftime("%Y-%m-%d")
@@ -1182,13 +1257,41 @@ async def dashboard_overview():
                     "preview": str(preview)[:120],
                 })
 
+        # 待审批数量同样按收敛范围过滤（按审批发起人 requester 归属）
+        pending_approvals = 0
         try:
-            pending_approvals = len(storage.list_pending_approvals())
+            for p in storage.list_pending_approvals():
+                req_user = p.get("requester_id", "")
+                req_dept = user_dept_map.get(req_user, "")
+                if not req_dept:
+                    args = p.get("tool_args") or {}
+                    req_dept = args.get("department", "") if isinstance(args, dict) else ""
+                if scope == "all":
+                    pending_approvals += 1
+                elif scope == "self" and req_user == username:
+                    pending_approvals += 1
+                elif scope == "dept" and dept and req_dept == dept:
+                    pending_approvals += 1
         except Exception:
             pending_approvals = 0
 
+        # scope 元信息：供前端标注“全平台 / 本部门 / 仅本人”视角
+        scope_meta = {
+            "scope": scope,
+            "username": username,
+            "display_name": display_name,
+            "role": role,
+            "department": dept,
+            "label": ("全平台" if scope == "all"
+                      else f"仅本人" if scope == "self"
+                      else f"本部门 {dept or ''}".strip()),
+            "hint": ("当前展示本账号可权限范围内的数据" if scope in ("dept", "self")
+                     else "当前展示全平台数据"),
+        }
+
         return {
             "success": True,
+            "scope": scope_meta,
             "kpi": {
                 "today_blocked": today_blocked,
                 "pending_approvals": pending_approvals,
@@ -1540,31 +1643,37 @@ async def calculate_evaluation_metrics(request: dict):
 
 
 @app.post("/api/agent/run")
-async def run_agent(user_input: str, input_source: str = "user_input"):
+async def run_agent(req: Request, user_input: str, input_source: str = "user_input"):
     try:
-        result = gov_agent.run(user_input, input_source)
+        # 审计到人：将发起调用的登录账号+部门透传给 agent，贯穿到其审计/审批
+        identity = current_identity(req.headers.get("X-Auth-Token")) if req else {}
+        result = gov_agent.run(user_input, input_source, user=identity or None)
         return result
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/api/agent/chat")
-async def chat_with_history(user_input: str, session_id: Optional[str] = None, input_source: str = "user_input"):
+async def chat_with_history(req: Request, user_input: str, session_id: Optional[str] = None, input_source: str = "user_input"):
     try:
-        result = gov_agent.run(user_input, input_source, session_id)
+        # 审计到人：将发起调用的登录账号+部门透传给 agent，贯穿到其审计/审批
+        identity = current_identity(req.headers.get("X-Auth-Token")) if req else {}
+        result = gov_agent.run(user_input, input_source, session_id, user=identity or None)
         return result
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/api/agent/file_upload")
-async def upload_file(request: FileUploadRequest):
+async def upload_file(http_req: Request, request: FileUploadRequest):
     try:
         session_id = request.session_id
         if not session_id:
             session_id = gov_agent.conversation_manager.create_session()
-        
-        result = gov_agent.process_file_message(session_id, request.file_data, request.file_type, request.filename)
+        # 审计到人：解析登录账号透传给 agent 处理
+        identity = current_identity(http_req.headers.get("X-Auth-Token")) if http_req else {}
+        result = gov_agent.process_file_message(session_id, request.file_data, request.file_type,
+                                                request.filename, user=identity or None)
         return result
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -1660,23 +1769,264 @@ async def health_check():
     }
 
 
+# ==================== 账号与角色（登录身份 / 角色导航 / 审计到人） ====================
+
+@app.post("/api/auth/login")
+async def auth_login(request: dict):
+    """登录：校验账号口令，返回访问令牌与用户身份"""
+    username = str(request.get("username", "")).strip()
+    password = str(request.get("password", ""))
+    if not username or not verify_password(username, password):
+        raise HTTPException(status_code=401, detail="用户名或密码错误")
+    from storage import get_storage
+    row = get_storage().get_user(username) or {}
+    token = create_token(username)
+    audit_logger.create_log(
+        user_id=username, user_role=row.get("role", "user"), agent_id="auth",
+        action_type="auth_login",
+        action_details={"display_name": row.get("display_name", username)},
+        risk_level=RiskLevel.NONE,
+        is_blocked=False,
+    )
+    return {
+        "success": True,
+        "token": token,
+        "user": {
+            "username": username,
+            "display_name": row.get("display_name", username),
+            "role": row.get("role", "user"),
+            "department": row.get("department", ""),
+            "position": row.get("position", ""),
+        },
+    }
+
+
+@app.post("/api/auth/logout")
+async def auth_logout(request: Request):
+    token = request.headers.get("X-Auth-Token")
+    if token:
+        revoke_token(token)
+    return {"success": True}
+
+
+@app.get("/api/auth/me")
+async def auth_me(request: Request):
+    """返回当前登录身份；未登录 user=null，同时附演示账号列表供登录界面展示"""
+    token = request.headers.get("X-Auth-Token")
+    user = get_user_by_token(token)
+    return {"user": user, "demo_accounts": list_demo_accounts()}
+
+
+# ==================== 用户与组织管理 API（仅系统管理员 admin） ====================
+_ROLES = ("admin", "operator", "auditor", "manager", "user")
+
+
+def _admin_guard(request: Request):
+    """返回当前 admin 身份，非管理员返回 None"""
+    identity = current_identity(request.headers.get("X-Auth-Token"))
+    return identity if identity.get("role") == "admin" else None
+
+
+def _pw_fields(password: str):
+    import hashlib, secrets
+    salt = secrets.token_bytes(16)
+    pw_hash = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 200_000).hex()
+    return pw_hash, salt.hex()
+
+
+async def _body(request: Request) -> dict:
+    try:
+        if request.headers.get("content-type", "").startswith("application/json"):
+            return await request.json()
+    except Exception:
+        pass
+    return {}
+
+
+@app.get("/api/admin/users")
+async def admin_list_users(request: Request):
+    """用户列表（仅 admin）"""
+    if not _admin_guard(request):
+        return {"success": False, "error": "无权限：需要系统管理员身份", "users": []}
+    from storage import get_storage
+    return {"success": True, "users": get_storage().list_users()}
+
+
+@app.post("/api/admin/users")
+async def admin_create_user(request: Request):
+    """新建用户（仅 admin）：{username,password,display_name,role,department,position}"""
+    from storage import get_storage
+    if not _admin_guard(request):
+        return {"success": False, "error": "无权限：需要系统管理员身份"}
+    body = await _body(request)
+    username = str(body.get("username", "")).strip()
+    password = str(body.get("password", ""))
+    display_name = str(body.get("display_name", "")).strip() or username
+    role = str(body.get("role", "")).strip()
+    if not username or len(password) < 6:
+        return {"success": False, "error": "用户名不能为空且密码至少 6 位"}
+    if role not in _ROLES:
+        return {"success": False, "error": f"角色必须为 {_ROLES}"}
+    if get_storage().user_exists(username):
+        return {"success": False, "error": f"账号 {username} 已存在"}
+    pw_hash, salt = _pw_fields(password)
+    get_storage().upsert_user(
+        username, pw_hash, salt, display_name, role,
+        str(body.get("department", "")).strip(), str(body.get("position", "")).strip(),
+        "active", str(body.get("note", "")).strip(),
+    )
+    # 组织目录：自动补录部门
+    dept = str(body.get("department", "")).strip()
+    if dept and dept not in get_storage().list_departments():
+        get_storage().add_department(dept)
+    return {"success": True, "message": f"已创建账号 {username}"}
+
+
+@app.put("/api/admin/users/{username}")
+async def admin_update_user(request: Request, username: str):
+    """更新用户资料/角色/状态（仅 admin，禁止改低 admin 自身角色）"""
+    from storage import get_storage
+    actor = _admin_guard(request)
+    if not actor:
+        return {"success": False, "error": "无权限：需要系统管理员身份"}
+    if not get_storage().user_exists(username):
+        return {"success": False, "error": f"账号 {username} 不存在"}
+    body = await _body(request)
+    # 保护：不允许管理员自己降级/停用，避免锁死系统
+    if username == actor["username"] and (body.get("role") in ("operator", "auditor", "user") or body.get("status") == "disabled"):
+        return {"success": False, "error": "不能降级或停用当前登录的管理员账号"}
+    if body.get("role") is not None and body.get("role") not in _ROLES:
+        return {"success": False, "error": f"角色必须为 {_ROLES}"}
+    get_storage().update_user_profile(
+        username,
+        display_name=body.get("display_name"),
+        role=body.get("role"),
+        department=body.get("department"),
+        position=body.get("position"),
+        status=body.get("status"),
+        note=body.get("note"),
+    )
+    return {"success": True, "message": f"已更新账号 {username}"}
+
+
+@app.post("/api/admin/users/{username}/reset_password")
+async def admin_reset_password(request: Request, username: str):
+    """重置用户密码（仅 admin）：{password}"""
+    from storage import get_storage
+    if not _admin_guard(request):
+        return {"success": False, "error": "无权限：需要系统管理员身份"}
+    body = await _body(request)
+    password = str(body.get("password", ""))
+    if len(password) < 6:
+        return {"success": False, "error": "新密码至少 6 位"}
+    if not get_storage().user_exists(username):
+        return {"success": False, "error": f"账号 {username} 不存在"}
+    pw_hash, salt = _pw_fields(password)
+    get_storage().update_user_password(username, pw_hash, salt)
+    return {"success": True, "message": f"已重置账号 {username} 的密码"}
+
+
+@app.delete("/api/admin/users/{username}")
+async def admin_delete_user(request: Request, username: str):
+    """删除用户（仅 admin）；系统管理员自身不可删"""
+    from storage import get_storage
+    actor = _admin_guard(request)
+    if not actor:
+        return {"success": False, "error": "无权限：需要系统管理员身份"}
+    if username == actor["username"]:
+        return {"success": False, "error": "不能删除当前登录的管理员账号"}
+    if username in ("admin", "operator", "auditor", "user"):
+        return {"success": False, "error": "内置演示账号建议用「停用」而非删除，避免破坏登录引导"}
+    if not get_storage().user_exists(username):
+        return {"success": False, "error": f"账号 {username} 不存在"}
+    get_storage().delete_user(username)
+    return {"success": True, "message": f"已删除账号 {username}"}
+
+
+@app.get("/api/admin/stats")
+async def admin_stats(request: Request):
+    """后台统计：用户数/角色分布/部门（仅 admin）"""
+    from storage import get_storage
+    if not _admin_guard(request):
+        return {"success": False, "error": "无权限：需要系统管理员身份"}
+    users = get_storage().list_users()
+    by_role = {}
+    by_dept = {}
+    for u in users:
+        by_role[u["role"]] = by_role.get(u["role"], 0) + 1
+        d = u.get("department") or "未分配"
+        by_dept[d] = by_dept.get(d, 0) + 1
+    return {
+        "success": True,
+        "stats": {
+            "total": len(users),
+            "active": sum(1 for u in users if u.get("status") == "active"),
+            "disabled": sum(1 for u in users if u.get("status") != "active"),
+            "by_role": by_role,
+            "by_department": by_dept,
+        },
+    }
+
+
+@app.get("/api/admin/departments")
+async def admin_list_departments(request: Request):
+    """部门目录（仅 admin）"""
+    if not _admin_guard(request):
+        return {"success": False, "error": "无权限：需要系统管理员身份", "departments": []}
+    from storage import get_storage
+    return {"success": True, "departments": get_storage().list_departments()}
+
+
+@app.post("/api/admin/departments")
+async def admin_add_department(request: Request):
+    """新增部门（仅 admin）：{name}"""
+    from storage import get_storage
+    if not _admin_guard(request):
+        return {"success": False, "error": "无权限：需要系统管理员身份"}
+    body = await _body(request)
+    name = str(body.get("name", "")).strip()
+    if not name:
+        return {"success": False, "error": "部门名称不能为空"}
+    ok = get_storage().add_department(name)
+    return {"success": ok, "message": ("已新增部门" if ok else "部门已存在")}
+
+
 # ==================== 审批管理 API ====================
 
 @app.post("/api/security/approval/approve/{request_id}")
-async def approve_request(request_id: str, approver_comment: str = ""):
+async def approve_request(request: Request, request_id: str, approver_comment: str = ""):
     """审批通过指定的请求
 
     异步审批流（B-2/B-5 联动）：批准时立即授予会话能力令牌 + 解锁会话工具，
     用户重试原请求时自动放行，无需重复审批。
+    审计到人：操作人取当前登录账号；未登录按本地管理面板处理（访客演示模式）。
     """
     try:
         # 注意参数顺序：approve_request(request_id, approver_id, approver_role, comments)
         # 历史缺陷曾把 "admin" 传成 approver_id 而 approver_role 为空 → 角色层级不足
         # 静默拒绝（DB 状态不更新但端点仍返回成功）
+        identity = current_identity(request.headers.get("X-Auth-Token"))
+        approver_id = identity.get("username") or "admin_panel"
+        role = identity.get("role")
+        if not identity:
+            approver_role = "admin"
+        elif role == "admin":
+            approver_role = "admin"
+        elif role == "operator":
+            # 安全运维可批中/低风险；高危请求由引擎按层级拒绝
+            approver_role = "manager"
+        elif role == "manager":
+            # 部门负责人：可批本部门发起的中等风险操作（层级3，引擎按 risk 判定）
+            approver_role = "manager"
+        else:
+            return {
+                "success": False,
+                "message": "当前账号无审批权限（需系统管理员或安全运维账号）",
+            }
         result = approval_engine.approve_request(
             request_id,
-            approver_id="admin_panel",
-            approver_role="admin",
+            approver_id=approver_id,
+            approver_role=approver_role,
             comments=approver_comment,
         )
         if result.status not in ("approved", "auto_approved"):
@@ -1722,7 +2072,7 @@ async def approve_request(request_id: str, approver_comment: str = ""):
         except Exception as grant_err:
             # 授予失败不阻断审批本身，仅记录（重试路径会在 check_approval 兜底授予）
             audit_logger.create_log(
-                user_id="admin", user_role="admin", agent_id="security_panel",
+                user_id=approver_id, user_role=approver_role, agent_id="security_panel",
                 action_type="approval_grant_warning",
                 action_details={"request_id": request_id, "error": str(grant_err)},
                 risk_level=RiskLevel.LOW,
@@ -1730,7 +2080,7 @@ async def approve_request(request_id: str, approver_comment: str = ""):
             )
 
         audit_logger.create_log(
-            user_id="admin", user_role="admin", agent_id="security_panel",
+            user_id=approver_id, user_role=approver_role, agent_id="security_panel",
             action_type="approval_approved",
             action_details={"request_id": request_id, "comment": approver_comment, **grant_info},
             risk_level=RiskLevel.NONE,
@@ -1752,17 +2102,31 @@ async def approve_request(request_id: str, approver_comment: str = ""):
 
 
 @app.post("/api/security/approval/reject/{request_id}")
-async def reject_request(request_id: str, reason: str = ""):
-    """驳回指定的请求"""
+async def reject_request(request: Request, request_id: str, reason: str = ""):
+    """驳回指定的请求（记录当前登录操作人，审计到人）"""
     try:
-        rejected = approval_engine.reject_request(request_id, "admin", reason)
+        identity = current_identity(request.headers.get("X-Auth-Token"))
+        approver_id = identity.get("username") or "admin_panel"
+        role = identity.get("role")
+        if not identity or role == "admin":
+            approver_role = "admin"
+        elif role == "operator":
+            approver_role = "manager"
+        elif role == "manager":
+            approver_role = "manager"
+        else:
+            return {
+                "success": False,
+                "message": "当前账号无审批权限（需系统管理员或安全运维账号）",
+            }
+        rejected = approval_engine.reject_request(request_id, approver_id, reason)
         if rejected.status not in ("rejected", "approved", "auto_approved"):
             return {
                 "success": False,
                 "message": f"审批请求 {request_id} 不存在或已处理"
             }
         audit_logger.create_log(
-            user_id="admin", user_role="admin", agent_id="security_panel",
+            user_id=approver_id, user_role=approver_role, agent_id="security_panel",
             action_type="approval_rejected",
             action_details={"request_id": request_id, "reason": reason},
             risk_level=RiskLevel.NONE,
@@ -2384,6 +2748,170 @@ async def get_evaluation_report():
     raise HTTPException(status_code=404, detail="评测报告未生成，请先运行评测")
 
 
+# ==================== 模型接入配置（P2-6：内网/离线 OpenAI 兼容端点） ====================
+
+@app.get("/api/model/config")
+async def get_model_config():
+    from llm_runtime import runtime_status
+    return {"success": True, "config": runtime_status()}
+
+
+@app.put("/api/model/config")
+async def set_model_config(request: dict):
+    from llm_runtime import save_config, load_config
+    provider = request.get("provider")
+    api_key = request.get("api_key")          # None=不修改 / ''=清除覆盖 Key
+    base_url = request.get("base_url")
+    model = request.get("model")
+    if provider not in (None, "zhipu", "openai"):
+        raise HTTPException(status_code=400, detail="provider 仅支持 zhipu / openai")
+    if base_url is not None and not base_url.startswith(("http://", "https://")):
+        raise HTTPException(status_code=400, detail="base_url 需以 http(s):// 开头")
+    saved = save_config(provider or "zhipu", api_key, base_url or "", model or "")
+    # 热生效：分类层 + 对话主链立即使用新接入参数（无需重启）
+    input_detector.llm_classifier.apply_runtime(saved)
+    gov_agent.refresh_llm(saved)
+    from llm_runtime import runtime_status
+    return {"success": True, "config": runtime_status()}
+
+
+@app.post("/api/model/config/test")
+async def test_model_config(request: dict):
+    from llm_runtime import test_connection
+    provider = str(request.get("provider", "zhipu"))
+    api_key = str(request.get("api_key", ""))
+    base_url = str(request.get("base_url", ""))
+    model = str(request.get("model", ""))
+    ok, detail = test_connection(provider, api_key, base_url, model)
+    if not ok:
+        raise HTTPException(status_code=400, detail=detail)
+    return {"success": True, "detail": detail}
+
+
+# ==================== 站内通知 & 外部通知渠道（P1-4） ====================
+
+@app.get("/api/notifications")
+async def list_notifications(limit: int = 50):
+    from storage import get_storage
+    storage = get_storage()
+    limit = max(1, min(limit, 200))
+    return {
+        "list": storage.list_notifications(limit=limit),
+        "unread": storage.count_unread_notifications(),
+    }
+
+
+@app.post("/api/notifications/read")
+async def notifications_mark_read(request: dict):
+    from storage import get_storage
+    storage = get_storage()
+    nid = request.get("id")
+    storage.mark_notifications_read(int(nid) if nid is not None else None)
+    return {"success": True, "unread": storage.count_unread_notifications()}
+
+
+@app.post("/api/notifications/clear")
+async def notifications_clear():
+    from storage import get_storage
+    get_storage().clear_notifications()
+    return {"success": True}
+
+
+@app.get("/api/notifications/webhook")
+async def get_webhook_config():
+    from notify_webhook import load_webhook
+    return {"success": True, "config": load_webhook()}
+
+
+@app.put("/api/notifications/webhook")
+async def set_webhook_config(request: dict):
+    from notify_webhook import save_webhook
+    url = str(request.get("url", "")).strip()
+    enabled = bool(request.get("enabled", False))
+    if enabled and not url.startswith(("http://", "https://")):
+        raise HTTPException(status_code=400, detail="Webhook 地址需以 http(s):// 开头")
+    save_webhook(url, enabled)
+    return {"success": True, "config": {"url": url, "enabled": enabled}}
+
+
+@app.post("/api/notifications/webhook/test")
+async def test_webhook_config(request: dict):
+    from notify_webhook import test_webhook as _test
+    url = str(request.get("url", "")).strip()
+    if not url.startswith(("http://", "https://")):
+        raise HTTPException(status_code=400, detail="请输入有效的 http(s) 地址")
+    ok, detail = _test(url)
+    if not ok:
+        raise HTTPException(status_code=400, detail=detail)
+    return {"success": True, "detail": detail}
+
+
+# ==================== 系统自检与数据维护（运维视角） ====================
+
+# 服务进程启动时刻（模块加载时记录，用于 uptime 统计）
+_SERVICE_START = datetime.now()
+
+
+@app.get("/api/system/status")
+async def system_status():
+    """聚合系统运行状态：服务版本/在线时长、WebSocket、LLM 依赖、策略、数据规模"""
+    try:
+        from storage import get_storage
+        from websocket.manager import ws_manager as wsm
+        storage = get_storage()
+        policy = policy_manager.get_policy()
+        return {
+            "success": True,
+            "health": "healthy",
+            "service": {
+                "name": settings.APP_NAME,
+                "version": settings.APP_VERSION,
+                "started_at": _SERVICE_START.strftime("%Y-%m-%d %H:%M:%S"),
+                "uptime_seconds": int((datetime.now() - _SERVICE_START).total_seconds()),
+            },
+            "websocket": {
+                "active_connections": wsm.active_connections,
+                "channels": wsm.channel_count,
+            },
+            "llm": {
+                "api_key_present": bool(getattr(input_detector.llm_classifier, "api_key", "")),
+                "classifier_enabled": bool(getattr(input_detector.llm_classifier, "enabled", False)),
+            },
+            "policy": {
+                "version": policy.get("policy_version", 0),
+                "block_threshold": policy.get("block_threshold", "high"),
+                "audit_retention_days": policy.get("audit_retention_days", 180),
+            },
+            "data": {
+                "audit_logs": storage.count_audit_logs(),
+                "approvals_total": storage.count_approvals(),
+                "approvals_pending": len(approval_engine.list_pending()),
+                "sessions_active": len(storage.list_sessions()),
+            },
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/system/maintenance/clean_sessions")
+async def system_maintenance_clean_sessions():
+    """清理无消息的空会话（反复「清空对话/新建会话」产生的残留），供演示/日常整理使用"""
+    try:
+        from storage import get_storage
+        storage = get_storage()
+        removed = storage.cleanup_empty_sessions()
+        audit_logger.create_log(
+            user_id="admin", user_role="admin", agent_id="system_center",
+            action_type="maintenance_clean_sessions",
+            action_details={"removed_empty_sessions": removed},
+            risk_level=RiskLevel.LOW,
+            is_blocked=False,
+        )
+        return {"success": True, "removed": removed, "message": f"已清理 {removed} 个空会话"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 # ==================== WebSocket 实时通信 ====================
 
 @app.websocket("/ws/events")
@@ -2399,6 +2927,44 @@ async def ws_status():
         "active_connections": ws_manager.active_connections,
         "channels": ws_manager.channel_count,
     }
+
+
+# ==================== 政务沙盒知识库（本地 RAG）API ====================
+
+@app.get("/api/kb/status")
+def kb_status():
+    """知识库索引状态（用于前端展示语料规模与就绪度）"""
+    from knowledge.rag_engine import get_kb
+    try:
+        return {"success": True, "kb": get_kb().stats()}
+    except Exception as e:  # noqa: BLE001
+        return {"success": False, "error": str(e), "kb": {"ready": False}}
+
+
+@app.post("/api/kb/search")
+def kb_search(payload: dict):
+    """语义检索政务沙盒知识库"""
+    from knowledge.rag_engine import get_kb
+    query = str(payload.get("query", "")).strip()
+    k = max(1, min(int(payload.get("k", 4)), 8))
+    if not query:
+        return {"success": False, "error": "query 不能为空", "hits": []}
+    kb = get_kb()
+    if not kb.ready():
+        return {"success": False, "error": "知识库尚未就绪，请先重建索引", "hits": []}
+    hits = kb.search(query, k=k, min_score=0.42)
+    return {"success": True, "query": query, "hits": hits}
+
+
+@app.post("/api/kb/rebuild")
+def kb_rebuild():
+    """重建知识库索引（语料更新后调用）"""
+    from knowledge.rag_engine import get_kb
+    try:
+        get_kb().rebuild()
+        return {"success": True, "kb": get_kb().stats()}
+    except Exception as e:  # noqa: BLE001
+        return {"success": False, "error": str(e)}
 
 
 if __name__ == "__main__":

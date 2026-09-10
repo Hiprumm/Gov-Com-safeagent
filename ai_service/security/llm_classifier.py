@@ -145,9 +145,14 @@ class LLMClassifier:
     """
 
     def __init__(self):
-        """初始化 ZhiPu GLM-4 配置"""
-        self.api_key = settings.ZHIPU_API_KEY
-        self.model = "glm-4-flash"          # 快速模型，适合分类任务
+        """初始化 LLM 接入（默认智谱 GLM；支持界面配置覆盖为内网 OpenAI 兼容端点）"""
+        from llm_runtime import load_config, completions_url
+        cfg = load_config()
+        self.api_key = cfg["api_key"]
+        self.model = cfg["model"]
+        self.provider = cfg["provider"]
+        self.base_url = cfg["base_url"]
+        self.completions_url = completions_url(cfg["base_url"])
         self.enabled = bool(self.api_key)
         self.timeout = 15                    # 15 秒超时（覆盖 GLM-4-flash 偶发慢响应，避免误回退）
 
@@ -161,7 +166,30 @@ class LLMClassifier:
         if self.enabled:
             logger.info("LLMClassifier 已启用，模型: %s", self.model)
         else:
-            logger.warning("LLMClassifier 未启用：ZHIPU_API_KEY 未配置，将使用本地启发式规则")
+            logger.warning("LLMClassifier 未启用：未配置模型接入（ZHIPU_API_KEY 或模型配置页），将使用本地启发式规则")
+
+    # ------------------------------------------------------------------
+    # 模型接入运行时（P2-6：内网/离线 OpenAI 兼容端点热生效）
+    # ------------------------------------------------------------------
+
+    def apply_runtime(self, cfg: dict):
+        """按模型配置页保存的运行时配置热更新接入参数（不改策略开关语义）"""
+        from llm_runtime import completions_url
+        prev_enabled = self.enabled
+        if cfg.get("api_key") is not None:
+            self.api_key = cfg["api_key"]
+        if cfg.get("provider"):
+            self.provider = cfg["provider"]
+        if cfg.get("base_url"):
+            self.base_url = cfg["base_url"]
+            self.completions_url = completions_url(cfg["base_url"])
+        if cfg.get("model"):
+            self.model = cfg["model"]
+        # 接入参数变化后按「是否有 Key」刷新运行态开关（策略页总开关可在其上覆盖）
+        self.enabled = bool(self.api_key)
+        if self.enabled != prev_enabled:
+            logger.info("LLMClassifier 运行态变更: enabled=%s model=%s endpoint=%s",
+                        self.enabled, self.model, self.completions_url)
 
     # ------------------------------------------------------------------
     # Public API
@@ -265,12 +293,12 @@ class LLMClassifier:
     # ------------------------------------------------------------------
 
     async def _call_llm(self, text: str) -> Optional[dict]:
-        """调用 ZhiPu GLM-4 API 进行安全分类。
+        """调用配置的 LLM 服务（默认智谱 GLM，可覆盖为内网 OpenAI 兼容端点）进行安全分类。
 
         Returns:
             LLM 返回的 JSON dict；失败返回 None
         """
-        url = "https://open.bigmodel.cn/api/paas/v4/chat/completions"
+        url = getattr(self, "completions_url", None) or "https://open.bigmodel.cn/api/paas/v4/chat/completions"
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",

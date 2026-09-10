@@ -49,8 +49,14 @@ class ToolRiskEvaluator:
 
     def classify_tool(self, tool_name: str) -> str:
         tool_lower = tool_name.lower()
-        
+
         if "search_knowledge" in tool_lower:
+            return "low"
+        # 拟稿助手：仅生成草稿文本，不写盘/不外发，无系统副作用，归 low；
+        # 产物带 AIGC 标识，须人工核定后才可对外，安全由内容层与审计兜底
+        if "draft_document" in tool_lower or "doc_worker" in tool_lower:
+            return "low"
+        if "generate_report" in tool_lower or "report_gen" in tool_lower:
             return "low"
         
         for risk_level, tools in self.high_risk_tools.items():

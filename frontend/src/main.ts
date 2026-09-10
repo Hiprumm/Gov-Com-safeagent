@@ -11,6 +11,10 @@ axios.interceptors.request.use((config) => {
   if (apiKey) {
     config.headers['X-API-Key'] = apiKey
   }
+  const authToken = localStorage.getItem('auth_token') || ''
+  if (authToken) {
+    config.headers['X-Auth-Token'] = authToken
+  }
   return config
 })
 
@@ -20,7 +24,8 @@ axios.interceptors.response.use(
     const status = error.response?.status
     let msg: string
     if (status === 401) {
-      msg = '认证失败，请在设置中配置 API Key'
+      // 401：登录失败或令牌失效，已由认证层（登录页/守卫）统一引导，此处不再重复弹窗
+      msg = '登录已失效，请重新登录'
     } else if (status === 429) {
       msg = '请求过于频繁，请稍后再试'
     } else if (status && status >= 500) {
@@ -28,12 +33,10 @@ axios.interceptors.response.use(
     } else {
       msg = error.response?.data?.detail || error.message || '网络错误'
     }
-    console.error(`[${status || 'NET'}] ${msg}`)
-    // 全局错误反馈（401 等业务错误已由调用方处理时可覆盖）
+    console.warn(`[${status || 'NET'}] ${msg}`)
+    // 全局错误反馈（401 由认证层处理，避免与登录页自身提示重复）
     if (status !== 401) {
       toast.error(msg)
-    } else {
-      toast.warning(msg)
     }
     return Promise.reject(error)
   }

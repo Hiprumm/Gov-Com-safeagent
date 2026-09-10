@@ -117,8 +117,8 @@ class SecurityLayer:
 
         # 审计日志
         self.audit_logger.create_log(
-            user_id="user",
-            user_role="user",
+            user_id=state.get("user_id") or "user",
+            user_role=state.get("user_role") or "user",
             agent_id="gov_agent",
             action_type="input_detection",
             action_details={
@@ -148,8 +148,8 @@ class SecurityLayer:
             if correlated_threats:
                 for threat in correlated_threats:
                     self.audit_logger.create_log(
-                        user_id="user",
-                        user_role="user",
+                        user_id=state.get("user_id") or "user",
+                        user_role=state.get("user_role") or "user",
                         agent_id="gov_agent",
                         action_type="cross_source_correlation",
                         action_details={
@@ -194,7 +194,7 @@ class SecurityLayer:
             request = ToolCallRequest(
                 tool_name=tool_name,
                 tool_args=tool_args,
-                user_role="user",
+                user_role=state.get("user_role") or "user",
                 agent_id="gov_agent",
                 context=state.get("user_input", "")
             )
@@ -203,8 +203,8 @@ class SecurityLayer:
             risk_results.append(risk_result)
             
             self.audit_logger.create_log(
-                user_id="user",
-                user_role="user",
+                user_id=state.get("user_id") or "user",
+                user_role=state.get("user_role") or "user",
                 agent_id="gov_agent",
                 action_type="tool_risk_evaluation",
                 action_details={"tool_name": tool_name, "tool_args": tool_args},
@@ -221,14 +221,16 @@ class SecurityLayer:
             
             if risk_result.requires_approval:
                 approval_request = self.approval_engine.create_request(
-                    user_id="user",
-                    user_role="user",
+                    user_id=state.get("user_id") or "user",
+                    user_role=state.get("user_role") or "user",
                     agent_id="gov_agent",
                     action_type=f"tool_call_{tool_name}",
                     action_details={
                         **tool_args,
                         "_session_id": state.get("session_id", "default"),
                         "_tool_name": tool_name,
+                        "_department": state.get("department") or "",
+                        "_actor_name": state.get("display_name") or state.get("user_id") or "user",
                     },
                     risk_level=risk_result.risk_level
                 )
@@ -264,8 +266,8 @@ class SecurityLayer:
 
             # 记录链路告警到审计日志
             self.audit_logger.create_log(
-                user_id="user",
-                user_role="user",
+                user_id=state.get("user_id") or "user",
+                user_role=state.get("user_role") or "user",
                 agent_id="gov_agent",
                 action_type="chain_detection",
                 action_details={
@@ -320,8 +322,8 @@ class SecurityLayer:
                     final_risk = guard_result.risk_level
 
                 self.audit_logger.create_log(
-                    user_id="user",
-                    user_role="user",
+                    user_id=state.get("user_id") or "user",
+                    user_role=state.get("user_role") or "user",
                     agent_id="gov_agent",
                     action_type="operation_guard_blocked",
                     action_details={
@@ -340,8 +342,8 @@ class SecurityLayer:
                 if self._RISK_ORDER.get(guard_result.risk_level.value, 0) > self._RISK_ORDER.get(final_risk.value, 0):
                     final_risk = guard_result.risk_level
                 approval_request = self.approval_engine.create_request(
-                    user_id="user",
-                    user_role="user",
+                    user_id=state.get("user_id") or "user",
+                    user_role=state.get("user_role") or "user",
                     agent_id="gov_agent",
                     action_type=f"guard_{tool_name}",
                     action_details={
@@ -349,14 +351,16 @@ class SecurityLayer:
                         "tool_args": tool_args,
                         "guard_reason": guard_result.approval_reason,
                         "_session_id": session_id,
+                        "_department": state.get("department") or "",
+                        "_actor_name": state.get("display_name") or state.get("user_id") or "user",
                     },
                     risk_level=guard_result.risk_level,
                 )
                 approval_requests.append(approval_request.dict())
 
                 self.audit_logger.create_log(
-                    user_id="user",
-                    user_role="user",
+                    user_id=state.get("user_id") or "user",
+                    user_role=state.get("user_role") or "user",
                     agent_id="gov_agent",
                     action_type="operation_guard_approval",
                     action_details={
@@ -404,7 +408,7 @@ class SecurityLayer:
                     final_risk = param_result.risk_level
                 # 审计：参数校验拦截原因
                 self.audit_logger.create_log(
-                    user_id="user", user_role="user", agent_id="gov_agent",
+                    user_id=state.get("user_id") or "user", user_role=state.get("user_role") or "user", agent_id="gov_agent",
                     action_type="parameter_validation",
                     action_details={"tool_name": tool_name, "tool_args": tool_args,
                                     "violations": param_result.violations},
@@ -435,7 +439,7 @@ class SecurityLayer:
                         final_risk = url_result.risk_level
                     # 审计：浏览器访问拦截原因
                     self.audit_logger.create_log(
-                        user_id="user", user_role="user", agent_id="gov_agent",
+                        user_id=state.get("user_id") or "user", user_role=state.get("user_role") or "user", agent_id="gov_agent",
                         action_type="browser_access_blocked",
                         action_details={"tool_name": tool_name, "url": url_value[:200],
                                         "param_name": param_name},
@@ -478,7 +482,7 @@ class SecurityLayer:
             final_risk = RiskLevel.CRITICAL
             guard_blocked = True
             self.audit_logger.create_log(
-                user_id="user", user_role="user", agent_id="gov_agent",
+                user_id=state.get("user_id") or "user", user_role=state.get("user_role") or "user", agent_id="gov_agent",
                 action_type="runtime_termination",
                 action_details={"reason": term_reason},
                 risk_level=RiskLevel.CRITICAL,

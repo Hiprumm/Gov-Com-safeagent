@@ -3,6 +3,7 @@ import { ref, computed, onMounted } from 'vue'
 import axios from 'axios'
 import { useWebSocket } from '@/composables/useWebSocket'
 import { useToast } from '@/composables/useToast'
+import { useAuth } from '@/composables/useAuth'
 
 // ==================== 类型 ====================
 /** 待审接口返回（approval_engine 的 ApprovalRequest 序列化） */
@@ -41,6 +42,21 @@ const historyList = ref<HistoryItem[]>([])
 const loading = ref(false)
 const expandedId = ref<string>('')
 const { success, error: toastError } = useToast()
+
+// ==================== 审批者身份视角（职责分离：能批谁由后端角色层级兜底，前端禁用交互避免误导） ====================
+const { currentUser } = useAuth()
+const myRole = computed(() => currentUser.value?.role || '')
+/** 当前账号是否具备审批操作权限 */
+const canApprove = computed(() => ['admin', 'operator', 'manager'].includes(myRole.value))
+const approverHint = computed(() => {
+  const map: Record<string, string> = {
+    admin: '系统管理员：可审批全部风险等级',
+    operator: '安全运维：可审批中/低风险，高风险由管理员兜底',
+    manager: '部门负责人：可审批中等风险操作，高风险由管理员兜底',
+  }
+  if (map[myRole.value]) return map[myRole.value]
+  return '当前账号仅可查看审批队列；审批与驳回需系统管理员、安全运维或部门负责人账号'
+})
 
 // ==================== WebSocket 实时刷新 ====================
 const { connect: wsConnect, onEvent } = useWebSocket()
@@ -186,7 +202,14 @@ onMounted(() => {
 <template>
   <div class="h-full">
     <h2 class="text-xl font-bold text-primary mb-1">审批中心</h2>
-    <p class="text-xs text-muted mb-4">高危工具调用的人工审批队列 · 批准即授予会话能力令牌并解锁（grant-on-approve）</p>
+    <p class="text-xs text-muted mb-3">高危工具调用的人工审批队列 · 批准即授予会话能力令牌并解锁（grant-on-approve）</p>
+
+    <!-- 审批者身份视角 -->
+    <div class="flex items-center gap-2 px-3 py-2 rounded-xl border mb-4"
+         :class="canApprove ? 'bg-accent/5 border-accent/20 text-accent' : 'bg-elevated/50 border-border-default text-secondary'">
+      <span class="w-1.5 h-1.5 rounded-full flex-shrink-0" :class="canApprove ? 'bg-accent' : 'bg-disabled'"></span>
+      <span class="text-xs">{{ approverHint }}</span>
+    </div>
 
     <!-- 统计条 -->
     <div class="grid grid-cols-2 lg:grid-cols-4 gap-3 mb-4">
@@ -295,8 +318,8 @@ onMounted(() => {
             <div v-if="detailRows(req).length === 0" class="text-xs text-disabled">无附加参数</div>
           </div>
 
-          <!-- 操作按钮 -->
-          <div class="flex gap-2">
+          <!-- 操作按钮（按审批者身份：无权限账号仅展示，防误导） -->
+          <div v-if="canApprove" class="flex gap-2">
             <button
               @click="approve(req.request_id)"
               class="flex-1 py-2 text-sm bg-gradient-to-r from-safe to-low text-white rounded-lg hover:opacity-90 transition-all active:scale-95 font-medium"
@@ -310,6 +333,7 @@ onMounted(() => {
               驳回
             </button>
           </div>
+          <p v-else class="text-[11px] text-muted text-center py-2 border border-dashed border-border-default rounded-lg">当前账号无审批操作权限（仅可查看队列）</p>
         </div>
       </div>
     </div>
