@@ -868,28 +868,83 @@ async def scan_tool_combinations(request: Request):
     }
 
 
+# ==================== 审计日志读取：登录 + 数据范围收敛 ====================
+def _audit_read_scope(request: Request):
+    """审计读取的可见范围：未登录返回 None；否则返回 (scope, subject, user_dept_map)。
+
+    与风险看板共用同一套 ABAC 规则（权限引擎 row_visible）：
+    admin/operator/auditor 看全平台；manager 看本部门；user 仅本人。
+    """
+    identity = current_identity(request.headers.get("X-Auth-Token"))
+    if not identity:
+        return None
+    scope = permission_engine.data_scope_for(identity.get("role"), authenticated=True)
+    subject = {"username": identity.get("username", ""),
+               "department": identity.get("department", "")}
+    dept_map: Dict[str, str] = {}
+    try:
+        from storage import get_storage
+        for u in get_storage().list_users():
+            dept_map[u.get("username", "")] = u.get("department", "") or ""
+    except Exception:
+        dept_map = {}
+    return scope, subject, dept_map
+
+
+def _filter_by_scope(rows: list, scope_ctx) -> list:
+    """按可见范围过滤审计行（scope=all 时直接返回）。"""
+    scope, subject, dept_map = scope_ctx
+    if scope == "all":
+        return rows
+    return [r for r in rows if permission_engine.row_visible(scope, subject, r, dept_map)]
+
+
 @app.get("/api/audit/logs/recent")
-async def get_recent_logs(limit: int = 100):
+async def get_recent_logs(request: Request, limit: int = 100):
+    """最近审计日志（需登录，按登录身份收敛数据范围）"""
+    sc = _audit_read_scope(request)
+    if not sc:
+        raise HTTPException(status_code=401, detail="未登录")
     try:
         logs = audit_logger.get_recent_logs(limit)
-        return {"logs": [log.dict() for log in logs]}
+        rows = _filter_by_scope([log.dict() for log in logs], sc)
+        return {"logs": rows, "scope": sc[0]}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/api/audit/logs/page")
-async def get_logs_page(page: int = 1, page_size: int = 20):
-    """分页查询审计日志（按时间倒序）
+async def get_logs_page(request: Request, page: int = 1, page_size: int = 20):
+    """分页查询审计日志（按时间倒序，按登录身份收敛数据范围）
 
     page: 页码，从 1 开始
     page_size: 每页条数（默认20，可选20/50，上限100）
     """
+    sc = _audit_read_scope(request)
+    if not sc:
+        raise HTTPException(status_code=401, detail="未登录")
     page = max(1, page)
     page_size = min(max(1, page_size), 100)
+    scope = sc[0]
     try:
-        result = audit_logger.get_logs_page(page=page, page_size=page_size)
-        result["logs"] = [log.dict() for log in result["logs"]]
-        return result
+        if scope == "all":
+            result = audit_logger.get_logs_page(page=page, page_size=page_size)
+            result["logs"] = [log.dict() for log in result["logs"]]
+            result["scope"] = scope
+            return result
+        # 非全平台：先取窗口数据 → 过滤 → 再分页，保证 total 与可见行口径一致
+        window_size = min(20000, max(page * page_size * 5, 2000))
+        rows = _filter_by_scope([log.dict() for log in audit_logger.get_recent_logs(window_size)], sc)
+        total = len(rows)
+        start = (page - 1) * page_size
+        return {
+            "logs": rows[start:start + page_size],
+            "total": total,
+            "page": page,
+            "page_size": page_size,
+            "pages": (total + page_size - 1) // page_size,
+            "scope": scope,
+        }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -1107,12 +1162,17 @@ async def get_log(log_id: str):
 
 @app.post("/api/audit/logs/search")
 async def search_logs(
+    request: Request,
     user_id: Optional[str] = None,
     agent_id: Optional[str] = None,
     risk_level: Optional[str] = None,
     action_type: Optional[str] = None,
     is_blocked: Optional[bool] = None
 ):
+    """审计日志检索（需登录，按登录身份收敛数据范围）"""
+    sc = _audit_read_scope(request)
+    if not sc:
+        raise HTTPException(status_code=401, detail="未登录")
     try:
         risk_level_enum = RiskLevel(risk_level) if risk_level else None
         logs = audit_logger.search_logs(
@@ -1122,7 +1182,8 @@ async def search_logs(
             action_type=action_type,
             is_blocked=is_blocked
         )
-        return {"logs": [log.dict() for log in logs]}
+        rows = _filter_by_scope([log.dict() for log in logs], sc)
+        return {"logs": rows, "scope": sc[0]}
     except ValueError:
         raise HTTPException(status_code=400, detail="无效的风险等级")
     except Exception as e:

@@ -385,6 +385,24 @@ check("J3 auditor 可导出", st == 200, (st, str(d)[:80]))
 st, d = call("GET", "/api/audit/export", token=admin_tk)
 check("J4 admin 可导出", st == 200, (st, str(d)[:80]))
 
+# ==================== K. 审计读取数据范围收敛 ====================
+st, d = call("GET", "/api/audit/logs/recent")
+check("K1 审计日志匿名被拒(401)", st == 401, (st, str(d)[:120]))
+st, d = call("GET", "/api/audit/logs/recent", token=admin_tk)
+check("K2 admin 视角 scope=all", st == 200 and d.get("scope") == "all", (st, str(d)[:120]))
+st, d = call("GET", "/api/audit/logs/recent", token=tokens.get("user", ""))
+check("K3 user 视角 scope=self", st == 200 and d.get("scope") == "self", (st, str(d)[:120]))
+rows = d.get("logs", []) if isinstance(d, dict) else []
+check("K4 user 仅见本人记录", all((r.get("user_id") or "") == "user" for r in rows), [r.get("user_id") for r in rows[:5]])
+st, d = call("GET", "/api/audit/logs/page?page=1&page_size=5", token=admin_tk)
+check("K5 admin 分页可见 scope=all", st == 200 and d.get("scope") == "all" and "total" in d, (st, str(d)[:150]))
+st, d = call("GET", "/api/audit/logs/page?page=1&page_size=5", token=tokens.get("user", ""))
+check("K6 user 分页可见 scope=self", st == 200 and d.get("scope") == "self", (st, str(d)[:150]))
+st, d = call("POST", "/api/audit/logs/search", token=tokens.get("user", ""), body={})
+check("K7 user 检索收敛 scope=self", st == 200 and d.get("scope") == "self", (st, str(d)[:150]))
+st, d = call("POST", "/api/audit/logs/search", body={})
+check("K8 审计检索匿名被拒(401)", st == 401, (st, str(d)[:120]))
+
 # ==================== H. 登录锁定（放在最后，避免影响其它用例） ====================
 lock_codes = []
 for _ in range(5):

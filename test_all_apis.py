@@ -7,6 +7,16 @@ import sys
 BASE = "http://localhost:8080"
 results = []
 
+# 认证：审计等端点在登录后按身份收敛数据范围，统一走带令牌的 Session（admin=全平台视角）
+_S = requests.Session()
+try:
+    _lr = _S.post(f"{BASE}/api/auth/login", json={"username": "admin", "password": "admin123"}, timeout=10)
+    _S.headers["X-Auth-Token"] = (_lr.json() or {}).get("token", "")
+except Exception:
+    pass
+requests.get, requests.post = _S.get, _S.post
+requests.put, requests.delete = _S.put, _S.delete
+
 def record(name, ok, detail=""):
     results.append({"name": name, "ok": ok, "detail": detail})
     status = "PASS" if ok else "FAIL"
