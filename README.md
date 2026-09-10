@@ -258,7 +258,10 @@ AUTH_LOGIN_LOCK_SECONDS=300             # 达到上限后的锁定时长（秒�
 AUTH_PASSWORD_MIN_LEN=8                 # 口令最小长度
 AUTH_PASSWORD_REQUIRE_COMPLEXITY=true   # 需含大小写/数字/符号中至少三类
 AUTH_MFA_ENABLED=true                   # 是否允许用户启用 MFA(TOTP)
+AUTH_MFA_SECRET_KEY=                   # MFA TOTP 密钥加密密钥；留空用 data/mfa_key.key（多实例需一致）
 AUTH_SSO_TRUSTED_HEADER=                # 受信网关头名（如 X-Remote-User）；配置后启用 SSO 免密登录
+AUTH_SSO_SHARED_SECRET=                 # SSO 网关共享密钥；配置后强制校验 X-SSO-Signature（防伪造受信头）
+AUTH_SSO_ALLOWED_IPS=                   # SSO 来源 IP 白名单（逗号分隔，如 10.0.0.5,10.0.0.6）
 
 # === 服务间鉴权（生产建议启用） ===
 AUTH_ENABLED=false                      # 置 true 后所有接口需 X-API-Key
