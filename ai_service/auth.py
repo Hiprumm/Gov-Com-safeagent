@@ -360,6 +360,12 @@ _MFA_ENABLED = bool(getattr(settings, "AUTH_MFA_ENABLED", True))
 _MFA_ISSUER = str(getattr(settings, "AUTH_MFA_ISSUER", "SafeAgent") or "SafeAgent")
 _MFA_TICKET_TTL = int(getattr(settings, "AUTH_MFA_TICKET_TTL", 300) or 300)
 _SSO_TRUSTED_HEADER = str(getattr(settings, "AUTH_SSO_TRUSTED_HEADER", "") or "")
+# SSO 加固：共享密钥签名（网关注入 X-SSO-Signature）+ 来源 IP 白名单
+_SSO_SHARED_SECRET = str(getattr(settings, "AUTH_SSO_SHARED_SECRET", "") or "")
+_SSO_ALLOWED_IPS = [
+    ip.strip() for ip in str(getattr(settings, "AUTH_SSO_ALLOWED_IPS", "") or "").split(",") if ip.strip()
+]
+_SSO_SIGNATURE_HEADER = "X-SSO-Signature"
 
 
 def check_password_policy(password: str) -> Tuple[bool, str]:
@@ -479,9 +485,36 @@ def sso_header_name() -> str:
     return _SSO_TRUSTED_HEADER
 
 
-def resolve_sso_identity(headers) -> Optional[Dict]:
-    """从受信网关头解析已认证身份并映射到本地账号。未配置/缺失/停用返回 None。"""
+def sso_signature_required() -> bool:
+    """是否强制校验网关注入的签名（配置了共享密钥即为强制）。"""
+    return bool(_SSO_TRUSTED_HEADER and _SSO_SHARED_SECRET)
+
+
+def sso_ip_restricted() -> bool:
+    return bool(_SSO_ALLOWED_IPS)
+
+
+def sso_signature(username: str) -> str:
+    """计算网关应携带的签名：HMAC-SHA256(secret, "<头名>:<用户名>")。
+
+    供前置网关/IdP 侧实现参照（服务端只做校验）。
+    """
+    msg = f"{_SSO_TRUSTED_HEADER}:{username}".encode("utf-8")
+    return hmac.new(_SSO_SHARED_SECRET.encode("utf-8"), msg, hashlib.sha256).hexdigest()
+
+
+def resolve_sso_identity(headers, client_ip: str = "") -> Optional[Dict]:
+    """从受信网关头解析已认证身份并映射到本地账号。未配置/缺失/停用/校验失败返回 None。
+
+    加固（防伪造受信头）：
+    1. 来源 IP 白名单（`AUTH_SSO_ALLOWED_IPS`）——仅接受前置网关来源；
+    2. 共享密钥签名（`AUTH_SSO_SHARED_SECRET`）——要求携带 X-SSO-Signature，
+       防止网络层未隔离时被伪造 X-Remote-User 直接免密登录。
+    """
     if not _SSO_TRUSTED_HEADER:
+        return None
+    # 1) 来源 IP 白名单
+    if _SSO_ALLOWED_IPS and (client_ip or "").strip() not in _SSO_ALLOWED_IPS:
         return None
     name = None
     try:
@@ -490,7 +523,16 @@ def resolve_sso_identity(headers) -> Optional[Dict]:
         name = None
     if not name:
         return None
-    row = get_storage().get_user(str(name).strip())
+    name = str(name).strip()
+    # 2) 共享密钥签名校验（常量时间比较）
+    if _SSO_SHARED_SECRET:
+        try:
+            provided = headers.get(_SSO_SIGNATURE_HEADER) or headers.get(_SSO_SIGNATURE_HEADER.lower()) or ""
+        except Exception:
+            provided = ""
+        if not provided or not hmac.compare_digest(str(provided).strip(), sso_signature(name)):
+            return None
+    row = get_storage().get_user(name)
     if not row or row.get("status") != "active":
         return None
     return {

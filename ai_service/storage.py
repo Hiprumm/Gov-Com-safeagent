@@ -598,22 +598,29 @@ class Storage:
         return [dict(r) for r in rows]
 
     def get_user_mfa(self, username: str) -> Dict[str, Any]:
-        """返回用户的 MFA 信息：{totp_secret, mfa_enabled}"""
+        """返回用户的 MFA 信息：{totp_secret, mfa_enabled}
+
+        totp_secret 在库中为密文（security.secret_box），此处透明解密为明文返回。
+        """
+        from security.secret_box import decrypt_secret
         with self._get_conn() as conn:
             row = conn.execute(
                 "SELECT totp_secret, mfa_enabled FROM sys_users WHERE username = ?", (username,)
             ).fetchone()
         if not row:
             return {"totp_secret": "", "mfa_enabled": False}
-        return {"totp_secret": row["totp_secret"] or "", "mfa_enabled": bool(row["mfa_enabled"])}
+        return {"totp_secret": decrypt_secret(row["totp_secret"] or ""),
+                "mfa_enabled": bool(row["mfa_enabled"])}
 
     def set_user_mfa(self, username: str, secret: str, enabled: bool) -> bool:
-        """设置用户的 TOTP 密钥与启用状态"""
+        """设置用户的 TOTP 密钥与启用状态（入库前加密）"""
+        from security.secret_box import encrypt_secret
         with self._lock:
             with self._get_conn() as conn:
                 cur = conn.execute(
                     "UPDATE sys_users SET totp_secret = ?, mfa_enabled = ?, updated_at = ? WHERE username = ?",
-                    (secret or "", 1 if enabled else 0, datetime.now().isoformat(), username),
+                    (encrypt_secret(secret or ""), 1 if enabled else 0,
+                     datetime.now().isoformat(), username),
                 )
                 return cur.rowcount > 0
 

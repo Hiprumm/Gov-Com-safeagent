@@ -102,6 +102,8 @@ check("A11 登出后令牌失效", st == 200 and st2 == 200 and d2.get("user") i
 
 st, d = call("GET", "/api/auth/sso/config")
 check("A12 SSO 默认未启用", st == 200 and d.get("sso_enabled") is False, d)
+check("A12b SSO 配置含加固字段(签名/IP)",
+      d.get("signature_required") is False and d.get("ip_restricted") is False, d)
 st, d = call("POST", "/api/auth/sso")
 check("A13 SSO 未启用 404", st == 404, (st, d))
 
@@ -223,6 +225,14 @@ secret = d.get("secret", "") if isinstance(d, dict) else ""
 check("D7 MFA 绑定生成密钥", st == 200 and d.get("success") and bool(secret) and "otpauth://" in d.get("otpauth_uri", ""), d)
 st, d = call("POST", "/api/auth/mfa/confirm", token=qa_tk, body={"code": "000000"})
 check("D8 错误验证码被拒", isinstance(d, dict) and d.get("success") is False, d)
+
+# TOTP 密钥加密入库（防止"拿到库即生成验证码"）
+_conn = sqlite3.connect(DB)
+_row = _conn.execute("SELECT totp_secret FROM sys_users WHERE username='qa_probe'").fetchone()
+_conn.close()
+_stored = _row[0] if _row else ""
+check("D8b TOTP 密钥密文入库(enc:v1:)", str(_stored).startswith("enc:v1:"), str(_stored)[:40])
+check("D8c 库中不含明文密钥", bool(secret) and secret not in str(_stored), "ok")
 st, d = call("POST", "/api/auth/mfa/confirm", token=qa_tk, body={"code": totp_code(secret)})
 check("D9 正确验证码启用 MFA", isinstance(d, dict) and d.get("success") is True, d)
 st, d = call("POST", "/api/auth/login", body={"username": "qa_probe", "password": "NewProbe#2026"})

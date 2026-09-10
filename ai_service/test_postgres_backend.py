@@ -104,6 +104,17 @@ def main() -> None:
         assert "PG自测部门" in st.list_departments()
         st.upsert_user("pg_user", "h", "s", "PG用户", "user", "PG自测部门", "", "active", "")
         assert st.user_exists("pg_user") and st.get_user("pg_user")["role"] == "user"
+        # MFA TOTP 密钥：加密入库 + 透明解密（PG 分支）
+        from security.secret_box import is_encrypted
+        st.set_user_mfa("pg_user", "JBSWY3DPEHPK3PXP", True)
+        with st._get_conn() as conn:
+            _row = conn.execute(
+                "SELECT totp_secret FROM sys_users WHERE username = %s", ("pg_user",)
+            ).fetchone()
+        raw_secret = _row["totp_secret"] if hasattr(_row, "keys") else _row[0]
+        assert is_encrypted(raw_secret), f"TOTP 未加密入库: {str(raw_secret)[:24]}"
+        mfa = st.get_user_mfa("pg_user")
+        assert mfa["totp_secret"] == "JBSWY3DPEHPK3PXP" and mfa["mfa_enabled"] is True
         st.set_setting("pg_kv", {"a": 1})
         assert st.get_setting("pg_kv") == {"a": 1}
         now = __import__("datetime").datetime.now().isoformat()

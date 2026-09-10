@@ -47,6 +47,9 @@ class Settings(BaseSettings):
     AUTH_MFA_ISSUER: str = "SafeAgent"         # TOTP 发行方（写入 otpauth URI）
     AUTH_MFA_TICKET_TTL: int = 300             # 登录二步验证临时票据有效期（秒）
     AUTH_SSO_TRUSTED_HEADER: str = ""          # 受信网关头名（如 X-Remote-User）；配置后启用 SSO 免密登录
+    AUTH_SSO_SHARED_SECRET: str = ""           # SSO 网关共享密钥；配置后强制校验 X-SSO-Signature（防伪造受信头）
+    AUTH_SSO_ALLOWED_IPS: str = ""              # SSO 来源 IP 白名单（逗号分隔，如 10.0.0.5,10.0.0.6）
+    AUTH_MFA_SECRET_KEY: str = ""              # 敏感字段（MFA TOTP 密钥）加密密钥；留空则用 data/mfa_key.key
 
     # ======== 存储 ========
     SQLITE_PATH: str = ""            # 留空用默认 data/safeagent.db

@@ -60,6 +60,8 @@ from auth import (
     sso_enabled,
     sso_header_name,
     resolve_sso_identity,
+    sso_signature_required,
+    sso_ip_restricted,
 )
 
 app = FastAPI(
@@ -267,6 +269,21 @@ async def startup_cleanup():
                   + ", ".join(default_pw_users))
     except Exception as e:
         print(f"[STARTUP] 默认口令巡检出错: {e}")
+    # SSO 加固巡检：启用 SSO 但未配置共享密钥/IP 白名单 → 受信网关头可被伪造
+    try:
+        if sso_enabled() and not sso_signature_required() and not sso_ip_restricted():
+            print("[STARTUP][WARN] 已启用 SSO 但既未配置 AUTH_SSO_SHARED_SECRET 也未配置 "
+                  "AUTH_SSO_ALLOWED_IPS：受信网关头可被伪造，请确保网络层严格隔离或补充加固配置。")
+    except Exception as e:
+        print(f"[STARTUP] SSO 巡检出错: {e}")
+    # 敏感字段加密巡检：TOTP 密钥应加密入库
+    try:
+        from security.secret_box import encryption_available
+        if not encryption_available():
+            print("[STARTUP][WARN] 敏感字段加密不可用（缺少 cryptography 或密钥），"
+                  "MFA TOTP 密钥将明文入库。")
+    except Exception as e:
+        print(f"[STARTUP] 加密巡检出错: {e}")
 
 
 @app.get("/")
@@ -2263,18 +2280,28 @@ async def auth_change_password(request: Request):
 
 @app.get("/api/auth/sso/config")
 async def auth_sso_config():
-    """SSO 是否启用及受信网关头名（不泄露敏感信息）。"""
-    return {"success": True, "sso_enabled": sso_enabled(), "header": sso_header_name()}
+    """SSO 是否启用及加要求（不泄露密钥本身）。"""
+    return {
+        "success": True,
+        "sso_enabled": sso_enabled(),
+        "header": sso_header_name(),
+        "signature_required": sso_signature_required(),
+        "ip_restricted": sso_ip_restricted(),
+    }
 
 
 @app.post("/api/auth/sso")
 async def auth_sso_login(request: Request):
-    """SSO 免密登录：由受信网关注入的头映射到本地账号并签发令牌。"""
+    """SSO 免密登录：由受信网关注入的头映射到本地账号并签发令牌。
+
+    加固：启用共享密钥后必须携带 X-SSO-Signature；可配置来源 IP 白名单。
+    """
     if not sso_enabled():
         raise HTTPException(status_code=404, detail="未启用 SSO")
-    identity = resolve_sso_identity(request.headers)
+    client_ip = request.client.host if request.client else ""
+    identity = resolve_sso_identity(request.headers, client_ip=client_ip)
     if not identity:
-        raise HTTPException(status_code=401, detail="SSO 身份无效或账号不存在/已停用")
+        raise HTTPException(status_code=401, detail="SSO 身份无效（签名/IP 校验失败或账号不存在/已停用）")
     token = create_token(identity["username"])
     audit_logger.create_log(user_id=identity["username"], user_role=identity.get("role", "user"),
                             agent_id="auth", action_type="auth_login",
