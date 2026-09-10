@@ -15,11 +15,14 @@ class ApprovalEngine:
     def __init__(self):
         self.storage = get_storage()
         
+        # 风险 → 所需审批者角色。CRITICAL 由 admin 兜底：
+        # 系统不存在 super_admin 账号（后台可创建角色仅 admin/operator/auditor/manager/user），
+        # 若要求 super_admin，极危审批单将永远无人可批（审批死锁）。
         self.approval_matrix = {
             RiskLevel.LOW: {"auto_approve": True, "required_level": None},
             RiskLevel.MEDIUM: {"auto_approve": False, "required_level": "manager"},
             RiskLevel.HIGH: {"auto_approve": False, "required_level": "admin"},
-            RiskLevel.CRITICAL: {"auto_approve": False, "required_level": "super_admin"},
+            RiskLevel.CRITICAL: {"auto_approve": False, "required_level": "admin"},
         }
 
     def create_request(self, user_id: str, user_role: str, agent_id: str, 
@@ -79,6 +82,7 @@ class ApprovalEngine:
             "guest": 1,
             "user": 2,
             "manager": 3,
+            "operator": 3,   # 安全运维与部门负责人同级（可批中低危）
             "admin": 4,
             "super_admin": 5,
         }
@@ -101,9 +105,11 @@ class ApprovalEngine:
                 comments=comments
             )
         else:
+            # 权限不足：**不修改审批单状态**（保持 pending），
+            # 避免把"待审"误写成"已驳回"导致待办丢失（历史缺陷）
             return ApprovalResponse(
                 request_id=request_id,
-                status="rejected",
+                status="insufficient_permission",
                 comments=f"审批者角色 [{approver_role}] 权限不足，需要 [{required_level}]"
             )
 

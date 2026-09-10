@@ -1,6 +1,8 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
 import axios from 'axios'
+import { useAuth } from '@/composables/useAuth'
+import { usePermissions } from '@/composables/usePermissions'
 
 interface AuditLog {
   log_id: string
@@ -30,6 +32,158 @@ const totalPages = ref(0)
 const currentPage = ref(1)
 const pageSize = ref(20)
 const retentionDays = ref<number | null>(null)
+
+// ==================== 审计治理（仅管理员）：WORM 保护 / 留存归档 / SIEM 外发 ====================
+// 权限判定以统一权限引擎为准（未加载时回退角色判断）
+const { currentUser } = useAuth()
+const { isAdmin: permIsAdmin, loaded: permLoaded } = usePermissions()
+const myRole = computed(() => currentUser.value?.role || '')
+const showGovernance = computed(() => (permLoaded.value ? permIsAdmin.value : myRole.value === 'admin'))
+
+const protStatus = ref<any>(null)
+const govLoading = ref(false)
+const govMsg = ref('')
+const forwardCfg = ref<{ url: string; enabled: boolean; format: string }>({ url: '', enabled: false, format: 'json' })
+const forwardMsg = ref('')
+
+const loadProtection = async () => {
+  try {
+    const r = await axios.get('/ai/audit/protection')
+    if (r.data?.success) protStatus.value = r.data
+  } catch { /* 非管理员/未登录忽略 */ }
+}
+const loadForward = async () => {
+  try {
+    const r = await axios.get('/ai/audit/forward')
+    if (r.data?.success && r.data.config) forwardCfg.value = { ...r.data.config }
+  } catch { /* ignore */ }
+}
+const installProtection = async () => {
+  govLoading.value = true; govMsg.value = ''
+  try {
+    const r = await axios.post('/ai/audit/protection/install')
+    govMsg.value = r.data?.success ? '已安装 / 修复 WORM 保护' : (r.data?.error || '操作失败')
+    await loadProtection()
+  } catch (e: any) {
+    govMsg.value = e.response?.data?.error || '操作失败'
+  } finally { govLoading.value = false }
+}
+const runRetention = async () => {
+  govLoading.value = true; govMsg.value = ''
+  try {
+    const r = await axios.post('/ai/audit/retention/run')
+    const d = r.data || {}
+    govMsg.value = d.success
+      ? `已归档 ${d.archived} 条，清理 ${d.deleted} 条${d.path ? '；归档文件：' + d.path : ''}`
+      : (d.error || '操作失败')
+    await loadArchives()
+  } catch (e: any) {
+    govMsg.value = e.response?.data?.detail || '操作失败'
+  } finally { govLoading.value = false }
+}
+const saveForward = async () => {
+  forwardMsg.value = ''
+  try {
+    const r = await axios.put('/ai/audit/forward', forwardCfg.value)
+    forwardMsg.value = r.data?.success ? '外发配置已保存' : (r.data?.error || '保存失败')
+    await loadForward()
+  } catch (e: any) {
+    forwardMsg.value = e.response?.data?.error || '保存失败'
+  }
+}
+const testForward = async () => {
+  forwardMsg.value = ''
+  try {
+    const r = await axios.post('/ai/audit/forward/test')
+    forwardMsg.value = r.data?.message || (r.data?.success ? '测试成功' : '测试失败')
+    await loadForwardHistory()
+  } catch (e: any) {
+    forwardMsg.value = e.response?.data?.error || '测试失败'
+  }
+}
+
+// ---- 归档文件 ----
+const archives = ref<Array<{ name: string; size: number; mtime: string }>>([])
+const loadArchives = async () => {
+  try {
+    const r = await axios.get('/ai/audit/archives')
+    if (r.data?.success) archives.value = r.data.archives || []
+  } catch { /* ignore */ }
+}
+const downloadArchive = (name: string) => {
+  axios.get(`/ai/audit/archives/${encodeURIComponent(name)}`, { responseType: 'blob' })
+    .then((res) => {
+      const url = URL.createObjectURL(res.data)
+      const a = document.createElement('a')
+      a.href = url; a.download = name; a.click()
+      URL.revokeObjectURL(url)
+    })
+    .catch(() => { /* ignore */ })
+}
+
+// ---- 链完整性校验 ----
+const verifyResult = ref<any>(null)
+const runVerify = async () => {
+  try {
+    const r = await axios.get('/ai/audit/logs/verify')
+    verifyResult.value = r.data
+  } catch (e: any) {
+    verifyResult.value = { ok: false, error: e.response?.data?.detail || '校验失败' }
+  }
+}
+
+// ---- 可信时间戳锚点 ----
+const anchorInfo = ref<any>(null)
+const anchorMsg = ref('')
+const tsaCfg = ref<{ url: string; enabled: boolean }>({ url: '', enabled: false })
+const loadAnchor = async () => {
+  try {
+    const r = await axios.get('/ai/audit/anchor')
+    if (r.data?.success) {
+      anchorInfo.value = r.data
+      if (r.data.tsa) tsaCfg.value = { url: r.data.tsa.url || '', enabled: !!r.data.tsa.enabled }
+    }
+  } catch { /* ignore */ }
+}
+const createAnchor = async () => {
+  anchorMsg.value = ''
+  try {
+    const r = await axios.post('/ai/audit/anchor')
+    anchorMsg.value = r.data?.success
+      ? `已创建锚点 ${r.data.anchor?.anchor_id}（时间戳模式：${r.data.anchor?.timestamp?.mode}）`
+      : (r.data?.error || '创建失败')
+    await loadAnchor()
+  } catch (e: any) {
+    anchorMsg.value = e.response?.data?.detail || '创建失败'
+  }
+}
+const verifyAnchor = async () => {
+  anchorMsg.value = ''
+  try {
+    const r = await axios.post('/ai/audit/anchor/verify')
+    anchorMsg.value = r.data?.message || '校验完成'
+  } catch (e: any) {
+    anchorMsg.value = e.response?.data?.detail || '校验失败'
+  }
+}
+const saveTsa = async () => {
+  anchorMsg.value = ''
+  try {
+    const r = await axios.put('/ai/audit/tsa', tsaCfg.value)
+    anchorMsg.value = r.data?.success ? 'TSA 配置已保存' : (r.data?.error || '保存失败')
+  } catch (e: any) {
+    anchorMsg.value = e.response?.data?.error || '保存失败'
+  }
+}
+
+// ---- 外发投递历史 ----
+const forwardHistory = ref<any[]>([])
+const loadForwardHistory = async () => {
+  try {
+    const r = await axios.get('/ai/audit/forward/history?limit=10')
+    if (r.data?.success) forwardHistory.value = r.data.history || []
+  } catch { /* ignore */ }
+}
 
 const loadLogs = async () => {
   isLoading.value = true
@@ -169,6 +323,13 @@ const getActionTypeText = (actionType: string) => {
 onMounted(() => {
   loadLogs()
   loadAuditConfig()
+  if (showGovernance.value) {
+    loadProtection()
+    loadForward()
+    loadArchives()
+    loadAnchor()
+    loadForwardHistory()
+  }
 })
 </script>
 
@@ -190,6 +351,176 @@ onMounted(() => {
         <span v-else>刷新</span>
       </button>
     </div>
+
+    <!-- 审计治理（仅管理员）：WORM 保护 / 留存归档 / SIEM 外发 -->
+    <div v-if="showGovernance" class="mb-4 p-4 rounded-xl bg-elevated/50 border border-border-default">
+      <div class="flex items-center justify-between flex-wrap gap-2 mb-3">
+        <h3 class="text-sm font-semibold text-primary flex items-center gap-2">
+          审计治理
+          <span class="px-1.5 py-0.5 text-[10px] rounded bg-accent/10 text-accent border border-accent/25">管理员</span>
+        </h3>
+        <div class="flex items-center gap-3 text-xs">
+          <span class="flex items-center gap-1.5">
+            <span class="w-2 h-2 rounded-full" :class="protStatus?.protection?.update_blocked ? 'bg-safe' : 'bg-critical'"></span>
+            <span :class="protStatus?.protection?.update_blocked ? 'text-safe' : 'text-critical'">
+              防篡改{{ protStatus?.protection?.update_blocked ? '已启用' : '未启用' }}
+            </span>
+          </span>
+          <span class="flex items-center gap-1.5">
+            <span class="w-2 h-2 rounded-full" :class="protStatus?.protection?.delete_blocked ? 'bg-safe' : 'bg-critical'"></span>
+            <span :class="protStatus?.protection?.delete_blocked ? 'text-safe' : 'text-critical'">
+              防删除{{ protStatus?.protection?.delete_blocked ? '已启用' : '未启用' }}
+            </span>
+          </span>
+        </div>
+      </div>
+
+      <div class="flex items-center gap-2 flex-wrap mb-2">
+        <button
+          @click="installProtection"
+          :disabled="govLoading"
+          class="px-3 py-1.5 rounded-lg bg-accent/10 text-accent border border-accent/20 text-xs font-medium hover:bg-accent/20 transition-colors disabled:opacity-50"
+        >
+          安装 / 修复 WORM 保护
+        </button>
+        <button
+          @click="runRetention"
+          :disabled="govLoading"
+          class="px-3 py-1.5 rounded-lg bg-elevated text-secondary border border-border-default text-xs font-medium hover:border-hover transition-colors disabled:opacity-50"
+        >
+          执行留存归档（先归档后清理）
+        </button>
+        <span v-if="retentionDays" class="text-[11px] text-disabled">留存 {{ retentionDays }} 天</span>
+        <span v-if="govMsg" class="text-[11px] text-muted ml-auto break-all">{{ govMsg }}</span>
+      </div>
+
+      <div class="mt-3 pt-3 border-t border-border-default">
+        <div class="flex items-center gap-3 flex-wrap mb-2">
+          <span class="text-xs font-medium text-secondary">审计外发（SIEM）</span>
+          <label class="flex items-center gap-1.5 text-xs text-muted cursor-pointer">
+            <input type="checkbox" v-model="forwardCfg.enabled" class="w-3.5 h-3.5" />
+            启用
+          </label>
+          <select
+            v-model="forwardCfg.format"
+            class="px-2 py-1 rounded-lg bg-canvas border border-border-default text-xs text-primary"
+          >
+            <option value="json">JSON</option>
+            <option value="cef">CEF</option>
+          </select>
+        </div>
+        <div class="flex items-center gap-2 flex-wrap">
+          <input
+            v-model="forwardCfg.url"
+            type="text"
+            placeholder="采集端 URL，如 http://siem.local/collect"
+            class="flex-1 min-w-[220px] px-3 py-1.5 rounded-lg bg-canvas border border-border-default text-xs text-primary placeholder:text-disabled focus:outline-none focus:border-accent"
+          />
+          <button
+            @click="saveForward"
+            class="px-3 py-1.5 rounded-lg bg-accent/10 text-accent border border-accent/20 text-xs font-medium hover:bg-accent/20 transition-colors"
+          >
+            保存
+          </button>
+          <button
+            @click="testForward"
+            class="px-3 py-1.5 rounded-lg bg-elevated text-secondary border border-border-default text-xs font-medium hover:border-hover transition-colors"
+          >
+            测试
+          </button>
+          <span v-if="forwardMsg" class="text-[11px] text-muted">{{ forwardMsg }}</span>
+        </div>
+      </div>
+
+      <!-- 审计链完整性 + 可信时间戳锚点 -->
+      <div class="mt-3 pt-3 border-t border-border-default">
+        <div class="flex items-center gap-2 flex-wrap mb-2">
+          <span class="text-xs font-medium text-secondary">审计链完整性</span>
+          <button
+            @click="runVerify"
+            class="px-3 py-1.5 rounded-lg bg-elevated text-secondary border border-border-default text-xs font-medium hover:border-hover transition-colors"
+          >
+            校验哈希链
+          </button>
+          <span v-if="verifyResult" class="text-[11px]" :class="verifyResult.ok ? 'text-safe' : 'text-critical'">
+            {{ verifyResult.ok
+              ? `完整（校验 ${verifyResult.checked}/${verifyResult.total}，遗留 ${verifyResult.legacy}）`
+              : `异常：篡改 ${verifyResult.tampered?.length ?? '?'} 条` }}
+          </span>
+        </div>
+        <div class="flex items-center gap-2 flex-wrap mb-2">
+          <span class="text-xs font-medium text-secondary">时间戳锚点</span>
+          <button
+            @click="createAnchor"
+            class="px-3 py-1.5 rounded-lg bg-accent/10 text-accent border border-accent/20 text-xs font-medium hover:bg-accent/20 transition-colors"
+          >
+            创建锚点
+          </button>
+          <button
+            @click="verifyAnchor"
+            class="px-3 py-1.5 rounded-lg bg-elevated text-secondary border border-border-default text-xs font-medium hover:border-hover transition-colors"
+          >
+            校验锚点
+          </button>
+          <span v-if="anchorInfo?.latest" class="text-[11px] text-disabled">
+            最近锚点 {{ anchorInfo.latest.anchor_id }} · 条数 {{ anchorInfo.latest.count }} · {{ anchorInfo.latest.timestamp?.mode }}
+          </span>
+          <span v-if="anchorMsg" class="text-[11px] text-muted ml-auto break-all">{{ anchorMsg }}</span>
+        </div>
+        <div class="flex items-center gap-2 flex-wrap">
+          <span class="text-xs text-muted">TSA 地址</span>
+          <input
+            v-model="tsaCfg.url"
+            type="text"
+            placeholder="https://tsa.example/ts（留空则用本地可信时钟）"
+            class="flex-1 min-w-[200px] px-3 py-1.5 rounded-lg bg-canvas border border-border-default text-xs text-primary placeholder:text-disabled focus:outline-none focus:border-accent"
+          />
+          <label class="flex items-center gap-1.5 text-xs text-muted cursor-pointer">
+            <input type="checkbox" v-model="tsaCfg.enabled" class="w-3.5 h-3.5" /> 启用
+          </label>
+          <button
+            @click="saveTsa"
+            class="px-3 py-1.5 rounded-lg bg-accent/10 text-accent border border-accent/20 text-xs font-medium hover:bg-accent/20 transition-colors"
+          >
+            保存 TSA
+          </button>
+        </div>
+      </div>
+
+      <!-- 归档文件 -->
+      <div class="mt-3 pt-3 border-t border-border-default">
+        <div class="flex items-center justify-between mb-2">
+          <span class="text-xs font-medium text-secondary">归档文件（{{ archives.length }}）</span>
+          <button @click="loadArchives" class="text-[11px] text-accent hover:underline">刷新</button>
+        </div>
+        <div v-if="archives.length" class="max-h-32 overflow-y-auto space-y-1">
+          <div v-for="a in archives" :key="a.name" class="flex items-center gap-2 text-[11px]">
+            <span class="flex-1 truncate text-muted">{{ a.name }}</span>
+            <span class="text-disabled">{{ (a.size / 1024).toFixed(1) }} KB</span>
+            <button @click="downloadArchive(a.name)" class="text-accent hover:underline">下载</button>
+          </div>
+        </div>
+        <div v-else class="text-[11px] text-disabled">暂无归档文件（执行「留存归档」后生成）</div>
+      </div>
+
+      <!-- 外发投递历史 -->
+      <div class="mt-3 pt-3 border-t border-border-default">
+        <div class="flex items-center justify-between mb-2">
+          <span class="text-xs font-medium text-secondary">外发投递历史</span>
+          <button @click="loadForwardHistory" class="text-[11px] text-accent hover:underline">刷新</button>
+        </div>
+        <div v-if="forwardHistory.length" class="max-h-32 overflow-y-auto space-y-1">
+          <div v-for="(f, i) in forwardHistory" :key="i" class="flex items-center gap-2 text-[11px]">
+            <span class="w-2 h-2 rounded-full flex-shrink-0" :class="f.ok ? 'bg-safe' : 'bg-critical'"></span>
+            <span class="text-disabled">{{ f.time }}</span>
+            <span class="text-muted flex-1 truncate">{{ f.action_type || f.log_id }}</span>
+            <span :class="f.ok ? 'text-safe' : 'text-critical'">{{ f.ok ? '送达' : (f.error || '失败') }}</span>
+          </div>
+        </div>
+        <div v-else class="text-[11px] text-disabled">暂无投递记录</div>
+      </div>
+    </div>
+
     <div class="overflow-x-auto">
       <table class="w-full text-sm">
         <thead>

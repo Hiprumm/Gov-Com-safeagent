@@ -7,7 +7,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, FileResponse
 from typing import List, Dict, Any, Optional
 from datetime import datetime
 
@@ -29,6 +29,7 @@ from security.session_risk_accumulator import SessionRiskAccumulator, session_ri
 from security.adversarial_mutator import BypassTester
 from security.cross_source_correlator import CrossSourceCorrelator, get_cross_source_correlator
 from security.policy_manager import get_policy_manager
+from security.permission_engine import get_permission_engine
 from plugins.plugin_scanner import PluginScanner
 from security.mcp_scanner import MCPScanner
 from security.skill_analyzer import SkillAnalyzer
@@ -42,11 +43,23 @@ from config import settings
 from auth import (
     DEMO_USERS,
     verify_password,
+    authenticate,
     create_token,
     revoke_token,
     get_user_by_token,
     current_identity,
     list_demo_accounts,
+    check_password_policy,
+    mfa_config,
+    mfa_status,
+    begin_mfa_enroll,
+    confirm_mfa_enroll,
+    disable_mfa,
+    create_mfa_ticket,
+    verify_mfa_ticket,
+    sso_enabled,
+    sso_header_name,
+    resolve_sso_identity,
 )
 
 app = FastAPI(
@@ -136,6 +149,8 @@ metrics_calculator = EvaluationMetricsCalculator()
 gov_agent = GovAgent()
 # 安全策略中枢（管控台在线配置，热生效）
 policy_manager = get_policy_manager()
+# 统一权限决策引擎（RBAC + ABAC 单一事实来源）
+permission_engine = get_permission_engine()
 
 
 def _apply_policy_hot():
@@ -161,8 +176,16 @@ async def startup_cleanup():
     except Exception as e:
         print(f"[STARTUP] 清理空会话时出错: {e}")
     try:
+        # 审计不可篡改（WORM）：启动即安装触发器，先于留存清理
+        from audit.audit_protection import install_audit_protection
+        prot = install_audit_protection()
+        print(f"[STARTUP] 审计 WORM 保护：update_blocked={prot.get('update_blocked')}, "
+              f"delete_blocked={prot.get('delete_blocked')}")
+    except Exception as e:
+        print(f"[STARTUP] 安装审计保护时出错: {e}")
+    try:
         _apply_policy_hot()
-        # 按策略留存天数清理过期审计日志
+        # 按策略留存天数处理过期审计日志（先归档再清理，走受控维护窗口）
         removed = audit_logger.apply_retention_policy(policy_manager.retention_days)
         print(f"[STARTUP] 安全策略 v{policy_manager.get_policy()['policy_version']} 已加载，"
               f"LLM分类层={'开' if input_detector.llm_classifier.enabled else '关'}，"
@@ -548,56 +571,30 @@ async def check_url_access(request: Request):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/api/security/approval/create", response_model=ApprovalRequest)
-async def create_approval(request: dict):
-    try:
-        approval_request = approval_engine.create_request(
-            user_id=request.get("user_id", "user"),
-            user_role=request.get("user_role", "user"),
-            agent_id=request.get("agent_id", "gov_agent"),
-            action_type=request.get("action_type", ""),
-            action_details=request.get("action_details", {}),
-            risk_level=RiskLevel(request.get("risk_level", "none"))
-        )
-        # WebSocket 推送：新审批创建
-        import asyncio
-        asyncio.create_task(push_approval_update(
-            request_id=approval_request.request_id if hasattr(approval_request, 'request_id') else "unknown",
-            action="created",
-            risk_level=request.get("risk_level", "none"),
-            detail={"action_type": request.get("action_type", "")}
-        ))
-        return approval_request
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+# ==================== 审批查询 API（需审批查看权限） ====================
+# 安全修正：原 legacy 的 /approval/create、/approval/approve、/approval/reject 已移除。
+# 它们把 approver_id / approver_role 直接取自调用方参数且完全不做鉴权，
+# 可被匿名请求伪造成 super_admin 批准任意审批单（越权绕过，实测已复现）。
+# 审批单由安全层/智能体内部产生；批准与驳回统一走带令牌校验的 /approve/{id}、/reject/{id}。
 
-
-@app.post("/api/security/approval/approve", response_model=ApprovalResponse)
-async def approve_approval(request_id: str, approver_id: str, approver_role: str, comments: Optional[str] = None):
-    try:
-        result = approval_engine.approve_request(request_id, approver_id, approver_role, comments)
-        return result
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.post("/api/security/approval/reject", response_model=ApprovalResponse)
-async def reject_approval(request_id: str, approver_id: str, comments: Optional[str] = None):
-    try:
-        result = approval_engine.reject_request(request_id, approver_id, comments)
-        return result
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+def _approval_view_guard(request: Request):
+    """返回具备审批查看权限的身份（admin/operator/auditor/manager），否则 None。"""
+    identity = current_identity(request.headers.get("X-Auth-Token"))
+    if identity and permission_engine.has_permission(identity.get("role"), "approval.view"):
+        return identity
+    return None
 
 
 @app.get("/api/security/approval/pending")
-async def get_pending_approvals():
-    """获取所有待审批的请求
+async def get_pending_approvals(request: Request):
+    """获取所有待审批的请求（需审批查看权限）
 
     注意：本路由必须注册在 /api/security/approval/{request_id} 之前，
     否则 "pending" 会被当作 request_id 匹配（历史缺陷：前端审批面板
     一直显示"暂无待审批请求"即由此导致）。
     """
+    if not _approval_view_guard(request):
+        raise HTTPException(status_code=403, detail="无权限：需要审批查看权限")
     try:
         pending = approval_engine.list_pending()
         pending_dicts = [r.dict() for r in pending]
@@ -610,11 +607,13 @@ async def get_pending_approvals():
 
 
 @app.get("/api/security/approval/history")
-async def get_approval_history(limit: int = 50):
-    """获取最近的审批记录（全部状态），供审批中心"已处理"列表使用
+async def get_approval_history(request: Request, limit: int = 50):
+    """获取最近的审批记录（全部状态），供审批中心"已处理"列表使用（需审批查看权限）
 
     同 pending：静态段路由必须注册在 /{request_id} 参数路由之前。
     """
+    if not _approval_view_guard(request):
+        raise HTTPException(status_code=403, detail="无权限：需要审批查看权限")
     try:
         from storage import get_storage
         limit = max(1, min(limit, 200))
@@ -629,7 +628,9 @@ async def get_approval_history(limit: int = 50):
 
 
 @app.get("/api/security/approval/{request_id}", response_model=ApprovalRequest)
-async def get_approval(request_id: str):
+async def get_approval(request: Request, request_id: str):
+    if not _approval_view_guard(request):
+        raise HTTPException(status_code=403, detail="无权限：需要审批查看权限")
     try:
         result = approval_engine.get_request(request_id)
         if not result:
@@ -903,6 +904,170 @@ async def get_audit_config():
     }
 
 
+# ==================== 审计不可篡改（WORM）与留存归档 ====================
+
+@app.get("/api/audit/protection")
+async def get_audit_protection(request: Request):
+    """审计保护状态：WORM 触发器 + 归档目录 + 留存天数（仅管理员）。"""
+    from audit.audit_protection import protection_status, ARCHIVE_DIR
+    from audit.audit_logger import AUDIT_RETENTION_DAYS
+    if not _admin_guard(request):
+        return {"success": False, "error": "无权限：需要系统管理员身份"}
+    return {
+        "success": True,
+        "protection": protection_status(),
+        "archive_dir": ARCHIVE_DIR,
+        "retention_days": AUDIT_RETENTION_DAYS,
+    }
+
+
+@app.post("/api/audit/protection/install")
+async def install_audit_worm(request: Request):
+    """安装/修复审计 WORM 保护触发器（仅管理员）。"""
+    from audit.audit_protection import install_audit_protection
+    if not _admin_guard(request):
+        return {"success": False, "error": "无权限：需要系统管理员身份"}
+    return {"success": True, "protection": install_audit_protection()}
+
+
+@app.post("/api/audit/retention/run")
+async def run_audit_retention(request: Request, days: Optional[int] = None):
+    """立即执行留存策略：归档超期日志后再清理（仅管理员，走受控维护窗口）。"""
+    from audit.audit_protection import retention_archive_and_purge
+    from audit.audit_logger import AUDIT_RETENTION_DAYS
+    if not _admin_guard(request):
+        return {"success": False, "error": "无权限：需要系统管理员身份"}
+    try:
+        result = retention_archive_and_purge(int(days) if days else AUDIT_RETENTION_DAYS)
+        return {"success": True, **result}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ==================== 审计外发（SIEM 对接） ====================
+
+@app.get("/api/audit/forward")
+async def get_audit_forward(request: Request):
+    """查询审计外发配置（仅管理员）。"""
+    from audit.audit_forwarder import load_config
+    if not _admin_guard(request):
+        return {"success": False, "error": "无权限：需要系统管理员身份"}
+    return {"success": True, "config": load_config(force=True)}
+
+
+@app.put("/api/audit/forward")
+async def put_audit_forward(request: Request):
+    """配置审计外发（仅管理员）：{url, enabled, format: json|cef}。"""
+    from audit.audit_forwarder import save_config, load_config
+    if not _admin_guard(request):
+        return {"success": False, "error": "无权限：需要系统管理员身份"}
+    body = await _body(request)
+    fmt = str(body.get("format", "json")).lower()
+    if fmt not in ("json", "cef"):
+        fmt = "json"
+    save_config(str(body.get("url", "")), bool(body.get("enabled", False)), fmt)
+    return {"success": True, "config": load_config(force=True)}
+
+
+@app.post("/api/audit/forward/test")
+async def test_audit_forward(request: Request):
+    """测试审计外发连通性（仅管理员）。"""
+    from audit.audit_forwarder import test_forward
+    if not _admin_guard(request):
+        return {"success": False, "error": "无权限：需要系统管理员身份"}
+    result = test_forward()
+    return {"success": bool(result.get("ok")), **result}
+
+
+# ==================== 可信时间戳（TSA）与审计锚点（Checkpoint） ====================
+
+@app.get("/api/audit/anchor")
+async def get_audit_anchor(request: Request):
+    """查询审计锚点（最近 10 条）与 TSA 配置（仅管理员）。"""
+    from audit.tsa import list_anchors, latest_anchor, load_tsa_config
+    if not _admin_guard(request):
+        return {"success": False, "error": "无权限：需要系统管理员身份"}
+    return {
+        "success": True,
+        "anchors": list_anchors()[-10:],
+        "latest": latest_anchor(),
+        "tsa": load_tsa_config(force=True),
+    }
+
+
+@app.post("/api/audit/anchor")
+async def create_audit_anchor(request: Request):
+    """创建审计锚点：对当前链头请求可信时间戳并留档（仅管理员）。"""
+    from audit.tsa import create_anchor
+    if not _admin_guard(request):
+        return {"success": False, "error": "无权限：需要系统管理员身份"}
+    try:
+        return {"success": True, "anchor": create_anchor()}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/audit/anchor/verify")
+async def verify_audit_anchor(request: Request):
+    """校验当前审计链相对最近锚点是否一致（未截断/回滚，仅管理员）。"""
+    from audit.tsa import verify_anchor
+    if not _admin_guard(request):
+        return {"success": False, "error": "无权限：需要系统管理员身份"}
+    result = verify_anchor()
+    return {"success": bool(result.get("ok")), **result}
+
+
+@app.get("/api/audit/tsa")
+async def get_audit_tsa(request: Request):
+    """查询可信时间戳（TSA）配置（仅管理员）。"""
+    from audit.tsa import load_tsa_config
+    if not _admin_guard(request):
+        return {"success": False, "error": "无权限：需要系统管理员身份"}
+    return {"success": True, "config": load_tsa_config(force=True)}
+
+
+@app.put("/api/audit/tsa")
+async def put_audit_tsa(request: Request):
+    """配置可信时间戳服务（仅管理员）：{url, enabled}。"""
+    from audit.tsa import save_tsa_config
+    if not _admin_guard(request):
+        return {"success": False, "error": "无权限：需要系统管理员身份"}
+    body = await _body(request)
+    return {"success": True, "config": save_tsa_config(str(body.get("url", "")), bool(body.get("enabled", False)))}
+
+
+# ==================== 归档文件 / 外发投递历史（治理面板） ====================
+
+@app.get("/api/audit/archives")
+async def list_audit_archives(request: Request):
+    """列出审计归档文件（仅管理员）。"""
+    from audit.audit_protection import list_archives, ARCHIVE_DIR
+    if not _admin_guard(request):
+        return {"success": False, "error": "无权限：需要系统管理员身份"}
+    return {"success": True, "archives": list_archives(), "archive_dir": ARCHIVE_DIR}
+
+
+@app.get("/api/audit/archives/{name}")
+async def download_audit_archive(request: Request, name: str):
+    """下载指定归档文件（仅管理员，防目录穿越）。"""
+    from audit.audit_protection import resolve_archive
+    if not _admin_guard(request):
+        raise HTTPException(status_code=403, detail="无权限：需要系统管理员身份")
+    path = resolve_archive(name)
+    if not path:
+        raise HTTPException(status_code=404, detail="归档文件不存在")
+    return FileResponse(path, media_type="application/x-ndjson", filename=name)
+
+
+@app.get("/api/audit/forward/history")
+async def get_audit_forward_history(request: Request, limit: int = 30):
+    """外发投递历史（最近若干条，仅管理员）。"""
+    from audit.audit_forwarder import forward_history
+    if not _admin_guard(request):
+        return {"success": False, "error": "无权限：需要系统管理员身份"}
+    return {"success": True, "history": forward_history(limit)}
+
+
 @app.get("/api/audit/logs/verify")
 async def verify_audit_chain():
     """校验审计日志哈希链与签名完整性（防篡改）"""
@@ -966,6 +1131,7 @@ async def search_logs(
 
 @app.get("/api/audit/export")
 async def export_audit_logs(
+    request: Request,
     format: str = "json",
     risk_level: Optional[str] = None,
     user_id: Optional[str] = None,
@@ -973,7 +1139,7 @@ async def export_audit_logs(
     limit: int = 1000,
 ):
     """
-    审计日志导出
+    审计日志导出（需 audit.export 权限：admin / auditor）
 
     支持 JSON 和 CSV 两种格式。
     可按风险等级、用户、操作类型筛选。
@@ -985,6 +1151,12 @@ async def export_audit_logs(
         action_type: 操作类型过滤
         limit: 最大导出数量 (default: 1000)
     """
+    exporter = current_identity(request.headers.get("X-Auth-Token"))
+    if not exporter:
+        raise HTTPException(status_code=401, detail="未登录")
+    if not permission_engine.has_permission(exporter.get("role"), "audit.export"):
+        raise HTTPException(status_code=403, detail="无权限：需要审计导出权限")
+
     import csv
     import io
 
@@ -1147,19 +1319,14 @@ async def dashboard_overview(request: Request):
 
         storage = get_storage()
 
-        # ---- 解析当前登录身份，决定收敛范围 ----
+        # ---- 解析当前登录身份，交由统一权限引擎决定数据收敛范围（RBAC+ABAC） ----
         identity = current_identity(request.headers.get("X-Auth-Token")) if request else {}
         username = identity.get("username", "")
         role = identity.get("role", "")
         dept = identity.get("department", "")
         display_name = identity.get("display_name", "")
-        # scope: all=全平台 | dept=本部门 | self=本人
-        if role in ("admin", "operator", "auditor") or not username:
-            scope = "all"
-        elif role == "manager":
-            scope = "dept"
-        else:
-            scope = "self"
+        scope = permission_engine.data_scope_for(role, authenticated=bool(username))
+        subject = {"username": username, "department": dept}
         # username -> department 反查表（用于把审计记录归属到部门）
         user_dept_map: Dict[str, str] = {}
         try:
@@ -1169,20 +1336,8 @@ async def dashboard_overview(request: Request):
             user_dept_map = {}
 
         def _in_scope(d: Dict[str, Any]) -> bool:
-            """审计/操作行是否在当前收敛范围可见"""
-            if scope == "all":
-                return True
-            row_user = d.get("user_id", "")
-            row_dept = user_dept_map.get(row_user, "")
-            # 兜底：网关写入的 action_details.department
-            if not row_dept:
-                ad = d.get("action_details") or {}
-                row_dept = ad.get("department", "") if isinstance(ad, dict) else ""
-            if scope == "self":
-                return bool(row_user) and row_user == username
-            if scope == "dept":
-                return bool(dept) and row_dept == dept
-            return True
+            """审计/操作行是否在当前收敛范围可见（由权限引擎统一判定）"""
+            return permission_engine.row_visible(scope, subject, d, user_dept_map)
 
         log_dicts = storage.get_audit_logs_recent(limit=5000)
         # 仅统计在收敛范围内的记录
@@ -1257,37 +1412,19 @@ async def dashboard_overview(request: Request):
                     "preview": str(preview)[:120],
                 })
 
-        # 待审批数量同样按收敛范围过滤（按审批发起人 requester 归属）
+        # 待审批数量同样按收敛范围过滤（复用权限引擎的逐行 ABAC 判定）
         pending_approvals = 0
         try:
             for p in storage.list_pending_approvals():
-                req_user = p.get("requester_id", "")
-                req_dept = user_dept_map.get(req_user, "")
-                if not req_dept:
-                    args = p.get("tool_args") or {}
-                    req_dept = args.get("department", "") if isinstance(args, dict) else ""
-                if scope == "all":
-                    pending_approvals += 1
-                elif scope == "self" and req_user == username:
-                    pending_approvals += 1
-                elif scope == "dept" and dept and req_dept == dept:
+                row = {"user_id": p.get("requester_id", ""),
+                       "action_details": p.get("tool_args") or {}}
+                if permission_engine.row_visible(scope, subject, row, user_dept_map):
                     pending_approvals += 1
         except Exception:
             pending_approvals = 0
 
-        # scope 元信息：供前端标注“全平台 / 本部门 / 仅本人”视角
-        scope_meta = {
-            "scope": scope,
-            "username": username,
-            "display_name": display_name,
-            "role": role,
-            "department": dept,
-            "label": ("全平台" if scope == "all"
-                      else f"仅本人" if scope == "self"
-                      else f"本部门 {dept or ''}".strip()),
-            "hint": ("当前展示本账号可权限范围内的数据" if scope in ("dept", "self")
-                     else "当前展示全平台数据"),
-        }
+        # scope 元信息：供前端标注“全平台 / 本部门 / 仅本人”视角（引擎统一生成）
+        scope_meta = permission_engine.scope_meta(identity)
 
         return {
             "success": True,
@@ -1773,12 +1910,42 @@ async def health_check():
 
 @app.post("/api/auth/login")
 async def auth_login(request: dict):
-    """登录：校验账号口令，返回访问令牌与用户身份"""
+    """登录：校验账号口令（含连续失败锁定），返回访问令牌与用户身份"""
     username = str(request.get("username", "")).strip()
     password = str(request.get("password", ""))
-    if not username or not verify_password(username, password):
+    auth_result = authenticate(username, password)
+    if not auth_result.get("ok"):
+        # 审计：登录失败（不记录口令），便于安全监控暴力破解
+        try:
+            audit_logger.create_log(
+                user_id=username or "unknown", user_role="guest", agent_id="auth",
+                action_type="auth_login_failed",
+                action_details={"reason": auth_result.get("reason"),
+                                "locked": auth_result.get("locked", False)},
+                risk_level=RiskLevel.LOW, is_blocked=True,
+                blocking_reason="登录失败或账号锁定",
+            )
+        except Exception:
+            pass
+        if auth_result.get("locked"):
+            raise HTTPException(
+                status_code=423,
+                detail=f"账号已锁定，请 {auth_result.get('remain', 0)} 秒后重试",
+            )
         raise HTTPException(status_code=401, detail="用户名或密码错误")
     from storage import get_storage
+    # 二步验证：账号启用 MFA 时，先返回临时票据，输入 TOTP 通过后再签发访问令牌
+    try:
+        _mfa = get_storage().get_user_mfa(username)
+    except Exception:
+        _mfa = {"mfa_enabled": False}
+    if _mfa.get("mfa_enabled"):
+        return {
+            "success": True,
+            "mfa_required": True,
+            "mfa_ticket": create_mfa_ticket(username),
+            "username": username,
+        }
     row = get_storage().get_user(username) or {}
     token = create_token(username)
     audit_logger.create_log(
@@ -1817,14 +1984,182 @@ async def auth_me(request: Request):
     return {"user": user, "demo_accounts": list_demo_accounts()}
 
 
+@app.get("/api/auth/permissions")
+async def auth_permissions(request: Request):
+    """返回当前登录主体的权限决策结果（单一事实来源）。
+
+    供前端驱动：可见模块（导航收敛）、权限点、数据可见范围（全平台/本部门/仅本人）、
+    审批能力。前端不再各自硬编码角色→菜单，避免与后端漂移。
+    """
+    identity = current_identity(request.headers.get("X-Auth-Token"))
+    return {
+        "success": True,
+        "identity": identity or None,
+        **permission_engine.describe(identity),
+    }
+
+
+# ==================== MFA（TOTP 二步验证）与认证增强 ====================
+
+@app.post("/api/auth/mfa/verify")
+async def auth_mfa_verify(request: dict):
+    """二步验证：校验 MFA 临时票据 + TOTP 验证码 → 签发访问令牌。"""
+    ticket = str(request.get("ticket", ""))
+    code = str(request.get("code", ""))
+    username = verify_mfa_ticket(ticket)
+    if not username:
+        raise HTTPException(status_code=401, detail="验证票据无效或已过期，请重新登录")
+    from auth import verify_totp, mfa_status as _mfa_status
+    info = _mfa_status(username)
+    if not info.get("mfa_enabled"):
+        raise HTTPException(status_code=400, detail="该账号未启用 MFA")
+    from storage import get_storage
+    secret = get_storage().get_user_mfa(username).get("totp_secret", "")
+    if not verify_totp(secret, code):
+        audit_logger.create_log(user_id=username, user_role="user", agent_id="auth",
+                                action_type="auth_mfa_failed", action_details={},
+                                risk_level=RiskLevel.LOW, is_blocked=True, blocking_reason="MFA 验证失败")
+        raise HTTPException(status_code=401, detail="验证码不正确")
+    row = get_storage().get_user(username) or {}
+    token = create_token(username)
+    audit_logger.create_log(user_id=username, user_role=row.get("role", "user"), agent_id="auth",
+                            action_type="auth_login", action_details={"mfa": True},
+                            risk_level=RiskLevel.NONE, is_blocked=False)
+    return {
+        "success": True,
+        "token": token,
+        "user": {
+            "username": username,
+            "display_name": row.get("display_name", username),
+            "role": row.get("role", "user"),
+            "department": row.get("department", ""),
+            "position": row.get("position", ""),
+        },
+    }
+
+
+@app.get("/api/auth/mfa/status")
+async def auth_mfa_status(request: Request):
+    """查询当前账号 MFA 状态与是否可启用。"""
+    identity = current_identity(request.headers.get("X-Auth-Token"))
+    if not identity:
+        raise HTTPException(status_code=401, detail="未登录")
+    return {"success": True, **mfa_status(identity["username"]), "config": mfa_config()}
+
+
+@app.post("/api/auth/mfa/enroll")
+async def auth_mfa_enroll(request: Request):
+    """开始绑定 MFA：生成 TOTP 密钥与 otpauth URI（需扫描后 confirm）。"""
+    identity = current_identity(request.headers.get("X-Auth-Token"))
+    if not identity:
+        raise HTTPException(status_code=401, detail="未登录")
+    if not mfa_config().get("enabled"):
+        return {"success": False, "message": "系统未启用 MFA"}
+    return {"success": True, **begin_mfa_enroll(identity["username"])}
+
+
+@app.post("/api/auth/mfa/confirm")
+async def auth_mfa_confirm(request: Request):
+    """确认绑定：校验一次 TOTP 验证码后正式启用 MFA。"""
+    identity = current_identity(request.headers.get("X-Auth-Token"))
+    if not identity:
+        raise HTTPException(status_code=401, detail="未登录")
+    body = await _body(request)
+    result = confirm_mfa_enroll(identity["username"], str(body.get("code", "")))
+    if result.get("ok"):
+        audit_logger.create_log(user_id=identity["username"], user_role=identity.get("role", "user"),
+                                agent_id="auth", action_type="auth_mfa_enabled", action_details={},
+                                risk_level=RiskLevel.NONE, is_blocked=False)
+    return {"success": bool(result.get("ok")), **result}
+
+
+@app.post("/api/auth/mfa/disable")
+async def auth_mfa_disable(request: Request):
+    """停用当前账号 MFA。"""
+    identity = current_identity(request.headers.get("X-Auth-Token"))
+    if not identity:
+        raise HTTPException(status_code=401, detail="未登录")
+    result = disable_mfa(identity["username"])
+    audit_logger.create_log(user_id=identity["username"], user_role=identity.get("role", "user"),
+                            agent_id="auth", action_type="auth_mfa_disabled", action_details={},
+                            risk_level=RiskLevel.LOW, is_blocked=False)
+    return {"success": True, **result}
+
+
+@app.post("/api/auth/refresh")
+async def auth_refresh(request: Request):
+    """续期：当前访问令牌有效则签发新令牌（用于临近过期的平滑续签）。"""
+    token = request.headers.get("X-Auth-Token")
+    identity = current_identity(token)
+    if not identity:
+        raise HTTPException(status_code=401, detail="登录已失效，请重新登录")
+    revoke_token(token)  # 旧令牌作废，避免长期可用
+    return {"success": True, "token": create_token(identity["username"]), "user": identity}
+
+
+@app.post("/api/auth/password")
+async def auth_change_password(request: Request):
+    """自助修改口令：校验原口令 + 强度策略。"""
+    identity = current_identity(request.headers.get("X-Auth-Token"))
+    if not identity:
+        raise HTTPException(status_code=401, detail="未登录")
+    body = await _body(request)
+    old_pw = str(body.get("old_password", ""))
+    new_pw = str(body.get("new_password", ""))
+    username = identity["username"]
+    if not verify_password(username, old_pw):
+        raise HTTPException(status_code=400, detail="原口令不正确")
+    ok, reason = check_password_policy(new_pw)
+    if not ok:
+        raise HTTPException(status_code=400, detail=reason)
+    from storage import get_storage
+    pw_hash, salt = _pw_fields(new_pw)
+    get_storage().update_user_password(username, pw_hash, salt)
+    audit_logger.create_log(user_id=username, user_role=identity.get("role", "user"), agent_id="auth",
+                            action_type="auth_password_changed", action_details={},
+                            risk_level=RiskLevel.LOW, is_blocked=False)
+    return {"success": True, "message": "口令已更新，请使用新口令登录"}
+
+
+@app.get("/api/auth/sso/config")
+async def auth_sso_config():
+    """SSO 是否启用及受信网关头名（不泄露敏感信息）。"""
+    return {"success": True, "sso_enabled": sso_enabled(), "header": sso_header_name()}
+
+
+@app.post("/api/auth/sso")
+async def auth_sso_login(request: Request):
+    """SSO 免密登录：由受信网关注入的头映射到本地账号并签发令牌。"""
+    if not sso_enabled():
+        raise HTTPException(status_code=404, detail="未启用 SSO")
+    identity = resolve_sso_identity(request.headers)
+    if not identity:
+        raise HTTPException(status_code=401, detail="SSO 身份无效或账号不存在/已停用")
+    token = create_token(identity["username"])
+    audit_logger.create_log(user_id=identity["username"], user_role=identity.get("role", "user"),
+                            agent_id="auth", action_type="auth_login",
+                            action_details={"sso": True}, risk_level=RiskLevel.NONE, is_blocked=False)
+    return {"success": True, "token": token, "user": identity}
+
+
 # ==================== 用户与组织管理 API（仅系统管理员 admin） ====================
 _ROLES = ("admin", "operator", "auditor", "manager", "user")
 
 
 def _admin_guard(request: Request):
-    """返回当前 admin 身份，非管理员返回 None"""
+    """返回当前具备后台管理权限的身份，无权限返回 None（走统一权限引擎）"""
     identity = current_identity(request.headers.get("X-Auth-Token"))
-    return identity if identity.get("role") == "admin" else None
+    if identity and permission_engine.has_permission(identity.get("role"), "admin.manage"):
+        return identity
+    return None
+
+
+def _login_guard(request: Request):
+    """返回当前登录身份（任意角色）；未登录返回 None。
+
+    用于系统配置类端点，避免匿名访客读写/破坏系统级配置与数据。
+    """
+    return current_identity(request.headers.get("X-Auth-Token")) or None
 
 
 def _pw_fields(password: str):
@@ -1863,8 +2198,11 @@ async def admin_create_user(request: Request):
     password = str(body.get("password", ""))
     display_name = str(body.get("display_name", "")).strip() or username
     role = str(body.get("role", "")).strip()
-    if not username or len(password) < 6:
-        return {"success": False, "error": "用户名不能为空且密码至少 6 位"}
+    if not username:
+        return {"success": False, "error": "用户名不能为空"}
+    _ok_pw, _reason = check_password_policy(password)
+    if not _ok_pw:
+        return {"success": False, "error": _reason}
     if role not in _ROLES:
         return {"success": False, "error": f"角色必须为 {_ROLES}"}
     if get_storage().user_exists(username):
@@ -1892,8 +2230,9 @@ async def admin_update_user(request: Request, username: str):
     if not get_storage().user_exists(username):
         return {"success": False, "error": f"账号 {username} 不存在"}
     body = await _body(request)
-    # 保护：不允许管理员自己降级/停用，避免锁死系统
-    if username == actor["username"] and (body.get("role") in ("operator", "auditor", "user") or body.get("status") == "disabled"):
+    # 保护：当前登录管理员不得把自己改成任何非 admin 角色或停用——否则会立即失去后台权限而自我锁死
+    # （此前只挡了 operator/auditor/user，遗漏 manager，可被降级为部门负责人后无法自行恢复）
+    if username == actor["username"] and (body.get("role") not in (None, "admin") or body.get("status") == "disabled"):
         return {"success": False, "error": "不能降级或停用当前登录的管理员账号"}
     if body.get("role") is not None and body.get("role") not in _ROLES:
         return {"success": False, "error": f"角色必须为 {_ROLES}"}
@@ -1917,8 +2256,9 @@ async def admin_reset_password(request: Request, username: str):
         return {"success": False, "error": "无权限：需要系统管理员身份"}
     body = await _body(request)
     password = str(body.get("password", ""))
-    if len(password) < 6:
-        return {"success": False, "error": "新密码至少 6 位"}
+    _ok_pw, _reason = check_password_policy(password)
+    if not _ok_pw:
+        return {"success": False, "error": _reason}
     if not get_storage().user_exists(username):
         return {"success": False, "error": f"账号 {username} 不存在"}
     pw_hash, salt = _pw_fields(password)
@@ -2006,22 +2346,14 @@ async def approve_request(request: Request, request_id: str, approver_comment: s
         # 历史缺陷曾把 "admin" 传成 approver_id 而 approver_role 为空 → 角色层级不足
         # 静默拒绝（DB 状态不更新但端点仍返回成功）
         identity = current_identity(request.headers.get("X-Auth-Token"))
-        approver_id = identity.get("username") or "admin_panel"
+        approver_id = identity.get("username") or ""
         role = identity.get("role")
-        if not identity:
-            approver_role = "admin"
-        elif role == "admin":
-            approver_role = "admin"
-        elif role == "operator":
-            # 安全运维可批中/低风险；高危请求由引擎按层级拒绝
-            approver_role = "manager"
-        elif role == "manager":
-            # 部门负责人：可批本部门发起的中等风险操作（层级3，引擎按 risk 判定）
-            approver_role = "manager"
-        else:
+        # 统一权限引擎判定审批能力（安全优先：未认证 / 无审批权限一律拒绝）
+        approver_role = permission_engine.approver_role_for(role, authenticated=bool(identity))
+        if not approver_role:
             return {
                 "success": False,
-                "message": "当前账号无审批权限（需系统管理员或安全运维账号）",
+                "message": "当前账号无审批权限（需系统管理员 / 安全运维 / 部门负责人）",
             }
         result = approval_engine.approve_request(
             request_id,
@@ -2106,18 +2438,14 @@ async def reject_request(request: Request, request_id: str, reason: str = ""):
     """驳回指定的请求（记录当前登录操作人，审计到人）"""
     try:
         identity = current_identity(request.headers.get("X-Auth-Token"))
-        approver_id = identity.get("username") or "admin_panel"
+        approver_id = identity.get("username") or ""
         role = identity.get("role")
-        if not identity or role == "admin":
-            approver_role = "admin"
-        elif role == "operator":
-            approver_role = "manager"
-        elif role == "manager":
-            approver_role = "manager"
-        else:
+        # 统一权限引擎判定审批能力（安全优先：未认证 / 无审批权限一律拒绝）
+        approver_role = permission_engine.approver_role_for(role, authenticated=bool(identity))
+        if not approver_role:
             return {
                 "success": False,
-                "message": "当前账号无审批权限（需系统管理员或安全运维账号）",
+                "message": "当前账号无审批权限（需系统管理员 / 安全运维 / 部门负责人）",
             }
         rejected = approval_engine.reject_request(request_id, approver_id, reason)
         if rejected.status not in ("rejected", "approved", "auto_approved"):
@@ -2751,18 +3079,24 @@ async def get_evaluation_report():
 # ==================== 模型接入配置（P2-6：内网/离线 OpenAI 兼容端点） ====================
 
 @app.get("/api/model/config")
-async def get_model_config():
+async def get_model_config(request: Request):
+    """模型接入配置查询（仅管理员：含接入端点与 Key 存在性，避免匿名探测）。"""
+    if not _admin_guard(request):
+        return {"success": False, "error": "无权限：需要系统管理员身份"}
     from llm_runtime import runtime_status
     return {"success": True, "config": runtime_status()}
 
 
 @app.put("/api/model/config")
-async def set_model_config(request: dict):
+async def set_model_config(request: Request, payload: dict):
+    """更新模型接入配置（仅管理员）：provider/api_key/base_url/model，热生效。"""
+    if not _admin_guard(request):
+        return {"success": False, "error": "无权限：需要系统管理员身份"}
     from llm_runtime import save_config, load_config
-    provider = request.get("provider")
-    api_key = request.get("api_key")          # None=不修改 / ''=清除覆盖 Key
-    base_url = request.get("base_url")
-    model = request.get("model")
+    provider = payload.get("provider")
+    api_key = payload.get("api_key")          # None=不修改 / ''=清除覆盖 Key
+    base_url = payload.get("base_url")
+    model = payload.get("model")
     if provider not in (None, "zhipu", "openai"):
         raise HTTPException(status_code=400, detail="provider 仅支持 zhipu / openai")
     if base_url is not None and not base_url.startswith(("http://", "https://")):
@@ -2776,12 +3110,15 @@ async def set_model_config(request: dict):
 
 
 @app.post("/api/model/config/test")
-async def test_model_config(request: dict):
+async def test_model_config(request: Request, payload: dict):
+    """模型连通性测试（仅管理员：会向指定 base_url 发起请求，须防匿名 SSRF）。"""
+    if not _admin_guard(request):
+        return {"success": False, "error": "无权限：需要系统管理员身份"}
     from llm_runtime import test_connection
-    provider = str(request.get("provider", "zhipu"))
-    api_key = str(request.get("api_key", ""))
-    base_url = str(request.get("base_url", ""))
-    model = str(request.get("model", ""))
+    provider = str(payload.get("provider", "zhipu"))
+    api_key = str(payload.get("api_key", ""))
+    base_url = str(payload.get("base_url", ""))
+    model = str(payload.get("model", ""))
     ok, detail = test_connection(provider, api_key, base_url, model)
     if not ok:
         raise HTTPException(status_code=400, detail=detail)
@@ -2791,7 +3128,10 @@ async def test_model_config(request: dict):
 # ==================== 站内通知 & 外部通知渠道（P1-4） ====================
 
 @app.get("/api/notifications")
-async def list_notifications(limit: int = 50):
+async def list_notifications(request: Request, limit: int = 50):
+    """站内通知列表（需登录，顶栏铃铛对全员可见）。"""
+    if not _login_guard(request):
+        raise HTTPException(status_code=401, detail="未登录")
     from storage import get_storage
     storage = get_storage()
     limit = max(1, min(limit, 200))
@@ -2802,32 +3142,44 @@ async def list_notifications(limit: int = 50):
 
 
 @app.post("/api/notifications/read")
-async def notifications_mark_read(request: dict):
+async def notifications_mark_read(request: Request, payload: dict):
+    """标记通知已读（需登录）。"""
+    if not _login_guard(request):
+        raise HTTPException(status_code=401, detail="未登录")
     from storage import get_storage
     storage = get_storage()
-    nid = request.get("id")
+    nid = payload.get("id")
     storage.mark_notifications_read(int(nid) if nid is not None else None)
     return {"success": True, "unread": storage.count_unread_notifications()}
 
 
 @app.post("/api/notifications/clear")
-async def notifications_clear():
+async def notifications_clear(request: Request):
+    """清空通知（需登录）。"""
+    if not _login_guard(request):
+        raise HTTPException(status_code=401, detail="未登录")
     from storage import get_storage
     get_storage().clear_notifications()
     return {"success": True}
 
 
 @app.get("/api/notifications/webhook")
-async def get_webhook_config():
+async def get_webhook_config(request: Request):
+    """外部通知渠道配置查询（仅管理员）。"""
+    if not _admin_guard(request):
+        return {"success": False, "error": "无权限：需要系统管理员身份"}
     from notify_webhook import load_webhook
     return {"success": True, "config": load_webhook()}
 
 
 @app.put("/api/notifications/webhook")
-async def set_webhook_config(request: dict):
+async def set_webhook_config(request: Request, payload: dict):
+    """配置外部通知渠道（仅管理员）。"""
+    if not _admin_guard(request):
+        return {"success": False, "error": "无权限：需要系统管理员身份"}
     from notify_webhook import save_webhook
-    url = str(request.get("url", "")).strip()
-    enabled = bool(request.get("enabled", False))
+    url = str(payload.get("url", "")).strip()
+    enabled = bool(payload.get("enabled", False))
     if enabled and not url.startswith(("http://", "https://")):
         raise HTTPException(status_code=400, detail="Webhook 地址需以 http(s):// 开头")
     save_webhook(url, enabled)
@@ -2835,9 +3187,12 @@ async def set_webhook_config(request: dict):
 
 
 @app.post("/api/notifications/webhook/test")
-async def test_webhook_config(request: dict):
+async def test_webhook_config(request: Request, payload: dict):
+    """Webhook 连通性测试（仅管理员：会向指定地址发起请求，须防匿名 SSRF）。"""
+    if not _admin_guard(request):
+        return {"success": False, "error": "无权限：需要系统管理员身份"}
     from notify_webhook import test_webhook as _test
-    url = str(request.get("url", "")).strip()
+    url = str(payload.get("url", "")).strip()
     if not url.startswith(("http://", "https://")):
         raise HTTPException(status_code=400, detail="请输入有效的 http(s) 地址")
     ok, detail = _test(url)
@@ -2853,8 +3208,10 @@ _SERVICE_START = datetime.now()
 
 
 @app.get("/api/system/status")
-async def system_status():
-    """聚合系统运行状态：服务版本/在线时长、WebSocket、LLM 依赖、策略、数据规模"""
+async def system_status(request: Request):
+    """聚合系统运行状态（仅管理员）：服务版本/在线时长、WebSocket、LLM 依赖、策略、数据规模"""
+    if not _admin_guard(request):
+        return {"success": False, "error": "无权限：需要系统管理员身份"}
     try:
         from storage import get_storage
         from websocket.manager import ws_manager as wsm
@@ -2894,8 +3251,10 @@ async def system_status():
 
 
 @app.post("/api/system/maintenance/clean_sessions")
-async def system_maintenance_clean_sessions():
-    """清理无消息的空会话（反复「清空对话/新建会话」产生的残留），供演示/日常整理使用"""
+async def system_maintenance_clean_sessions(request: Request):
+    """清理无消息的空会话（仅管理员）——演示/日常整理使用"""
+    if not _admin_guard(request):
+        return {"success": False, "error": "无权限：需要系统管理员身份"}
     try:
         from storage import get_storage
         storage = get_storage()

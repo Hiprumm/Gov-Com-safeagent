@@ -18,6 +18,12 @@ def check(name, ok, detail=""):
 time.sleep(8)  # 等后端就绪
 c = httpx.Client(timeout=120)
 
+# 认证：审批查看与批准均需登录令牌（admin 具备审批权限）
+_lr = c.post(f"{BASE}/api/auth/login", json={"username": "admin", "password": "admin123"})
+_TOKEN = (_lr.json() or {}).get("token", "") if _lr.status_code == 200 else ""
+c.headers["X-Auth-Token"] = _TOKEN
+check("登录获取审批令牌", bool(_TOKEN), f"status={_lr.status_code}")
+
 print("=" * 72)
 print("1. 发送导出请求 → 应立即返回待人工审批（不阻塞 30 秒）")
 print("=" * 72)

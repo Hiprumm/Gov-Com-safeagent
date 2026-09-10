@@ -34,8 +34,9 @@ axios.interceptors.response.use(
       msg = error.response?.data?.detail || error.message || '网络错误'
     }
     console.warn(`[${status || 'NET'}] ${msg}`)
-    // 全局错误反馈（401 由认证层处理，避免与登录页自身提示重复）
-    if (status !== 401) {
+    // 全局错误反馈：401 由认证层处理；登录接口的错误由登录页统一提示，避免重复弹窗
+    const isAuthLogin = (error.config?.url || '').includes('/auth/login')
+    if (status !== 401 && !isAuthLogin) {
       toast.error(msg)
     }
     return Promise.reject(error)

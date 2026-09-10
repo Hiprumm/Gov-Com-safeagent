@@ -4,6 +4,7 @@ import axios from 'axios'
 import { useWebSocket } from '@/composables/useWebSocket'
 import { useToast } from '@/composables/useToast'
 import { useAuth } from '@/composables/useAuth'
+import { usePermissions } from '@/composables/usePermissions'
 
 // ==================== 类型 ====================
 /** 待审接口返回（approval_engine 的 ApprovalRequest 序列化） */
@@ -45,9 +46,13 @@ const { success, error: toastError } = useToast()
 
 // ==================== 审批者身份视角（职责分离：能批谁由后端角色层级兜底，前端禁用交互避免误导） ====================
 const { currentUser } = useAuth()
+const { canApproveApproval, loaded: permLoaded } = usePermissions()
 const myRole = computed(() => currentUser.value?.role || '')
-/** 当前账号是否具备审批操作权限 */
-const canApprove = computed(() => ['admin', 'operator', 'manager'].includes(myRole.value))
+/** 当前账号是否具备审批操作权限（以统一权限引擎为准；未加载时回退角色表） */
+const canApprove = computed(() =>
+  permLoaded.value ? canApproveApproval.value
+                   : ['admin', 'operator', 'manager'].includes(myRole.value)
+)
 const approverHint = computed(() => {
   const map: Record<string, string> = {
     admin: '系统管理员：可审批全部风险等级',

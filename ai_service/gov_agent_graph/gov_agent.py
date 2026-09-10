@@ -31,22 +31,13 @@ class ConversationManager:
         return self.storage.create_session()
 
     def ensure_session(self, session_id: str) -> str:
-        """确保 session_id 存在，不存在则创建（保留外部传入 ID）"""
+        """确保 session_id 存在，不存在则创建（保留外部传入 ID）。
+
+        走存储后端的统一幂等方法，兼容 SQLite / PostgreSQL。
+        """
         if not session_id:
             return self.storage.create_session()
-        if self.storage.get_session(session_id) is None:
-            # 创建一个使用给定 ID 的会话记录，避免外键约束失败
-            now = datetime.now().isoformat()
-            try:
-                with self.storage._get_conn() as conn:
-                    conn.execute(
-                        "INSERT OR IGNORE INTO sessions (session_id, created_at, updated_at) VALUES (?, ?, ?)",
-                        (session_id, now, now),
-                    )
-            except Exception:
-                # 若插入失败（如重复），回退到新建会话
-                return self.storage.create_session()
-        return session_id
+        return self.storage.ensure_session(session_id)
 
     def add_message(self, session_id: str, role: str, content: str, message_type: str = 'text'):
         self.storage.add_message(session_id, role, content, message_type)

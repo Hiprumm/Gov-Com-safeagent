@@ -29,6 +29,8 @@ const TOKEN_KEY = 'auth_token'
 
 const currentUser = ref<AuthUser | null>(null)
 const demoAccounts = ref<DemoAccount[]>([])
+/** MFA 二步登录挂起态：密码校验通过但待输入 TOTP 验证码 */
+const mfaPending = ref<{ ticket: string; username: string } | null>(null)
 
 /** 本地是否持有令牌（同步、可靠的“已登录”判据，供路由守卫使用） */
 const hasToken = computed(() => !!localStorage.getItem(TOKEN_KEY))
@@ -60,12 +62,18 @@ async function initAuth(): Promise<boolean> {
   return false
 }
 
-/** 登录成功后跳转首页；由路由守卫保证登录前到不了工作台 */
+/** 登录成功后跳转首页；若账号启用 MFA 则进入二步验证（返回 false 并置 mfaPending） */
 async function login(username: string, password: string): Promise<boolean> {
   try {
     const res = await axios.post('/ai/auth/login', { username, password })
+    // 二步验证：密码通过但需输入 TOTP
+    if (res.data?.mfa_required) {
+      mfaPending.value = { ticket: res.data.mfa_ticket, username: res.data.username || username }
+      return false
+    }
     setToken(res.data.token)
     currentUser.value = res.data.user
+    mfaPending.value = null
     toast.success(`欢迎，${res.data.user.display_name}`)
     router.replace('/')
     return true
@@ -75,6 +83,31 @@ async function login(username: string, password: string): Promise<boolean> {
   }
 }
 
+/** MFA 二步：校验 TOTP 验证码完成登录 */
+async function verifyMfa(code: string): Promise<boolean> {
+  if (!mfaPending.value) return false
+  try {
+    const res = await axios.post('/ai/auth/mfa/verify', {
+      ticket: mfaPending.value.ticket,
+      code: code.trim(),
+    })
+    setToken(res.data.token)
+    currentUser.value = res.data.user
+    mfaPending.value = null
+    toast.success(`欢迎，${res.data.user.display_name}`)
+    router.replace('/')
+    return true
+  } catch (e: any) {
+    toast.error(e.response?.data?.detail || '验证码不正确')
+    return false
+  }
+}
+
+/** 取消 MFA 二步，回到账号口令输入 */
+function cancelMfa() {
+  mfaPending.value = null
+}
+
 /** 登出：清令牌并回到登录页 */
 async function logout() {
   try {
@@ -82,10 +115,14 @@ async function logout() {
   } catch { /* ignore */ }
   setToken('')
   currentUser.value = null
+  mfaPending.value = null
   toast.info('已退出登录')
   router.replace('/login')
 }
 
 export function useAuth() {
-  return { currentUser, demoAccounts, isAuthed, hasToken, initAuth, login, logout }
+  return {
+    currentUser, demoAccounts, isAuthed, hasToken,
+    mfaPending, initAuth, login, verifyMfa, cancelMfa, logout,
+  }
 }

@@ -18,7 +18,9 @@ import ToolPanel from '@/components/tools/ToolPanel.vue'
 import SystemStatusPanel from '@/components/system/SystemStatusPanel.vue'
 import NotificationBell from '@/components/notify/NotificationBell.vue'
 import GuideBanner from '@/components/onboarding/GuideBanner.vue'
+import AccountSecurityModal from '@/components/account/AccountSecurityModal.vue'
 import { useAuth } from '@/composables/useAuth'
+import { usePermissions } from '@/composables/usePermissions'
 import { useRouter } from 'vue-router'
 import { useToast } from '@/composables/useToast'
 import { useTheme } from '@/composables/useTheme'
@@ -72,7 +74,10 @@ const currentTab = computed(() => tabs.find(t => t.name === activeTab.value))
 // ---- 账号 / 角色体系（强制登录）：只有登录用户能进入本工作台，导航按角色收敛 ----
 const router = useRouter()
 const { currentUser, initAuth, logout } = useAuth()
+// 统一权限：可见模块/数据范围/操作权限均由后端权限引擎决定
+const { modules: permModules, loaded: permLoaded, fetchPermissions, resetPermissions } = usePermissions()
 
+// 本地回退表：仅在后端权限暂未返回时兜底，避免首屏空白；后端返回后以其为准（单一事实来源）
 const ROLE_ALLOWED_TABS: Record<string, string[]> = {
   admin: tabs.map(t => t.name),
   operator: ['chat', 'dashboard', 'runtime', 'security', 'tools', 'approval', 'audit'],
@@ -80,22 +85,28 @@ const ROLE_ALLOWED_TABS: Record<string, string[]> = {
   manager: ['chat', 'dashboard', 'audit', 'approval'],
   user: ['chat', 'dashboard', 'audit'],
 }
-const visibleTabs = computed(() => {
+const effectiveAllow = computed<string[]>(() => {
+  if (permLoaded.value && permModules.value.length) return permModules.value
   const role = currentUser.value?.role || ''
-  const allow = ROLE_ALLOWED_TABS[role] || []
+  return ROLE_ALLOWED_TABS[role] || []
+})
+const visibleTabs = computed(() => {
+  const allow = effectiveAllow.value
   return tabs.filter(t => allow.includes(t.name))
 })
-// 登录角色切换后，若当前模块不在其权限内则回落至智能问答
-watch(currentUser, () => {
+// 登录角色切换后：拉取后端权限并校验当前模块；权限失效则回落至智能问答
+watch(currentUser, async () => {
   if (!currentUser.value) {
+    resetPermissions()
     // 登录态丢失（token 被服务端清理/过期）→ 回到登录页
     if (router.currentRoute.value.path !== '/login') router.replace('/login')
     return
   }
-  const allow = ROLE_ALLOWED_TABS[currentUser.value.role] || []
-  if (!allow.includes(activeTab.value)) activeTab.value = 'chat'
+  await fetchPermissions()
+  if (!effectiveAllow.value.includes(activeTab.value)) activeTab.value = 'chat'
 })
 const userLogout = () => { logout() }
+const showAccountSecurity = ref(false)
 const roleLabel = (r?: string) =>
   ({ admin: '管理员', operator: '安全运维', auditor: '合规审计', manager: '部门负责人', user: '业务用户' } as Record<string, string>)[r || ''] || ''
 
@@ -206,9 +217,10 @@ function handleKeydown(e: KeyboardEvent) {
   }
 }
 
-onMounted(() => {
+onMounted(async () => {
   checkMobile()
-  initAuth()
+  const ok = await initAuth()
+  if (ok) await fetchPermissions()
   window.addEventListener('resize', checkMobile)
   window.addEventListener('keydown', handleKeydown)
 })
@@ -289,6 +301,13 @@ onUnmounted(() => {
             <span class="hidden xl:inline text-[10px] px-1.5 py-0.5 rounded-full bg-accent/10 text-accent font-medium">{{ roleLabel(currentUser.role) }}</span>
           </div>
           <button
+            @click="showAccountSecurity = true"
+            class="p-1.5 rounded-lg hover:bg-hover transition-colors text-muted hover:text-accent flex-shrink-0 active:scale-95"
+            title="账号安全（MFA / 改密）"
+          >
+            <ShieldCheck class="w-4 h-4" />
+          </button>
+          <button
             @click="userLogout"
             class="p-1.5 rounded-lg hover:bg-hover transition-colors text-muted hover:text-critical flex-shrink-0 active:scale-95"
             title="退出登录"
@@ -362,6 +381,9 @@ onUnmounted(() => {
 
     <!-- ========== 首次使用引导横幅 ========== -->
     <GuideBanner v-if="showGuide" @close="dismissGuide" @goto="guideGoto" />
+
+    <!-- 账号安全（MFA / 改密） -->
+    <AccountSecurityModal v-if="showAccountSecurity" @close="showAccountSecurity = false" />
 
     <!-- ========== 移动端侧边栏遮罩 ========== -->
     <div

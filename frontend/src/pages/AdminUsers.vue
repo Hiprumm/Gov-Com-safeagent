@@ -17,6 +17,15 @@ const ROLE_LABEL: Record<string, string> = {
   admin: '系统管理员', operator: '安全运维', auditor: '合规审计', manager: '部门负责人', user: '业务用户',
 }
 
+// 口令策略须与后端 auth.check_password_policy 保持一致（≥8 位 + 大小写/数字/符号至少三类），
+// 否则前端放行后会被后端拒绝，造成"填了却建不了"的困惑
+const pwPolicyError = (pw: string): string => {
+  if (!pw || pw.length < 8) return '密码至少 8 位'
+  const cats = [/[a-z]/, /[A-Z]/, /[0-9]/, /[^A-Za-z0-9]/].filter((r) => r.test(pw)).length
+  if (cats < 3) return '密码需包含大写字母、小写字母、数字、符号中的至少三类'
+  return ''
+}
+
 // ---- 数据 ----
 const users = ref<any[]>([])
 const departments = ref<string[]>([])
@@ -83,7 +92,8 @@ const openEdit = (u: any) => {
 const saveUser = async () => {
   if (!isEdit.value) {
     if (!form.value.username?.trim()) return toast.error('请输入用户名')
-    if (!form.value.password || form.value.password.length < 6) return toast.error('初始密码至少 6 位')
+    const pwErr = pwPolicyError(form.value.password || '')
+    if (pwErr) return toast.error(pwErr)
     try {
       const r = await axios.post('/api/admin/users', form.value)
       if (!r.data?.success) return toast.error(r.data?.error || '创建失败')
@@ -108,9 +118,10 @@ const saveUser = async () => {
 
 // ---- 重置密码 / 启停 / 删除 ----
 const resetPw = async (u: any) => {
-  const newPw = window.prompt(`为账号 ${u.username} 设置新密码（至少 6 位）：`, '')
+  const newPw = window.prompt(`为账号 ${u.username} 设置新密码（≥8 位，含大小写/数字/符号至少三类）：`, '')
   if (newPw === null) return
-  if (!newPw || newPw.length < 6) return toast.error('新密码至少 6 位')
+  const pwErr = pwPolicyError(newPw)
+  if (pwErr) return toast.error(pwErr)
   try {
     const r = await axios.post(`/api/admin/users/${u.username}/reset_password`, { password: newPw })
     if (!r.data?.success) return toast.error(r.data?.error || '重置失败')
@@ -220,6 +231,7 @@ const statCards = computed(() => [
                   <th class="px-4 py-2 font-medium">角色</th>
                   <th class="px-4 py-2 font-medium">部门 / 岗位</th>
                   <th class="px-4 py-2 font-medium">状态</th>
+                  <th class="px-4 py-2 font-medium">MFA</th>
                   <th class="px-4 py-2 font-medium text-right">操作</th>
                 </tr>
               </thead>
@@ -235,6 +247,11 @@ const statCards = computed(() => [
                     </span>
                   </td>
                   <td class="px-4 py-2.5">
+                    <span class="text-[11px] px-2 py-0.5 rounded-full font-medium" :class="u.mfa_enabled ? 'bg-accent/15 text-accent' : 'bg-elevated text-disabled'">
+                      {{ u.mfa_enabled ? '已启用' : '未启用' }}
+                    </span>
+                  </td>
+                  <td class="px-4 py-2.5">
                     <div class="flex items-center justify-end gap-1">
                       <button @click="openEdit(u)" class="p-1.5 rounded-lg hover:bg-hover text-secondary hover:text-accent transition-colors" title="编辑"><Pencil class="w-4 h-4" /></button>
                       <button @click="resetPw(u)" class="p-1.5 rounded-lg hover:bg-hover text-secondary hover:text-accent transition-colors" title="重置密码"><KeyRound class="w-4 h-4" /></button>
@@ -246,7 +263,7 @@ const statCards = computed(() => [
                     </div>
                   </td>
                 </tr>
-                <tr v-if="!users.length && !loading"><td colspan="6" class="px-4 py-10 text-center text-muted">暂无账号，点击右上角「新建账号」创建</td></tr>
+                <tr v-if="!users.length && !loading"><td colspan="7" class="px-4 py-10 text-center text-muted">暂无账号，点击右上角「新建账号」创建</td></tr>
               </tbody>
             </table>
           </div>
@@ -291,7 +308,7 @@ const statCards = computed(() => [
               <input v-model="form.username" placeholder="如 zhangwei" class="w-full px-3 py-2 bg-canvas border border-border-default rounded-lg text-sm focus:outline-none focus:border-accent" />
             </div>
             <div>
-              <label class="block text-xs text-muted mb-1">初始密码（≥6 位）</label>
+              <label class="block text-xs text-muted mb-1">初始密码（≥8 位，含大小写/数字/符号至少三类）</label>
               <input v-model="form.password" type="password" placeholder="设置初始密码" class="w-full px-3 py-2 bg-canvas border border-border-default rounded-lg text-sm focus:outline-none focus:border-accent" />
             </div>
           </template>

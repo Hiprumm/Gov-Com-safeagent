@@ -34,8 +34,30 @@ class Settings(BaseSettings):
     AUTH_ENABLED: bool = False
     AUTH_API_KEY: str = ""           # 简单 API Key,填写则启用
 
+    # ======== 认证与会话（S1 认证加固）========
+    AUTH_JWT_SECRET: str = ""              # JWT 签名密钥；生产务必在 .env 配置；留空则随机生成(重启后旧令牌失效)
+    AUTH_TOKEN_TTL_SECONDS: int = 8 * 3600 # 访问令牌有效期（默认 8 小时）
+    AUTH_LOGIN_MAX_FAILS: int = 5          # 连续登录失败上限
+    AUTH_LOGIN_LOCK_SECONDS: int = 300     # 达到上限后的锁定时长（秒）
+
+    # ======== 认证增强（S1 收尾）========
+    AUTH_PASSWORD_MIN_LEN: int = 8             # 口令最小长度
+    AUTH_PASSWORD_REQUIRE_COMPLEXITY: bool = True  # 需包含 大小写/数字/符号 中至少三类
+    AUTH_MFA_ENABLED: bool = True              # 是否允许用户启用 MFA(TOTP)
+    AUTH_MFA_ISSUER: str = "SafeAgent"         # TOTP 发行方（写入 otpauth URI）
+    AUTH_MFA_TICKET_TTL: int = 300             # 登录二步验证临时票据有效期（秒）
+    AUTH_SSO_TRUSTED_HEADER: str = ""          # 受信网关头名（如 X-Remote-User）；配置后启用 SSO 免密登录
+
     # ======== 存储 ========
     SQLITE_PATH: str = ""            # 留空用默认 data/safeagent.db
+    STORAGE_BACKEND: str = "sqlite"  # sqlite | postgres（生产建议 postgres）
+    # PostgreSQL 连接（STORAGE_BACKEND=postgres 时生效；可只配 POSTGRES_DSN）
+    POSTGRES_DSN: str = ""           # 形如 postgresql://user:pwd@host:5432/db；留空则用下方分项拼装
+    POSTGRES_HOST: str = "localhost"
+    POSTGRES_PORT: int = 5432
+    POSTGRES_DB: str = "safeagent"
+    POSTGRES_USER: str = "safeagent"
+    POSTGRES_PASSWORD: str = ""
 
     # ======== 检测阈值 ========
     ATTACK_THRESHOLD_LOW: float = 0.3

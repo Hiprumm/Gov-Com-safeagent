@@ -291,6 +291,13 @@ class AuditLogger:
                 "extra_data": extra_data,
             })
 
+        # SIEM 外发（可选）：启用时后台线程投递，非阻塞、失败静默，不影响审计主流程
+        try:
+            from audit.audit_forwarder import forward_event_async
+            forward_event_async(log.model_dump())
+        except Exception:
+            pass
+
         return log
 
     # ------------------------------------------------------------------
@@ -298,8 +305,21 @@ class AuditLogger:
     # ------------------------------------------------------------------
 
     def apply_retention_policy(self, days: int = AUDIT_RETENTION_DAYS) -> int:
-        """按留存策略清理超期日志，返回删除条数"""
-        return self.storage.delete_audit_logs_older_than(days)
+        """按留存策略处理超期日志：**先归档再清理**（WORM 保护下走受控维护窗口），返回清理条数。"""
+        try:
+            from audit.audit_protection import retention_archive_and_purge
+            result = retention_archive_and_purge(days)
+            archived = result.get("archived", 0)
+            deleted = result.get("deleted", 0)
+            if archived:
+                try:
+                    print(f"[AUDIT] 留存归档：{archived} 条 → {result.get('path')}；清理 {deleted} 条")
+                except Exception:
+                    pass
+            return int(deleted)
+        except Exception:
+            # 兜底：保护模块不可用时退回原始清理（保持兼容）
+            return self.storage.delete_audit_logs_older_than(days)
 
     # ------------------------------------------------------------------
     # 日志防篡改校验（哈希链 + 签名）

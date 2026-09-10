@@ -22,6 +22,16 @@ class Storage:
         self._lock = Lock()
         self._init_db()
 
+    @property
+    def db_path(self) -> str:
+        """当前数据库文件路径（供审计保护/归档等维护模块使用）"""
+        return self._db_path
+
+    @property
+    def is_file_backed(self) -> bool:
+        """是否为文件型数据库（SQLite）。PostgreSQL 后端为 False。"""
+        return True
+
     @contextmanager
     def _get_conn(self):
         conn = sqlite3.connect(self._db_path)
@@ -123,6 +133,8 @@ class Storage:
                     position TEXT DEFAULT '',
                     status TEXT DEFAULT 'active',
                     note TEXT DEFAULT '',
+                    totp_secret TEXT DEFAULT '',
+                    mfa_enabled INTEGER DEFAULT 0,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
@@ -136,14 +148,24 @@ class Storage:
                 CREATE INDEX IF NOT EXISTS idx_notifications_created ON notifications(created_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_users_role ON sys_users(role);
             """)
+            # 迁移：为历史库补充 MFA(TOTP) 列（幂等）
+            try:
+                cols = {r["name"] for r in conn.execute("PRAGMA table_info(sys_users)").fetchall()}
+                if "totp_secret" not in cols:
+                    conn.execute("ALTER TABLE sys_users ADD COLUMN totp_secret TEXT DEFAULT ''")
+                if "mfa_enabled" not in cols:
+                    conn.execute("ALTER TABLE sys_users ADD COLUMN mfa_enabled INTEGER DEFAULT 0")
+            except Exception:
+                pass
 
     # ==================== 审计日志 ====================
 
     def save_audit_log(self, log_data: Dict[str, Any]):
+        """写入审计日志（**只追加**，不覆盖；配合 WORM 触发器实现物理不可篡改）"""
         with self._lock:
             with self._get_conn() as conn:
                 conn.execute("""
-                    INSERT OR REPLACE INTO audit_logs
+                    INSERT INTO audit_logs
                     (log_id, timestamp, user_id, user_role, agent_id,
                      action_type, action_details, risk_level,
                      detection_result, tool_call_result, approval_status,
@@ -253,6 +275,15 @@ class Storage:
             ).fetchall()
         return [self._row_to_dict(r) for r in rows]
 
+    def get_audit_logs_before(self, cutoff_iso: str, limit: int = 200000) -> List[Dict[str, Any]]:
+        """按时间正序取早于 cutoff 的审计日志（用于留存归档后再清理）"""
+        with self._get_conn() as conn:
+            rows = conn.execute(
+                "SELECT * FROM audit_logs WHERE timestamp < ? ORDER BY timestamp ASC, rowid ASC LIMIT ?",
+                (cutoff_iso, limit),
+            ).fetchall()
+        return [self._row_to_dict(r) for r in rows]
+
     # ==================== 审批记录 ====================
 
     def create_approval(self, approval_data: Dict[str, Any]):
@@ -319,6 +350,22 @@ class Storage:
                 return [self._row_to_dict(r) for r in rows]
 
     # ==================== 会话管理 ====================
+
+    def ensure_session(self, session_id: str) -> str:
+        """幂等确保会话存在：不存在则创建，存在则原样返回。
+
+        统一入口，替代此前外部直接调用数据库私有连接 + SQLite 专有 SQL 的做法。
+        """
+        if not session_id:
+            return self.create_session()
+        now = datetime.now().isoformat()
+        with self._lock:
+            with self._get_conn() as conn:
+                conn.execute(
+                    "INSERT OR IGNORE INTO sessions (session_id, created_at, updated_at) VALUES (?, ?, ?)",
+                    (session_id, now, now),
+                )
+        return session_id
 
     def create_session(self) -> str:
         import uuid
@@ -546,9 +593,29 @@ class Storage:
     def list_users(self) -> List[Dict[str, Any]]:
         with self._get_conn() as conn:
             rows = conn.execute(
-                "SELECT username, display_name, role, department, position, status, note, created_at, updated_at FROM sys_users ORDER BY role, username"
+                "SELECT username, display_name, role, department, position, status, note, mfa_enabled, created_at, updated_at FROM sys_users ORDER BY role, username"
             ).fetchall()
         return [dict(r) for r in rows]
+
+    def get_user_mfa(self, username: str) -> Dict[str, Any]:
+        """返回用户的 MFA 信息：{totp_secret, mfa_enabled}"""
+        with self._get_conn() as conn:
+            row = conn.execute(
+                "SELECT totp_secret, mfa_enabled FROM sys_users WHERE username = ?", (username,)
+            ).fetchone()
+        if not row:
+            return {"totp_secret": "", "mfa_enabled": False}
+        return {"totp_secret": row["totp_secret"] or "", "mfa_enabled": bool(row["mfa_enabled"])}
+
+    def set_user_mfa(self, username: str, secret: str, enabled: bool) -> bool:
+        """设置用户的 TOTP 密钥与启用状态"""
+        with self._lock:
+            with self._get_conn() as conn:
+                cur = conn.execute(
+                    "UPDATE sys_users SET totp_secret = ?, mfa_enabled = ?, updated_at = ? WHERE username = ?",
+                    (secret or "", 1 if enabled else 0, datetime.now().isoformat(), username),
+                )
+                return cur.rowcount > 0
 
     def update_user_profile(self, username: str, display_name: str = None, role: str = None,
                             department: str = None, position: str = None,
@@ -623,11 +690,29 @@ class Storage:
         return d
 
 
-_storage_instance: Optional[Storage] = None
+_storage_instance: Optional[Any] = None
 
 
-def get_storage() -> Storage:
+def get_storage() -> Any:
+    """存储单例工厂：依据配置选择后端（SQLite 默认 / PostgreSQL 可选）。
+
+    通过环境变量/.env 的 `STORAGE_BACKEND=sqlite|postgres` 切换。
+    - 默认 sqlite：零依赖，行为与历史一致；
+    - postgres：需安装 `psycopg`，连接参数见 POSTGRES_* / POSTGRES_DSN。
+    两种后端实现同一套公开方法（见 Storage / PostgresStorage），上层调用方无需改动。
+    """
     global _storage_instance
-    if _storage_instance is None:
+    if _storage_instance is not None:
+        return _storage_instance
+    backend = "sqlite"
+    try:
+        from config import settings
+        backend = str(getattr(settings, "STORAGE_BACKEND", "sqlite") or "sqlite").lower()
+    except Exception:
+        backend = "sqlite"
+    if backend in ("postgres", "postgresql", "pg"):
+        from postgres_storage import PostgresStorage  # 延迟导入，避免循环依赖
+        _storage_instance = PostgresStorage()
+    else:
         _storage_instance = Storage()
     return _storage_instance

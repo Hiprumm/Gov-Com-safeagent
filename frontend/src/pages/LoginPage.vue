@@ -9,11 +9,13 @@ const route = useRoute()
 const router = useRouter()
 const { isDark, toggleTheme } = useTheme()
 
-const { login, demoAccounts, initAuth } = useAuth()
+const { login, demoAccounts, initAuth, mfaPending, verifyMfa, cancelMfa } = useAuth()
 const username = ref('')
 const password = ref('')
 const submitting = ref(false)
 const errorMsg = ref('')
+const mfaCode = ref('')
+const mfaSubmitting = ref(false)
 
 // 首次进入拉取演示账号列表（未登录时 /me 也返回 demo_accounts）
 onMounted(async () => {
@@ -44,6 +46,30 @@ const submit = async () => {
       router.replace(redirect)
     }
   }
+  // 若需 MFA，useAuth 会置 mfaPending，模板自动切换到二步验证
+}
+
+const submitMfa = async () => {
+  if (!mfaCode.value.trim()) {
+    errorMsg.value = '请输入动态验证码'
+    return
+  }
+  mfaSubmitting.value = true
+  errorMsg.value = ''
+  const ok = await verifyMfa(mfaCode.value)
+  mfaSubmitting.value = false
+  if (ok) {
+    const redirect = typeof route.query.redirect === 'string' ? route.query.redirect : ''
+    if (redirect && redirect.startsWith('/') && redirect !== '/login') {
+      router.replace(redirect)
+    }
+  }
+}
+
+const backToPassword = () => {
+  cancelMfa()
+  mfaCode.value = ''
+  errorMsg.value = ''
 }
 </script>
 
@@ -83,6 +109,7 @@ const submit = async () => {
         </div>
 
         <div class="p-6 space-y-4">
+          <template v-if="!mfaPending">
           <!-- 演示账号快捷选择 -->
           <div>
             <p class="text-xs text-muted mb-2">选择演示账号体验不同角色（口令统一 <span class="text-accent font-medium">admin123</span>）：</p>
@@ -139,6 +166,43 @@ const submit = async () => {
           <p class="text-[11px] text-disabled text-center leading-relaxed">
             登录后导航将按角色收敛 · 审批与审计操作将记录到当前账号
           </p>
+          </template>
+
+          <!-- MFA 二步验证 -->
+          <template v-else>
+            <div class="text-center">
+              <h4 class="text-base font-bold text-primary">二步验证</h4>
+              <p class="text-xs text-muted mt-1">
+                账号 <span class="text-accent font-medium">{{ mfaPending?.username }}</span> 已启用 MFA，请输入认证器中的动态验证码
+              </p>
+            </div>
+            <div>
+              <label class="block text-sm text-secondary mb-1.5">动态验证码</label>
+              <input
+                v-model="mfaCode"
+                type="text"
+                inputmode="numeric"
+                maxlength="6"
+                placeholder="6 位数字"
+                @keydown.enter="submitMfa"
+                class="w-full px-3.5 py-2.5 bg-canvas border border-border-default text-primary placeholder:text-disabled rounded-xl text-sm tracking-[0.3em] text-center focus:outline-none focus:ring-2 focus:ring-accent/20 focus:border-accent"
+              />
+            </div>
+            <p v-if="errorMsg" class="text-sm text-critical">{{ errorMsg }}</p>
+            <button
+              @click="submitMfa"
+              :disabled="mfaSubmitting"
+              class="w-full py-2.5 rounded-xl bg-gradient-to-r from-accent to-low text-white font-medium hover:opacity-90 transition-all active:scale-[0.98] disabled:opacity-50"
+            >
+              {{ mfaSubmitting ? '验证中...' : '验 证 并 登 录' }}
+            </button>
+            <button
+              @click="backToPassword"
+              class="w-full text-xs text-muted hover:text-accent transition-colors"
+            >
+              返回账号口令
+            </button>
+          </template>
         </div>
       </div>
 

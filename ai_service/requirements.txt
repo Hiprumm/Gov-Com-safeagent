@@ -8,3 +8,6 @@ langchain-openai==0.1.10
 langchain-community==0.0.25
 PyPDF2==3.0.1
 python-dotenv==1.0.1
+
+# PostgreSQL 存储后端驱动（设置 STORAGE_BACKEND=postgres 时使用；默认 sqlite 后端不依赖它）
+psycopg[binary]>=3.1
