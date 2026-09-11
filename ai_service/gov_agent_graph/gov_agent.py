@@ -5,6 +5,8 @@ import uuid
 import base64
 import json
 from datetime import datetime
+import queue
+import threading
 from typing import Dict, Any, List, Callable, Optional
 from langgraph.graph import StateGraph, END
 
@@ -40,8 +42,9 @@ class ConversationManager:
             return self.storage.create_session(user_id)
         return self.storage.ensure_session(session_id, user_id)
 
-    def add_message(self, session_id: str, role: str, content: str, message_type: str = 'text'):
-        self.storage.add_message(session_id, role, content, message_type)
+    def add_message(self, session_id: str, role: str, content: str, message_type: str = 'text',
+                    metadata: Optional[str] = None):
+        self.storage.add_message(session_id, role, content, message_type, metadata)
 
     def get_history(self, session_id: str, limit: int = 20) -> List[Dict[str, Any]]:
         return self.storage.get_history(session_id, limit)
@@ -113,12 +116,15 @@ class FileProcessor:
         try:
             decoded = base64.b64decode(file_data)
             file_size_mb = len(decoded) / (1024 * 1024)
-            
+
+            text = ""
+            detail = ""
+            # 1) 优先本地 Tesseract OCR（若已安装引擎）
             try:
                 import pytesseract
                 from PIL import Image
                 from io import BytesIO
-                
+
                 # 设置Tesseract路径（Windows）
                 tesseract_paths = [
                     r'C:\Program Files\Tesseract-OCR\tesseract.exe',
@@ -129,49 +135,55 @@ class FileProcessor:
                     if os.path.exists(path):
                         pytesseract.pytesseract.tesseract_cmd = path
                         break
-                
+
                 img = Image.open(BytesIO(decoded))
                 # 转换为RGB模式以提高兼容性
                 if img.mode != 'RGB':
                     img = img.convert('RGB')
-                
+
                 # 尝试识别中文和英文
                 # 检查中文语言包是否存在
                 tessdata_dir = os.path.dirname(pytesseract.pytesseract.tesseract_cmd)
                 chi_sim_path = os.path.join(tessdata_dir, 'tessdata', 'chi_sim.traineddata')
-                
+
                 if os.path.exists(chi_sim_path):
                     text = pytesseract.image_to_string(img, lang='chi_sim+eng')
                 else:
                     # 中文语言包缺失，仅识别英文
                     text = pytesseract.image_to_string(img)
-                
-                if text.strip():
-                    return {
-                        "success": True,
-                        "content": text,
-                        "summary": f"图片识别成功，提取文本 {len(text)} 字符",
-                        "detection_required": True
-                    }
-                else:
-                    return {
-                        "success": True,
-                        "content": "图片中未识别到文字内容",
-                        "summary": "图片识别完成，无文本内容",
-                        "detection_required": False
-                    }
             except ImportError:
-                return {
-                    "success": True,
-                    "content": f"图片数据已接收，文件名: {file_type}\n大小: {file_size_mb:.2f} MB\n\n(OCR模块未安装，请安装 pytesseract 和 Pillow)",
-                    "summary": "图片已上传，等待OCR识别",
-                    "detection_required": False
-                }
+                detail = "OCR本地模块(pytesseract/Pillow)未安装"
             except pytesseract.pytesseract.TesseractNotFoundError:
+                detail = "Tesseract OCR引擎未安装"
+            except Exception as e:  # noqa: BLE001
+                detail = f"本地OCR识别失败: {e}"
+
+            # 2) 本地未识别到文字/引擎缺失 → 回退 LLM 视觉识别
+            if not (text and text.strip()):
+                try:
+                    llm_text = self._vision_ocr(decoded, file_type)
+                    if llm_text and llm_text.strip():
+                        text = llm_text
+                        detail = ""
+                    elif llm_text is not None:
+                        # LLM 成功返回但无文字
+                        text = llm_text
+                        detail = ""
+                except Exception as e:  # noqa: BLE001
+                    detail = (detail + f"；视觉识别失败: {e}").strip("；")
+
+            if text and text.strip():
                 return {
                     "success": True,
-                    "content": f"图片数据已接收，文件名: {file_type}\n大小: {file_size_mb:.2f} MB\n\n(Tesseract OCR引擎未安装或未配置路径，请下载安装Tesseract-OCR并配置环境变量)",
-                    "summary": "图片已上传，Tesseract引擎未安装",
+                    "content": text,
+                    "summary": f"图片识别成功，提取文本 {len(text)} 字符",
+                    "detection_required": True
+                }
+            else:
+                return {
+                    "success": True,
+                    "content": f"图片数据已接收，文件名: {file_type}\n大小: {file_size_mb:.2f} MB\n\n(未识别到文字内容" + (f"；{detail}" if detail else "") + ")",
+                    "summary": "图片识别完成，无文本内容",
                     "detection_required": False
                 }
         except Exception as e:
@@ -180,6 +192,68 @@ class FileProcessor:
                 "content": f"图片处理失败: {str(e)}",
                 "summary": "图片处理失败"
             }
+
+    def _vision_ocr(self, file_bytes: bytes, file_type: str) -> str:
+        """通过 LLM 视觉能力识别图片文字（Tesseract 缺失/失败时的回退路径）。
+
+        走 llm_runtime 的开放配置（provider/api_key/base_url/model），
+        以 OpenAI 兼容多模态格式把 base64 图片交给大模型提取文字。
+        返回识别出的文字；模型不可用/失败时返回空字符串（由调用方兜底）。
+        """
+        try:
+            import json
+            import urllib.error
+            import urllib.request
+
+            from llm_runtime import load_config, completions_url
+        except Exception:  # noqa: BLE001
+            return ""
+
+        cfg = load_config()
+        if not cfg.get("api_key"):
+            return ""
+
+        # 构造 data URI（mime 从文件类型推断）
+        mime = file_type if "/" in file_type else "image/png"
+        b64 = base64.b64encode(file_bytes).decode("ascii")
+        image_url = f"data:{mime};base64,{b64}"
+
+        # 候选模型：先试当前配置模型，若其不支持视觉(400/报错)则回退到已知视觉模型
+        configured = cfg.get("model") or "glm-4-flash"
+        candidate_models = list(dict.fromkeys([configured, "glm-4v-flash"]))
+        prompt = "请识别并提取图片中的全部文字，只返回识别到的文字本身，不要加任何解释；若无文字请直接返回：无文字。"
+
+        for model in candidate_models:
+            payload = json.dumps({
+                "model": model,
+                "messages": [{
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {"type": "image_url", "image_url": {"url": image_url}},
+                    ],
+                }],
+                "max_tokens": 1024,
+                "stream": False,
+            }).encode("utf-8")
+
+            req = urllib.request.Request(
+                completions_url(cfg["base_url"]),
+                data=payload,
+                method="POST",
+                headers={"Content-Type": "application/json",
+                         "Authorization": f"Bearer {cfg['api_key']}"},
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=90) as resp:
+                    body = json.loads(resp.read().decode("utf-8", "replace"))
+            except Exception:  # noqa: BLE001 - 换下一个候选模型
+                continue
+            try:
+                return body["choices"][0]["message"]["content"] or ""
+            except Exception:  # noqa: BLE001
+                return ""
+        return ""
     
     def _process_text(self, file_data: str) -> Dict[str, Any]:
         try:
@@ -506,6 +580,12 @@ class GovAgent:
 4. 如果用户问"你是谁"或"你叫什么"，简短介绍自己是政企安全智能体
 5. 回答必须符合政务安全规范，不泄露敏感信息
 6. 回答要具体、有针对性，不要空泛
+7. 使用 Markdown 排版输出（用户界面支持 Markdown 渲染），使回答结构清晰易读：
+   - 关键结论或重要事项用 **加粗** 突出
+   - 分点说明用 - 无序列表或 1. 有序列表
+   - 内容较多时可用 ## 小节标题分层；涉及多字段对照用表格
+   - 命令、代码、接口、字段名用反引号 `代码` 包裹，多行代码用 ``` 代码块
+   - 不要过度使用标题与列表，保持政务表达的正式、简洁
 
 对话历史：
 {conversation_history}
@@ -514,6 +594,8 @@ class GovAgent:
                 ])
                 
                 self.parser = JsonOutputParser()
+            # 流式回答专用通道：run_stream 启动前注入 queue.Queue，response_generation 用它推送 token 增量
+            self._stream_sink: Optional["queue.Queue"] = None
             if self.llm_available:
                 print("[INFO] LLM 对话主链已启用（可在 系统状态-模型接入 中热更新）")
             else:
@@ -654,7 +736,7 @@ class GovAgent:
 
         # 2. 最大迭代次数检查
         iteration = state.get("react_iteration", 0)
-        max_iter = state.get("react_max_iterations", 5)
+        max_iter = state.get("react_max_iterations", 3)
         if iteration >= max_iter:
             return "end"
 
@@ -704,13 +786,23 @@ class GovAgent:
         if self.llm_available:
             try:
                 chain = self.prompt_template | self.llm | self.parser
+                # max_tokens 上限：决策只需结构化 JSON（tool_calls+reasoning，通常 <300 token），
+                # 防止模型"话痨"式长输出拉长思考期（保持质量前提下缩短时延）
                 result = chain.invoke({
                     "user_input": user_input,
                     "conversation_history": history_str,
                     "tool_results": tool_results_str,
-                })
+                }, max_tokens=512)
 
                 tool_calls = result.get("tool_calls", [])
+
+                # 上传内容已内联在 user_input 中：对 uploaded_doc 来源过滤文件读取/检索类工具，
+                # 防止模型误调 read_file/search_knowledge 而报"文件不存在"。
+                if state.get("input_source") == "uploaded_doc":
+                    tool_calls = [
+                        c for c in tool_calls
+                        if c.get("name") not in ("read_file", "search_knowledge", "draft_document", "generate_report")
+                    ]
                 reasoning = result.get("reasoning", "")
 
                 # T4: 运行时监控——记录Think阶段
@@ -937,7 +1029,13 @@ class GovAgent:
         # 去重护栏：同一请求内"同名同参数"的工具不再重复执行。
         # 判定口径为"此前是否已尝试过"（成功或失败都算）——失败重试同样无意义，
         # 且会形成重试风暴（如沙箱环境异常时 LLM 反复下发同一调用）把请求拖到迭代上限超时。
+        # 一次性生成类工具（拟稿/报表）：同名即视为重复（即使参数微调也禁止重入），
+        # 防止 LLM 每轮追加 outline 等参数重跑完整长文生成，把单请求拖到分钟级。
+        _ONE_SHOT_TOOLS = {"draft_document", "generate_report"}
+
         def _tool_sig(name: str, args: dict) -> str:
+            if name in _ONE_SHOT_TOOLS:
+                return name
             return f"{name}|{json.dumps(args or {}, sort_keys=True, ensure_ascii=False)}"
 
         _attempted_sigs = {
@@ -1094,16 +1192,51 @@ class GovAgent:
         if self.llm_available:
             try:
                 tool_results_str = "\n".join([f"{r['tool_name']}: {r['result']}" for r in tool_results])
-                chain = self.response_template | self.llm
-                llm_response = chain.invoke({
-                    "user_input": user_input,
-                    "tool_results": tool_results_str,
-                    "conversation_history": history_str
-                })
-                final_response = llm_response.content
+                sink = getattr(self, "_stream_sink", None)
+                if sink is not None:
+                    # 流式回答：逐 token 推送增量到 SSE 通道
+                    # max_tokens 上限：限制最坏生成时长（约 3000+ 中文字符，正常问答足够）
+                    prompt_messages = self.response_template.format_messages(
+                        user_input=user_input,
+                        tool_results=tool_results_str,
+                        conversation_history=history_str,
+                    )
+                    parts: List[str] = []
+                    for tok in self.llm.stream(prompt_messages, max_tokens=2048):
+                        t = getattr(tok, "content", None)
+                        if t == "" or t is None:
+                            continue
+                        parts.append(str(t))
+                        sink.put(("content", {"delta": str(t)}))
+                    final_response = "".join(parts)
+                    if not final_response:
+                        chain = self.response_template | self.llm
+                        llm_response = chain.invoke({
+                            "user_input": user_input,
+                            "tool_results": tool_results_str,
+                            "conversation_history": history_str
+                        }, max_tokens=2048)
+                        final_response = llm_response.content
+                else:
+                    chain = self.response_template | self.llm
+                    llm_response = chain.invoke({
+                        "user_input": user_input,
+                        "tool_results": tool_results_str,
+                        "conversation_history": history_str
+                    }, max_tokens=2048)
+                    final_response = llm_response.content
                 
-                # AIGC 标识应用（显式 + 隐式）
-                labeled = apply_aigc_label(final_response, aigc_metadata)
+                # AIGC 标识应用：使用策略管理器中的配置
+                from security.policy_manager import get_policy_manager
+                from security.aigc_labeling import apply_aigc_label
+                policy = get_policy_manager()
+                
+                labeled = apply_aigc_label(
+                    final_response, 
+                    aigc_metadata,
+                    include_implicit=policy.aigc_implicit_marker_enabled,
+                    include_explicit=policy.aigc_explicit_label_enabled
+                )
                 
                 self.security_layer.audit_logger.create_log(
                     user_id=state.get("user_id") or "user",
@@ -1130,8 +1263,17 @@ class GovAgent:
         
         final_response = self._fallback_response(user_input, tool_results)
         
-        # AIGC 标识应用（显式 + 隐式）
-        labeled = apply_aigc_label(final_response, aigc_metadata)
+        # AIGC 标识应用：使用策略管理器中的配置
+        from security.policy_manager import get_policy_manager
+        from security.aigc_labeling import apply_aigc_label
+        policy = get_policy_manager()
+        
+        labeled = apply_aigc_label(
+            final_response, 
+            aigc_metadata,
+            include_implicit=policy.aigc_implicit_marker_enabled,
+            include_explicit=policy.aigc_explicit_label_enabled
+        )
         
         self.security_layer.audit_logger.create_log(
             user_id=state.get("user_id") or "user",
@@ -1377,12 +1519,11 @@ class GovAgent:
             "current_step": "blocked",
         }
     
-    def run_with_history(self, session_id: str, user_input: str, input_source: str = "user_input",
-                         user: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        conversation_history = self.conversation_manager.get_history(session_id)
+    def _prepare_initial_state(self, session_id: str, user_input: str, input_source: str,
+                               user: Optional[Dict[str, Any]], conversation_history: List[Dict[str, Any]]) -> AgentState:
+        """组装 LangGraph 初始状态，供同步 invoke 与流式 stream 复用，保证节点副作用一致。"""
         identity = user or {}
-
-        initial_state: AgentState = {
+        return {
             "user_input": user_input,
             "input_source": input_source,
             "session_id": session_id,
@@ -1412,18 +1553,145 @@ class GovAgent:
             "anomaly_alerts": [],
             # T4: ReAct 循环控制
             "react_iteration": 0,
-            "react_max_iterations": 5,
+            # ReAct 最大迭代 3（首轮通常即出结果；限制最坏情况额外 LLM 往返，避免长尾时延）
+            "react_max_iterations": 3,
             "should_continue_react": False,
             # T5 合规：AIGC 内容标识元数据
             "aigc_metadata": None,
         }
-        
+
+    # ---------- "思考中"功能：将真实图节点产出整理为对用户可读的推理步骤 ----------
+    _THINKING_NODE_MAP = {
+        # node -> (phase, title, 详情字段提取函数索引)
+        "input_detection": ("analysis", "分析问题与安全检测", "detection"),
+        "risk_assessment": ("analysis", "评估风险等级", "risk"),
+        "decision_making": ("decision", "判断回答方式", "decision"),
+        "tool_selection": ("plan", "规划工具调用", "tool"),
+        "plan_ir_build": ("plan", "构建执行计划", "plan"),
+        "sequence_risk_eval": ("logic", "校验执行序列风险", "sequence"),
+        "tool_evaluation": ("logic", "执行工具安全校验", "toolval"),
+        "approval_check": ("logic", "检查权限审批", "approval"),
+        "tool_execution": ("retrieval", "检索信息与执行工具", "exec"),
+        "response_generation": ("answer", "组织最终答案", "gen"),
+        "output_filter": ("answer", "校验并输出结果", "filter"),
+    }
+
+    def _build_thinking_step(self, node_name: str, node_update: Dict[str, Any], step_id: int) -> Optional[Dict[str, Any]]:
+        """根据单个节点产出生成一条用户友好的推理步骤（不做模拟，仅真实节点数据）。"""
+        mapping = self._THINKING_NODE_MAP.get(node_name)
+        if not mapping:
+            return None
+        phase, title, kind = mapping
+        detail = self._format_node_detail(kind, node_update, node_name)
+        if detail is None:
+            return None
+        return {
+            "step_id": step_id,
+            "phase": phase,
+            "phase_label": {"analysis": "问题分析", "decision": "意图决策", "plan": "规划",
+                            "logic": "推理", "retrieval": "信息检索", "answer": "答案构建"}.get(phase, phase),
+            "title": title,
+            "detail": detail,
+            "node": node_name,
+        }
+
+    @staticmethod
+    def _safe_text(v: Any, limit: int = 120) -> str:
+        s = "".join(str(v)).replace("\n", " ").replace("\r", " ") if v is not None else ""
+        return s[:limit] + ("…" if len(s) > limit else "")
+
+    def _format_node_detail(self, kind: str, update: Dict[str, Any], node: str) -> Optional[str]:
+        try:
+            if kind == "detection":
+                rl = getattr(update.get("risk_level"), "value", str(update.get("risk_level") or "none"))
+                return f"已对输入完成多层安全检测，当前风险等级：{rl}。确认内容安全后继续处理。"
+            if kind == "risk":
+                rs = update.get("risk_summary")
+                if rs:
+                    s = self._safe_text(rs.get("summary") or json.dumps(rs, ensure_ascii=False), 120)
+                    return s
+                return None
+            if kind == "decision":
+                tool_calls = update.get("tool_calls") or []
+                if tool_calls:
+                    names = ", ".join(self._safe_text(t.get("name") or t.get("tool_name") or "工具", 30)
+                                      for t in tool_calls[:3])
+                    return f"判断需要调用工具来获取更准确的信息，计划使用：{names}。"
+                return "判断可直接基于已有知识作答，无需调用外部工具。"
+            if kind == "tool":
+                calls = update.get("tool_calls") or []
+                if calls:
+                    names = ", ".join(self._safe_text(t.get("name") or t.get("tool_name") or "工具", 30)
+                                      for t in calls[:3])
+                    return f"规划本次回答需要使用的工具：{names}。"
+                return None
+            if kind == "plan":
+                pir = update.get("plan_ir")
+                if pir is not None:
+                    s = self._safe_text(str(pir), 150)
+                    return f"已制定执行计划：{s}"
+                return None
+            if kind == "sequence":
+                seq = update.get("sequence_risk_assessment")
+                if seq:
+                    level = seq.get("overall_risk") or seq.get("risk_level") or "低"
+                    return f"对计划的执行序列做了风险校验，整体序列风险：{self._safe_text(level, 30)}。"
+                return None
+            if kind == "toolval":
+                results = update.get("tool_risk_results")
+                if results is not None:
+                    danger = sum(1 for r in results if getattr(getattr(r, "risk_level", None), "value", "") in ("HIGH", "CRITICAL"))
+                    return f"对计划调用的工具逐一做过安全检查，共 {len(results)} 项{('，其中 ' + str(danger) + ' 项命中高危') if danger else ''}。"
+                return None
+            if kind == "approval":
+                pend = update.get("pending_human_approval") or []
+                if pend:
+                    return f"相关操作需要人工审批后方可执行，共 {len(pend)} 项待审批。"
+                can = update.get("can_proceed")
+                if can is not None:
+                    return "权限校验通过，可安全执行。"
+                return None
+            if kind == "exec":
+                results = update.get("tool_execution_results") or []
+                if results:
+                    parts = []
+                    for r in results[:2]:
+                        status = "成功" if r.get("status") in ("success", "ok") else "完成"
+                        out = self._safe_text(r.get("output") or r.get("summary") or "", 90)
+                        parts.append(f"「{self._safe_text(r.get('tool_name') or '工具', 20)}」{status}" + (f"：{out}" if out else ""))
+                    joined = "；".join(parts)
+                    if len(results) > 2:
+                        joined += f"（另有 {len(results) - 2} 项）"
+                    return f"已检索/执行工具获取关键信息：{joined}"
+                return None
+            if kind == "gen":
+                # response_generation 本身产出最终答案，思考区仅提示，不重复展示大段答案
+                return "信息已齐备，开始组织并生成最终答案。"
+            if kind == "filter":
+                fpr = update.get("output_filter_result")
+                if fpr:
+                    cnt = fpr.get("filtered_count") or 0
+                    by = fpr.get("by_type") or {}
+                    kinds = "、".join(k for k, c in by.items() if c) if isinstance(by, dict) else ""
+                    suffix = f"，已脱敏 {cnt} 处（{kinds}）" if cnt else ""
+                    return f"对生成结果做了输出安全校验{suffix}，确认无敏感信息泄露。"
+                return None
+        except Exception:
+            # 个别节点无法格式化时不阻塞流式展示
+            return None
+        return None
+
+    def run_with_history(self, session_id: str, user_input: str, input_source: str = "user_input",
+                         user: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        conversation_history = self.conversation_manager.get_history(session_id)
+        initial_state = self._prepare_initial_state(session_id, user_input, input_source, user, conversation_history)
+
         result = self.graph.invoke(initial_state)
-        
+
         final_response = result.get("final_response", "")
         self.conversation_manager.add_message(session_id, "user", user_input)
         self.conversation_manager.add_message(session_id, "assistant", final_response)
-        
+
         return {
             "final_response": final_response,
             "risk_level": result.get("risk_level", RiskLevel.NONE).value,
@@ -1447,6 +1715,102 @@ class GovAgent:
             "aigc_metadata": result.get("aigc_metadata", None),
         }
     
+    def run_stream(self, session_id: str, user_input: str, input_source: str = "user_input",
+                   user: Optional[Dict[str, Any]] = None):
+        """同步干跑 LangGraph 的全部节点，并以生成器实时产出"思考"步骤、AI 回答 token 增量与最终结果。
+
+        产出事件：
+          ("thinking", step)    逐条实时推送的思考步骤
+          ("content", {"delta": ...})   AI 回答逐 token 增量（LLM 支持流式时）
+          ("done", result)      收尾（含完整 final_response）
+          ("error", {"message": ...})  失败兜底
+        不改变任何节点的真实执行/审计/审批副作用。
+        """
+        conversation_history = self.conversation_manager.get_history(session_id)
+
+        def _to_jsonable(v: Any):
+            if hasattr(v, "dict"):
+                return v.dict()
+            if hasattr(v, "model_dump"):
+                return v.model_dump(mode="json")
+            if hasattr(v, "value"):  # RiskLevel 枚举
+                return v.value
+            return v
+
+        initial_state = self._prepare_initial_state(session_id, user_input, input_source, user, conversation_history)
+        running_state: Dict[str, Any] = dict(initial_state)
+
+        # 通过后台线程运行图：response_generation 的 token 增量与各节点思考步骤统一进入 sink 队列，
+        # 主生成器按序取出实时 yield，从而真实"边生成边推送" AI 回答内容。
+        sink: "queue.Queue" = queue.Queue()
+        self._stream_sink = sink
+
+        def _run_graph() -> None:
+            thinking_steps_t: List[Dict[str, Any]] = []
+            try:
+                for chunk in self.graph.stream(initial_state, stream_mode="updates"):
+                    if not isinstance(chunk, dict):
+                        continue
+                    for node_name, node_update in chunk.items():
+                        if isinstance(node_update, dict):
+                            running_state.update(node_update)
+                        step = self._build_thinking_step(node_name, node_update, len(thinking_steps_t) + 1)
+                        if step:
+                            thinking_steps_t.append(step)
+                            sink.put(("thinking", step))
+                sink.put(("_complete", running_state, thinking_steps_t))
+            except Exception as e:  # noqa: BLE001
+                try:
+                    sink.put(("error", {"message": str(e)}))
+                except Exception:  # noqa: BLE001
+                    pass
+
+        thread = threading.Thread(target=_run_graph, daemon=True)
+        thinking_steps: List[Dict[str, Any]] = []
+        thread.start()
+        try:
+            while True:
+                item = sink.get()
+                kind = item[0]
+                if kind == "thinking":
+                    thinking_steps.append(item[1])
+                    yield ("thinking", item[1])
+                elif kind == "content":
+                    yield ("content", item[1])
+                elif kind == "error":
+                    yield ("error", item[1])
+                    return
+                elif kind == "_complete":
+                    running_state = item[1]
+                    break
+        finally:
+            self._stream_sink = None
+            thread.join(timeout=1.0)
+
+        final_response = running_state.get("final_response") or ""
+        rl = running_state.get("risk_level")
+        meta = json.dumps({"thinking_steps": thinking_steps}, ensure_ascii=False) if thinking_steps else None
+        # 与同步路径一致：落库 user 消息与 assistant 消息（assistant 附带思考过程元数据）
+        self.conversation_manager.add_message(session_id, "user", user_input)
+        self.conversation_manager.add_message(session_id, "assistant", final_response, metadata=meta)
+
+        yield ("done", {
+            "final_response": final_response,
+            "risk_level": _to_jsonable(rl),
+            "can_proceed": running_state.get("can_proceed", False),
+            "current_step": running_state.get("current_step"),
+            "pending_human_approval": running_state.get("pending_human_approval", []),
+            "detection_results": [_to_jsonable(r) for r in running_state.get("detection_results", [])],
+            "tool_risk_results": [_to_jsonable(r) for r in running_state.get("tool_risk_results", [])],
+            "tool_execution_results": running_state.get("tool_execution_results", []),
+            "llm_response": running_state.get("llm_response"),
+            "session_id": session_id,
+            "runtime_trace": running_state.get("runtime_trace", []),
+            "anomaly_alerts": running_state.get("anomaly_alerts", []),
+            "guard_results": [_to_jsonable(r) for r in running_state.get("guard_results", [])],
+            "thinking_steps": thinking_steps,
+        })
+
     def run(self, user_input: str, input_source: str = "user_input", session_id: Optional[str] = None,
             user: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         # 会话归属当前登录用户：新会话/首次落库时绑定 user_id，实现账户会话隔离
@@ -1460,6 +1824,7 @@ class GovAgent:
         return self.run_with_history(session_id, user_input, input_source, user=user)
 
     def process_file_message(self, session_id: str, file_data: str, file_type: str, filename: str,
+                             user_text: str = None,
                              user: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         processed = self.file_processor.process_file(file_data, file_type, filename)
         
@@ -1483,11 +1848,67 @@ class GovAgent:
                     "conversation_history": self.conversation_manager.get_history(session_id),
                 }
         
-        user_input = f"请分析以下文件内容：\n文件名: {filename}\n类型: {file_type}\n内容:\n{processed['content'][:2000]}"
-        
-        self.conversation_manager.add_message(session_id, "user", f"[文件上传] {filename}")
+        # 上传内容已在此处完整提供（图片已自动 OCR 识别为文字），
+        # 文件读取/检索类工具由 decision_making 中的 uploaded_doc 硬防护统一过滤。
+        content_body = processed.get("content") or processed.get("text") or ""
+        user_input = f"以下文字是用户上传内容识别出的结果，请直接基于这段文字分析并回答：\n{content_body[:2000]}"
+        # 用户上传时一并输入的附言/提问：合并进输入，让模型结合图片/文件内容回答
+        if user_text:
+            user_input += f"\n\n用户针对该上传内容的补充提问/要求：\n{user_text}"
+
+        history_user = f"[文件上传] {filename}"
+        if user_text:
+            history_user += f"\n用户附言：{user_text}"
+        self.conversation_manager.add_message(session_id, "user", history_user)
         
         return self.run_with_history(session_id, user_input, "uploaded_doc", user=user)
+
+    def process_file_message_stream(self, session_id: str, file_data: str, file_type: str, filename: str,
+                                    user_text: str = None,
+                                    user: Optional[Dict[str, Any]] = None):
+        """附件问答流式版：识别阶段先推送思考步骤，之后复用 run_stream 全量流式（思考步骤 + AI token 增量 + done）。
+
+        与 process_file_message 保持相同的真实执行副作用（识别、检测、落库）。
+        """
+        step_no = 0
+        step_no += 1
+        yield ("thinking", {"step": step_no, "phase": "uploaded_doc", "phase_label": "上传内容识别",
+                            "title": "正在识别上传文件内容", "detail": f"文件：{filename}", "node": "file_processing"})
+
+        processed = self.file_processor.process_file(file_data, file_type, filename)
+
+        if processed["detection_required"] and processed["content"]:
+            detection_result = self.security_layer.input_detector.detect_single_input(
+                processed["content"],
+                source="uploaded_doc",
+                session_id=session_id,
+            )
+            if detection_result.risk_level in [RiskLevel.HIGH, RiskLevel.CRITICAL]:
+                self.conversation_manager.add_message(session_id, "user", f"[文件上传] {filename}")
+                self.conversation_manager.add_message(session_id, "assistant",
+                    f"文件 {filename} 包含安全风险内容，已被拦截！\n风险等级: {detection_result.risk_level.value}")
+                yield ("done", {
+                    "final_response": f"文件 {filename} 包含安全风险内容，已被拦截！\n风险等级: {detection_result.risk_level.value}",
+                    "risk_level": detection_result.risk_level.value,
+                    "session_id": session_id,
+                    "thinking_steps": [],
+                })
+                return
+
+        content_body = processed.get("content") or processed.get("text") or ""
+        user_input = f"以下文字是用户上传内容识别出的结果，请直接基于这段文字分析并回答：\n{content_body[:2000]}"
+        # 用户上传时一并输入的附言/提问：合并进输入，让模型结合图片/文件内容回答
+        if user_text:
+            user_input += f"\n\n用户针对该上传内容的补充提问/要求：\n{user_text}"
+
+        history_user = f"[文件上传] {filename}"
+        if user_text:
+            history_user += f"\n用户附言：{user_text}"
+        self.conversation_manager.add_message(session_id, "user", history_user)
+
+        # 复用全量流式：graph 各节点思考步骤 + AI 回答逐 token 增量 + done 收尾
+        for event_type, payload in self.run_stream(session_id, user_input, "uploaded_doc", user=user):
+            yield (event_type, payload)
     
     def get_conversation_history(self, session_id: str) -> Dict[str, Any]:
         history = self.conversation_manager.get_history(session_id)

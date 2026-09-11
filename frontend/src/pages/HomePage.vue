@@ -5,6 +5,7 @@ import {
   ShieldX, Clock, AlertTriangle, ShieldCheck,
   MessageSquare, Shield, Settings, FileText, ClipboardCheck,
   Sun, Moon, LayoutDashboard, Swords, SlidersHorizontal, Activity, Server, LogIn, LogOut,
+  Landmark,
 } from 'lucide-vue-next'
 import ChatPanel from '@/components/chat/ChatPanel.vue'
 import DashboardPanel from '@/components/dashboard/DashboardPanel.vue'
@@ -16,9 +17,12 @@ import ApprovalPanel from '@/components/approval/ApprovalPanel.vue'
 import AuditPanel from '@/components/audit/AuditPanel.vue'
 import ToolPanel from '@/components/tools/ToolPanel.vue'
 import SystemStatusPanel from '@/components/system/SystemStatusPanel.vue'
+import GovernancePanel from '@/components/governance/GovernancePanel.vue'
+import OpsMetricsPanel from '@/components/ops/OpsMetricsPanel.vue'
 import NotificationBell from '@/components/notify/NotificationBell.vue'
 import GuideBanner from '@/components/onboarding/GuideBanner.vue'
 import AccountSecurityModal from '@/components/account/AccountSecurityModal.vue'
+import UserProfileModal from '@/components/account/UserProfileModal.vue'
 import { useAuth } from '@/composables/useAuth'
 import { usePermissions } from '@/composables/usePermissions'
 import { useRouter } from 'vue-router'
@@ -40,6 +44,8 @@ const tabIconMap: Record<string, any> = {
   policy: SlidersHorizontal,
   system: Server,
   audit: FileText,
+  governance: Landmark,
+  ops: BarChart3,
 }
 const kpiIconMap: Record<string, any> = {
   block: ShieldX,
@@ -67,6 +73,8 @@ const tabs = [
   { name: 'audit', label: '审计追溯', sub: '过程可审计·责任可追溯', icon: 'audit', group: '合规审计' },
   { name: 'policy', label: '策略配置', sub: '阈值/开关 · 热生效', icon: 'policy', group: '系统配置' },
   { name: 'system', label: '系统状态', sub: '自检 · 数据维护', icon: 'system', group: '系统配置' },
+  { name: 'ops', label: '运维监控', sub: '性能 · 可用性', icon: 'ops', group: '系统配置' },
+  { name: 'governance', label: '治理中心', sub: '应急 · 生态 · 合规', icon: 'governance', group: '合规治理' },
 ]
 
 const currentTab = computed(() => tabs.find(t => t.name === activeTab.value))
@@ -107,6 +115,12 @@ watch(currentUser, async () => {
 })
 const userLogout = () => { logout() }
 const showAccountSecurity = ref(false)
+/** 个人中心弹窗：点击顶栏用户身份胶囊打开 */
+const showUserProfile = ref(false)
+const openSecurityFromProfile = () => {
+  showUserProfile.value = false
+  showAccountSecurity.value = true
+}
 const roleLabel = (r?: string) =>
   ({ admin: '管理员', operator: '安全运维', auditor: '合规审计', manager: '部门负责人', user: '业务用户' } as Record<string, string>)[r || ''] || ''
 
@@ -136,6 +150,8 @@ const panelMap: Record<string, any> = {
   policy: PolicyPanel,
   system: SystemStatusPanel,
   audit: AuditPanel,
+  governance: GovernancePanel,
+  ops: OpsMetricsPanel,
 }
 
 // 入场动画交替类名：类名变化才会重新触发 animation（见 style.css animate-card-in-b）
@@ -290,16 +306,17 @@ onUnmounted(() => {
 
         <!-- 用户身份 / 登录 -->
         <template v-if="currentUser">
-          <div
-            class="flex items-center gap-1.5 px-1.5 sm:px-2 py-1 rounded-full bg-elevated/60 border border-border-default"
-            :title="`${currentUser.display_name}（${roleLabel(currentUser.role)}）`"
+          <button
+            @click="showUserProfile = true"
+            class="flex items-center gap-1.5 px-1.5 sm:px-2 py-1 rounded-full bg-elevated/60 border border-border-default hover:border-accent/40 hover:bg-elevated transition-colors cursor-pointer"
+            :title="`${currentUser.display_name}（${roleLabel(currentUser.role)}）· 点击查看个人信息`"
           >
             <span class="w-6 h-6 rounded-full bg-gradient-to-br from-accent to-low flex items-center justify-center text-white text-xs font-bold flex-shrink-0">
               {{ currentUser.display_name.slice(0, 1) }}
             </span>
             <span class="hidden lg:inline text-xs font-medium text-primary max-w-[96px] truncate">{{ currentUser.display_name }}</span>
             <span class="hidden xl:inline text-[10px] px-1.5 py-0.5 rounded-full bg-accent/10 text-accent font-medium">{{ roleLabel(currentUser.role) }}</span>
-          </div>
+          </button>
           <button
             @click="showAccountSecurity = true"
             class="p-1.5 rounded-lg hover:bg-hover transition-colors text-muted hover:text-accent flex-shrink-0 active:scale-95"
@@ -384,6 +401,11 @@ onUnmounted(() => {
 
     <!-- 账号安全（MFA / 改密） -->
     <AccountSecurityModal v-if="showAccountSecurity" @close="showAccountSecurity = false" />
+    <UserProfileModal
+      v-if="showUserProfile"
+      @close="showUserProfile = false"
+      @open-security="openSecurityFromProfile"
+    />
 
     <!-- ========== 移动端侧边栏遮罩 ========== -->
     <div

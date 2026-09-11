@@ -17,6 +17,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import re
 import json
 import asyncio
+import time
 import logging
 from typing import Tuple, List, Optional
 
@@ -155,6 +156,12 @@ class LLMClassifier:
         self.completions_url = completions_url(cfg["base_url"])
         self.enabled = bool(self.api_key)
         self.timeout = 15                    # 15 秒超时（覆盖 GLM-4-flash 偶发慢响应，避免误回退）
+        # 备用模型（多供应商容灾）：主模型故障/超时自动切换重试一次
+        self.backup_api_key = cfg.get("backup_api_key") or ""
+        self.backup_base_url = cfg.get("backup_base_url") or ""
+        self.backup_model = cfg.get("backup_model") or ""
+        self.backup_provider = cfg.get("backup_provider") or "openai"
+        self.backup_completions_url = completions_url(self.backup_base_url) if self.backup_base_url else ""
 
         # LLM 结果缓存：同文本不重复调 API（temperature=0.1 判定基本稳定）
         # 生产场景常见重复输入（常见问题/模板化请求），命中时延迟从 ~2s 降到 ~0ms
@@ -185,6 +192,16 @@ class LLMClassifier:
             self.completions_url = completions_url(cfg["base_url"])
         if cfg.get("model"):
             self.model = cfg["model"]
+        # 备用模型运行时热更新
+        if "backup_api_key" in cfg:
+            self.backup_api_key = cfg.get("backup_api_key") or ""
+        if cfg.get("backup_base_url"):
+            self.backup_base_url = cfg["backup_base_url"]
+            self.backup_completions_url = completions_url(self.backup_base_url)
+        if cfg.get("backup_model"):
+            self.backup_model = cfg["backup_model"]
+        if cfg.get("backup_provider"):
+            self.backup_provider = cfg["backup_provider"]
         # 接入参数变化后按「是否有 Key」刷新运行态开关（策略页总开关可在其上覆盖）
         self.enabled = bool(self.api_key)
         if self.enabled != prev_enabled:
@@ -297,6 +314,9 @@ class LLMClassifier:
     async def _call_llm(self, text: str) -> Optional[dict]:
         """调用配置的 LLM 服务（默认智谱 GLM，可覆盖为内网 OpenAI 兼容端点）进行安全分类。
 
+        主模型失败/超时 → 配置了备用模型时自动切换重试一次（多供应商容灾）；
+        备用也失败 → 返回 None（上层回退本地启发式）。
+
         Returns:
             LLM 返回的 JSON dict；失败返回 None
         """
@@ -315,29 +335,14 @@ class LLMClassifier:
             "max_tokens": 200,
         }
 
+        start = time.monotonic()
         try:
-            async with httpx.AsyncClient(timeout=self.timeout) as client:
-                resp = await client.post(url, headers=headers, json=payload)
-                resp.raise_for_status()
-                data = resp.json()
-
-                content = (
-                    data.get("choices", [{}])[0]
-                    .get("message", {})
-                    .get("content", "")
-                    .strip()
-                )
-
-                if not content:
-                    logger.warning("LLM 返回空内容")
-                    return None
-
-                # 提取 JSON（兼容 markdown 代码块包裹）
-                return self._extract_json(content)
-
+            result = await self._post_chat(url, headers, payload)
+            self._record_llm(True, False, False, time.monotonic() - start)
+            return result
         except httpx.TimeoutException:
             logger.warning("LLM API 调用超时 (%.1fs)", self.timeout)
-            return None
+            self._record_llm(False, True, False, time.monotonic() - start)
         except httpx.HTTPStatusError as e:
             body = ""
             try:
@@ -345,7 +350,7 @@ class LLMClassifier:
             except Exception:
                 pass
             # 智谱内容安全审查（1301）：请求文本被 API 判定为不安全。
-            # 返回标记供 classify 转为 HIGH 检测信号（而非静默降级漏报）
+            # 返回标记供 classify 转为 HIGH 检测信号（而非静默降级漏报）——这是检测信号，不走备用重试
             if e.response.status_code == 400 and ("1301" in body or "contentFilter" in body):
                 level = 2
                 try:
@@ -357,10 +362,67 @@ class LLMClassifier:
                 logger.info("LLM API 内容安全审查拦截（1301, level=%s），转为 HIGH 检测信号", level)
                 return {"content_filter_blocked": True, "filter_level": level}
             logger.warning("LLM API HTTP 错误 %d: %s", e.response.status_code, body[:200])
-            return None
+            self._record_llm(False, False, False, time.monotonic() - start)
         except Exception:
             logger.exception("LLM API 调用异常")
-            return None
+            self._record_llm(False, False, False, time.monotonic() - start)
+
+        # ---- 主模型失败 → 备用模型重试一次（多供应商容灾） ----
+        if self.backup_api_key and self.backup_completions_url:
+            backup_headers = {
+                "Authorization": f"Bearer {self.backup_api_key}",
+                "Content-Type": "application/json",
+            }
+            backup_payload = dict(payload)
+            if self.backup_model:
+                backup_payload["model"] = self.backup_model
+            logger.warning("切换备用模型重试（%s）", self.backup_completions_url)
+            start2 = time.monotonic()
+            try:
+                result = await self._post_chat(self.backup_completions_url, backup_headers, backup_payload)
+                self._record_llm(True, False, True, time.monotonic() - start2)
+                return result
+            except httpx.TimeoutException:
+                logger.warning("备用模型调用超时")
+                self._record_llm(False, True, True, time.monotonic() - start2)
+            except Exception:
+                logger.exception("备用模型调用也失败")
+                self._record_llm(False, False, True, time.monotonic() - start2)
+        return None
+
+    @staticmethod
+    def _record_llm(ok: bool, timeout: bool, switched: bool, seconds: float):
+        """LLM 调用指标打点（供 /api/metrics 大盘统计）"""
+        try:
+            from metrics_collector import get_metrics_collector
+            get_metrics_collector().record_llm(ok, timeout, switched, seconds * 1000)
+        except Exception:
+            pass
+
+    async def _post_chat(self, url: str, headers: dict, payload: dict) -> dict:
+        """发起一次 chat/completions 调用；网络/HTTP 错误抛出异常，由 _call_llm 处理降级/切换"""
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            resp = await client.post(url, headers=headers, json=payload)
+            resp.raise_for_status()
+            data = resp.json()
+
+            content = (
+                data.get("choices", [{}])[0]
+                .get("message", {})
+                .get("content", "")
+                .strip()
+            )
+
+            if not content:
+                logger.warning("LLM 返回空内容")
+                return {}
+
+            # 提取 JSON（兼容 markdown 代码块包裹）
+            parsed = self._extract_json(content)
+            if parsed is None:
+                logger.warning("LLM 返回内容无法解析为 JSON")
+                return {}
+            return parsed
 
     # ------------------------------------------------------------------
     # Response Parsing

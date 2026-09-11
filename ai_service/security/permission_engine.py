@@ -32,7 +32,8 @@ ROLE_LEVELS: Dict[str, int] = {
 # ------------------------------------------------------------------
 MODULES: List[str] = [
     "chat", "dashboard", "runtime", "security", "redteam",
-    "tools", "approval", "audit", "policy", "system",
+    "tools", "approval", "audit", "policy", "system", "governance",
+    "ops",
 ]
 
 # 模块 → 进入该模块所需的最小权限点
@@ -47,6 +48,8 @@ MODULE_PERMISSION: Dict[str, str] = {
     "audit": "audit.view",
     "policy": "policy.view",
     "system": "system.view",
+    "governance": "system.maintain",
+    "ops": "system.view",
 }
 
 # ------------------------------------------------------------------

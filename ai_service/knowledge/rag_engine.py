@@ -69,6 +69,55 @@ class KnowledgeBase:
             "built_at": self.meta.get("built_at", ""),
         }
 
+    @staticmethod
+    def list_documents() -> list[dict]:
+        """列出语料目录中的知识文档骨架信息（供管理界面展示）。"""
+        out = []
+        for path in sorted(glob.glob(os.path.join(_DOC_DIR, "*.md")) + glob.glob(os.path.join(_DOC_DIR, "*.txt"))):
+            try:
+                st = os.stat(path)
+            except OSError:
+                continue
+            out.append({
+                "name": os.path.basename(path),
+                "size": st.st_size,
+                "size_kb": round(st.st_size / 1024, 1),
+                "mtime": st.st_mtime,
+            })
+        return out
+
+    @staticmethod
+    def _safe_doc_name(filename: str) -> str:
+        """清洗文件名，仅允许 <名>.md / .txt，防止路径注入。"""
+        base = os.path.basename(str(filename or "").replace("\\", "/")).strip()
+        if not base:
+            raise ValueError("文件名为空")
+        if not base.lower().endswith((".md", ".txt")):
+            raise ValueError("仅支持 .md 或 .txt 格式的知识文档")
+        if any(ch in base for ch in ('/', '\\', ':', '*', '?', '"', '<', '>', '|')):
+            raise ValueError("文件名包含非法字符")
+        return base
+
+    @staticmethod
+    def add_document(filename: str, content: str) -> str:
+        """写入/覆盖一份知识文档到语料目录，返回安全化后的文件名。"""
+        name = KnowledgeBase._safe_doc_name(filename)
+        path = os.path.join(_DOC_DIR, name)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(content or "")
+        logger.info("知识文档已写入：%s", name)
+        return name
+
+    @staticmethod
+    def remove_document(filename: str) -> None:
+        """从语料目录删除一份知识文档。"""
+        name = KnowledgeBase._safe_doc_name(filename)
+        path = os.path.join(_DOC_DIR, name)
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"文档不存在：{name}")
+        os.remove(path)
+        logger.info("知识文档已删除：%s", name)
+
     def search(self, query: str, k: int = 4, min_score: float = 0.40):
         """语义检索，返回 [{text, title, source, score, doc}]"""
         if not self.ready() or not query.strip():

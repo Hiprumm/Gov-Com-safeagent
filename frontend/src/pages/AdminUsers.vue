@@ -254,27 +254,27 @@ const statCards = computed(() => [
               <thead>
                 <tr class="text-left text-xs text-muted border-b border-border-default">
                   <th class="px-4 py-2 font-medium">用户名</th>
-                  <th class="px-4 py-2 font-medium">姓名</th>
-                  <th class="px-4 py-2 font-medium">角色</th>
+                  <th class="px-4 py-2 font-medium whitespace-nowrap min-w-[96px]">姓名</th>
+                  <th class="px-4 py-2 font-medium whitespace-nowrap min-w-[108px]">角色</th>
                   <th class="px-4 py-2 font-medium">部门 / 岗位</th>
-                  <th class="px-4 py-2 font-medium">状态</th>
-                  <th class="px-4 py-2 font-medium">MFA</th>
+                  <th class="px-4 py-2 font-medium whitespace-nowrap min-w-[100px]">状态</th>
+                  <th class="px-4 py-2 font-medium whitespace-nowrap min-w-[100px]">MFA</th>
                   <th class="px-4 py-2 font-medium text-right">操作</th>
                 </tr>
               </thead>
               <tbody>
                 <tr v-for="u in users" :key="u.username" class="border-b border-border-default/60 hover:bg-hover/40">
                   <td class="px-4 py-2.5 font-medium">{{ u.username }}</td>
-                  <td class="px-4 py-2.5">{{ u.display_name }}</td>
-                  <td class="px-4 py-2.5"><span class="text-[11px] px-2 py-0.5 rounded-full font-medium" :class="roleColor(u.role)">{{ ROLE_LABEL[u.role] || u.role }}</span></td>
+                  <td class="px-4 py-2.5 whitespace-nowrap">{{ u.display_name }}</td>
+                  <td class="px-4 py-2.5"><span class="text-[11px] px-2 py-0.5 rounded-full font-medium whitespace-nowrap" :class="roleColor(u.role)">{{ ROLE_LABEL[u.role] || u.role }}</span></td>
                   <td class="px-4 py-2.5 text-secondary">{{ u.department || '—' }}<span v-if="u.position" class="text-muted"> · {{ u.position }}</span></td>
                   <td class="px-4 py-2.5">
-                    <span class="text-[11px] px-2 py-0.5 rounded-full font-medium" :class="u.status === 'active' ? 'bg-safe/15 text-safe' : 'bg-critical/15 text-critical'">
+                    <span class="text-[11px] px-2 py-0.5 rounded-full font-medium whitespace-nowrap" :class="u.status === 'active' ? 'bg-safe/15 text-safe' : 'bg-critical/15 text-critical'">
                       {{ u.status === 'active' ? '启用' : '停用' }}
                     </span>
                   </td>
                   <td class="px-4 py-2.5">
-                    <span class="text-[11px] px-2 py-0.5 rounded-full font-medium" :class="u.mfa_enabled ? 'bg-accent/15 text-accent' : 'bg-elevated text-disabled'">
+                    <span class="text-[11px] px-2 py-0.5 rounded-full font-medium whitespace-nowrap" :class="u.mfa_enabled ? 'bg-accent/15 text-accent' : 'bg-elevated text-disabled'">
                       {{ u.mfa_enabled ? '已启用' : '未启用' }}
                     </span>
                   </td>

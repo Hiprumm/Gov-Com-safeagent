@@ -30,6 +30,11 @@ def default_config() -> dict:
         "api_key": settings.ZHIPU_API_KEY or "",
         "base_url": DEFAULT_ZHIPU_BASE,
         "model": DEFAULT_MODEL,
+        # 备用模型（多供应商容灾）：主模型故障/超时自动切换
+        "backup_provider": "openai",
+        "backup_api_key": "",
+        "backup_base_url": "",
+        "backup_model": "",
     }
 
 
@@ -46,12 +51,27 @@ def load_config() -> dict:
         for k in ("provider", "base_url", "model"):
             if over.get(k):
                 cfg[k] = over[k]
+        if over.get("backup_provider"):
+            cfg["backup_provider"] = over["backup_provider"]
+        if "backup_api_key" in over:
+            cfg["backup_api_key"] = over.get("backup_api_key") or ""
+        if over.get("backup_base_url"):
+            cfg["backup_base_url"] = over["backup_base_url"]
+        if over.get("backup_model"):
+            cfg["backup_model"] = over["backup_model"]
     return cfg
 
 
 def save_config(provider: str, api_key: str, base_url: str, model: str,
-                overwrite_key: bool = True) -> dict:
-    """保存模型接入覆盖配置。api_key 为空表示清除已存 Key（回到 .env）。"""
+                overwrite_key: bool = True,
+                backup_provider: str | None = None,
+                backup_api_key: str | None = None,
+                backup_base_url: str | None = None,
+                backup_model: str | None = None) -> dict:
+    """保存模型接入覆盖配置。api_key 为空表示清除已存 Key（回到 .env）。
+
+    备用模型参数为 None 时不修改；backup_api_key 传 '' 表示清除备用 Key。
+    """
     cfg = load_config()
     if provider in ("zhipu", "openai"):
         cfg["provider"] = provider
@@ -61,12 +81,32 @@ def save_config(provider: str, api_key: str, base_url: str, model: str,
         cfg["model"] = model
     if api_key is not None:  # None 表示不修改（前端留空不清除）
         cfg["api_key"] = api_key
+
+    if backup_provider in ("zhipu", "openai"):
+        cfg["backup_provider"] = backup_provider
+    if backup_base_url is not None and backup_base_url.startswith(("http://", "https://")):
+        cfg["backup_base_url"] = backup_base_url.rstrip("/")
+    if backup_model is not None:
+        cfg["backup_model"] = backup_model
+    if backup_api_key is not None:
+        cfg["backup_api_key"] = backup_api_key
+
     get_storage().set_setting(STORE_KEY, {
         "provider": cfg["provider"],
         "api_key": cfg["api_key"],
         "base_url": cfg["base_url"],
         "model": cfg["model"],
+        "backup_provider": cfg["backup_provider"],
+        "backup_api_key": cfg["backup_api_key"],
+        "backup_base_url": cfg["backup_base_url"],
+        "backup_model": cfg["backup_model"],
     })
+    # 写后读校验：确认配置已真正持久化（而非仅停留在内存），失败即抛错由调用方反馈
+    persisted = get_storage().get_setting(STORE_KEY) or {}
+    if persisted.get("api_key", "") != (cfg["api_key"] or ""):
+        raise RuntimeError("模型配置写入失败：存储中的 api_key 与本次保存不一致")
+    if persisted.get("model", "") != (cfg["model"] or ""):
+        raise RuntimeError("模型配置写入失败：存储中的 model 与本次保存不一致")
     return cfg
 
 
@@ -82,6 +122,10 @@ def runtime_status() -> dict:
         "has_key": bool(cfg["api_key"]),
         "env_key_present": env_key,
         "stored_override": bool(get_storage().get_setting(STORE_KEY)),
+        "backup_provider": cfg.get("backup_provider", "openai"),
+        "backup_base_url": cfg.get("backup_base_url", ""),
+        "backup_model": cfg.get("backup_model", ""),
+        "backup_has_key": bool(cfg.get("backup_api_key")),
     }
 
 

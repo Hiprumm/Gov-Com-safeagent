@@ -22,6 +22,8 @@ POLICY_DEFAULTS: Dict[str, Any] = {
     "block_threshold": "high",          # medium=中风险即拦截 | high=高风险拦截（默认） | critical=仅严重拦截
     "audit_retention_days": 180,        # 等保2.0三级建议 ≥180 天
     "trusted_domain_suffixes": [".gov.cn", ".gov.org", ".gov", ".edu.cn", ".edu", ".ac.cn"],
+    "aigc_explicit_label_enabled": False,  # 是否在回复中显示【AI生成内容】标签（默认False，避免影响用户体验）
+    "aigc_implicit_marker_enabled": True,  # 是否添加隐式元数据标记（默认True，保留合规溯源）
 }
 
 # 拦截阈值 → 风险等级集合
@@ -62,6 +64,11 @@ class PolicyManager:
                         self._updated_at = str(json.loads(raw_val))
                     except (ValueError, TypeError):
                         pass
+                    continue
+                # 仅合并策略键：policy_config 同时存放模型接入 / 通知通道 / 审计转发
+                # / TSA 等其它全局配置，不允许混入策略状态——否则 get_policy() 会把
+                # 非策略配置原样返回（含明文 API Key / SMTP 密码），造成配置泄露
+                if key not in POLICY_DEFAULTS:
                     continue
                 try:
                     merged[key] = json.loads(raw_val)
@@ -128,6 +135,12 @@ class PolicyManager:
                 s for s in cleaned if not (s in seen or seen.add(s))
             ]
 
+        if "aigc_explicit_label_enabled" in changes:
+            validated["aigc_explicit_label_enabled"] = bool(changes["aigc_explicit_label_enabled"])
+
+        if "aigc_implicit_marker_enabled" in changes:
+            validated["aigc_implicit_marker_enabled"] = bool(changes["aigc_implicit_marker_enabled"])
+
         if not validated:
             raise ValueError("没有可更新的有效策略项")
 
@@ -158,6 +171,16 @@ class PolicyManager:
     @property
     def retention_days(self) -> int:
         return int(self._policy.get("audit_retention_days", 180))
+
+    @property
+    def aigc_explicit_label_enabled(self) -> bool:
+        """是否在回复中显示【AI生成内容】标签"""
+        return bool(self._policy.get("aigc_explicit_label_enabled", False))
+
+    @property
+    def aigc_implicit_marker_enabled(self) -> bool:
+        """是否添加隐式元数据标记"""
+        return bool(self._policy.get("aigc_implicit_marker_enabled", True))
 
     def trusted_suffixes(self) -> List[str]:
         return list(self._policy.get("trusted_domain_suffixes", []))

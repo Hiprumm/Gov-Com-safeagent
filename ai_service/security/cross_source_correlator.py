@@ -216,11 +216,6 @@ class CrossSourceCorrelator:
 
             self._reported_threats.add(threat_id)
 
-            # 同步存入 session 威胁列表，便于后续 summary 查询
-            if session_id not in self._session_threats:
-                self._session_threats[session_id] = []
-            self._session_threats[session_id].append(threat)
-
             attack_chain = self._build_attack_chain(pattern, window_events)
             severity = self._calc_severity(combined_confidence, len(window_events))
 
@@ -242,6 +237,11 @@ class CrossSourceCorrelator:
             )
 
             threats.append(threat)
+
+            # 同步存入 session 威胁列表，便于后续 summary 查询
+            if session_id not in self._session_threats:
+                self._session_threats[session_id] = []
+            self._session_threats[session_id].append(threat)
 
         return threats if threats else None
 

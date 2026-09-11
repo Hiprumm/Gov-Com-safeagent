@@ -16,6 +16,7 @@ export interface AuthUser {
   role: string
   department?: string
   position?: string
+  status?: string
 }
 export interface DemoAccount {
   username: string
@@ -108,6 +109,19 @@ function cancelMfa() {
   mfaPending.value = null
 }
 
+/** 数据同步：重新拉取 /api/auth/me 恢复最新身份（个人中心"刷新"、资料编辑后调用） */
+async function refreshProfile(): Promise<AuthUser | null> {
+  try {
+    const res = await axios.get('/ai/auth/me')
+    demoAccounts.value = res.data.demo_accounts || []
+    if (res.data.user) {
+      currentUser.value = res.data.user
+      return res.data.user
+    }
+  } catch { /* 网络异常时保留旧身份，不打断当前会话 */ }
+  return null
+}
+
 /** 登出：清令牌并回到登录页 */
 async function logout() {
   try {
@@ -123,6 +137,6 @@ async function logout() {
 export function useAuth() {
   return {
     currentUser, demoAccounts, isAuthed, hasToken,
-    mfaPending, initAuth, login, verifyMfa, cancelMfa, logout,
+    mfaPending, initAuth, login, verifyMfa, cancelMfa, refreshProfile, logout,
   }
 }

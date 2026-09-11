@@ -36,6 +36,10 @@
   --c-accent: 8 145 178;        /* #0891B2 cyan-600 */
   --c-accent2: 124 58 237;      /* #7C3AED violet-600 */
 
+  /* 代码块 — 深色底，类 GitHub/DeepSeek 观感 */
+  --c-code-bg: 15 23 42;        /* #0F172A slate-900 */
+  --c-code-text: 226 232 240;   /* #E2E8F0 slate-200 */
+
   /* 阴影 — 浅色下轻阴影 */
   --shadow-sm: 0 1px 2px 0 rgba(0, 0, 0, 0.05);
   --shadow-md: 0 4px 6px -1px rgba(0, 0, 0, 0.07), 0 2px 4px -2px rgba(0, 0, 0, 0.05);
@@ -105,6 +109,10 @@
   --c-critical: 239 68 68;     /* #EF4444 */
   --c-accent: 6 182 212;       /* #06B6D4 */
   --c-accent2: 139 92 246;     /* #8B5CF6 */
+
+  /* 代码块 — 比 surface 更深的底，保证对比层次 */
+  --c-code-bg: 7 13 24;        /* #070D18 */
+  --c-code-text: 203 213 225;  /* #CBD5E1 slate-300 */
 
   /* 阴影 — 深色下低透明度黑多层叠加增加层次感 */
   --shadow-sm: 0 1px 2px 0 rgba(0, 0, 0, 0.3);
@@ -278,53 +286,190 @@ a {
   outline-offset: 2px;
 }
 
-/* ======== Markdown 渲染（会话中 AI 生成的结构化报表/表格） ======== */
-.markdown-body { word-break: break-word; }
-.markdown-body table {
-  border-collapse: collapse;
-  margin: 0.5rem 0;
-  width: 100%;
-  font-size: 0.875rem;
+/* ======== Markdown 渲染（AI 对话正文，类 ChatGPT/DeepSeek 观感） ======== */
+.markdown-body {
+  word-break: break-word;
+  line-height: 1.75;
 }
-.markdown-body th, .markdown-body td {
-  border: 1px solid rgb(var(--c-border-default));
-  padding: 0.4rem 0.6rem;
-  text-align: left;
-}
-.markdown-body th {
-  background: rgb(var(--c-elevated));
-  font-weight: 600;
-}
-.markdown-body h1, .markdown-body h2, .markdown-body h3 {
+.markdown-body > *:first-child { margin-top: 0; }
+.markdown-body > *:last-child { margin-bottom: 0; }
+
+/* —— 标题层级：h1 下划线、h2 强调侧标 —— */
+.markdown-body h1, .markdown-body h2, .markdown-body h3, .markdown-body h4 {
   font-weight: 700;
-  margin: 0.75rem 0 0.4rem;
   line-height: 1.4;
+  margin: 1.1rem 0 0.5rem;
 }
-.markdown-body h1 { font-size: 1.25rem; }
-.markdown-body h2 { font-size: 1.125rem; }
-.markdown-body h3 { font-size: 1rem; }
-.markdown-body p { margin: 0.35rem 0; }
-.markdown-body ul, .markdown-body ol { margin: 0.35rem 0; padding-left: 1.25rem; }
-.markdown-body li { margin: 0.15rem 0; }
+.markdown-body h1 {
+  font-size: 1.3rem;
+  padding-bottom: 0.4rem;
+  border-bottom: 1px solid rgb(var(--c-border-default));
+}
+.markdown-body h2 {
+  font-size: 1.15rem;
+  padding-left: 0.6rem;
+  border-left: 3px solid rgb(var(--c-accent));
+}
+.markdown-body h3 { font-size: 1.02rem; }
+.markdown-body h4 { font-size: 0.95rem; color: rgb(var(--c-secondary)); }
+
+/* —— 段落 / 列表：呼吸感 + 强调符号 —— */
+.markdown-body p { margin: 0.5rem 0; }
+/* 必须显式声明 list-style：Tailwind Preflight 会重置为 none，否则项目符号不显示 */
+.markdown-body ul { list-style: disc; }
+.markdown-body ol { list-style: decimal; }
+.markdown-body ul, .markdown-body ol { margin: 0.5rem 0; padding-left: 1.4rem; }
+.markdown-body ul li::marker { color: rgb(var(--c-accent)); }
+.markdown-body ol li::marker { color: rgb(var(--c-secondary)); font-weight: 600; }
+.markdown-body li { margin: 0.3rem 0; }
+.markdown-body li > ul, .markdown-body li > ol { margin: 0.2rem 0; }
+.markdown-body strong { font-weight: 600; }
+
+/* —— 行内代码：芯片风 —— */
 .markdown-body code {
   background: rgb(var(--c-elevated));
-  padding: 0.1rem 0.3rem;
-  border-radius: 4px;
+  border: 1px solid rgb(var(--c-border-default));
+  padding: 0.14rem 0.4rem;
+  border-radius: 5px;
   font-family: var(--font-mono);
   font-size: 0.85em;
 }
+
+/* —— 代码块：深色底 + 标题栏（语言标签 + 复制按钮） —— */
 .markdown-body pre {
-  background: rgb(var(--c-elevated));
-  padding: 0.6rem 0.8rem;
-  border-radius: 8px;
+  background: rgb(var(--c-code-bg));
+  color: rgb(var(--c-code-text));
+  padding: 0.8rem 1rem;
+  border-radius: 10px;
   overflow-x: auto;
-  margin: 0.5rem 0;
+  margin: 0.6rem 0;
+  line-height: 1.6;
 }
-.markdown-body pre code { background: transparent; padding: 0; }
-.markdown-body hr { border: none; border-top: 1px solid rgb(var(--c-border-default)); margin: 0.75rem 0; }
+.markdown-body pre code {
+  background: transparent;
+  border: none;
+  padding: 0;
+  color: inherit;
+  font-size: 0.85em;
+}
+.md-code-wrap {
+  margin: 0.7rem 0;
+  border: 1px solid rgb(var(--c-border-default));
+  border-radius: 10px;
+  overflow: hidden;
+  background: rgb(var(--c-code-bg));
+}
+.md-code-wrap pre {
+  margin: 0;
+  border: none;
+  border-radius: 0;
+  background: transparent;
+}
+.md-code-bar {
+  display: flex;
+  align-items: center;
+  padding: 0.35rem 0.8rem;
+  background: rgb(var(--c-code-text) / 0.07);
+  border-bottom: 1px solid rgb(var(--c-code-text) / 0.12);
+}
+/* macOS 风格圆点 */
+.md-code-bar::before {
+  content: '';
+  width: 0.6rem;
+  height: 0.6rem;
+  border-radius: 9999px;
+  background: rgb(var(--c-critical));
+  box-shadow: 1.1rem 0 0 rgb(var(--c-medium)), 2.2rem 0 0 rgb(var(--c-safe));
+  flex-shrink: 0;
+}
+.md-code-lang {
+  margin-left: 3.1rem;
+  font-size: 0.7rem;
+  font-family: var(--font-mono);
+  text-transform: lowercase;
+  color: rgb(var(--c-code-text) / 0.6);
+}
+.md-code-copy {
+  margin-left: auto;
+  font-size: 0.7rem;
+  color: rgb(var(--c-code-text) / 0.75);
+  background: rgb(var(--c-code-text) / 0.1);
+  border: 1px solid rgb(var(--c-code-text) / 0.2);
+  border-radius: 6px;
+  padding: 0.12rem 0.55rem;
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s;
+}
+.md-code-copy:hover {
+  background: rgb(var(--c-code-text) / 0.22);
+  color: rgb(var(--c-code-text));
+}
+
+/* —— 表格：圆角容器 + 斑马纹（圆角由 .md-table-wrap 承担，跨浏览器稳定） —— */
+.md-table-wrap {
+  margin: 0.75rem 0;
+  border: 1px solid rgb(var(--c-border-default));
+  border-radius: 8px;
+  overflow: hidden;
+}
+.md-table-wrap table {
+  width: 100%;
+  margin: 0;
+  font-size: 0.875rem;
+  border-collapse: collapse;
+}
+.md-table-wrap th, .md-table-wrap td {
+  border-bottom: 1px solid rgb(var(--c-border-default));
+  border-right: 1px solid rgb(var(--c-border-default));
+  padding: 0.5rem 0.7rem;
+  text-align: left;
+  vertical-align: top;
+}
+.md-table-wrap th:last-child, .md-table-wrap td:last-child { border-right: none; }
+.md-table-wrap tr:last-child > * { border-bottom: none; }
+.md-table-wrap th { background: rgb(var(--c-elevated)); font-weight: 600; }
+.md-table-wrap tbody tr:nth-child(even) { background: rgb(var(--c-elevated) / 0.5); }
+
+/* —— 引用 / 分隔线 / 链接 —— */
 .markdown-body blockquote {
   border-left: 3px solid rgb(var(--c-accent));
-  padding-left: 0.75rem;
+  border-radius: 0 8px 8px 0;
+  background: rgb(var(--c-accent) / 0.07);
+  padding: 0.4rem 0.9rem;
   color: rgb(var(--c-secondary));
-  margin: 0.5rem 0;
+  margin: 0.7rem 0;
 }
+.markdown-body hr {
+  border: none;
+  height: 1px;
+  background: linear-gradient(to right, transparent, rgb(var(--c-border-hover)), transparent);
+  margin: 1.2rem 0;
+}
+.markdown-body a {
+  color: rgb(var(--c-accent));
+  text-decoration: none;
+  border-bottom: 1px solid rgb(var(--c-accent) / 0.35);
+  transition: border-color 0.15s;
+}
+.markdown-body a:hover { border-bottom-color: rgb(var(--c-accent)); }
+
+/* —— 用户气泡（渐变底色 + 白字）内覆盖：用 currentColor 派生，保持主题一致 —— */
+.markdown-body-user code {
+  background: color-mix(in srgb, currentColor 16%, transparent);
+  border-color: color-mix(in srgb, currentColor 30%, transparent);
+  color: inherit;
+}
+.markdown-body-user blockquote {
+  border-left-color: color-mix(in srgb, currentColor 55%, transparent);
+  background: color-mix(in srgb, currentColor 10%, transparent);
+  color: inherit;
+}
+.markdown-body-user ul li::marker,
+.markdown-body-user ol li::marker { color: color-mix(in srgb, currentColor 75%, transparent); }
+.markdown-body-user .md-table-wrap { border-color: color-mix(in srgb, currentColor 40%, transparent); }
+.markdown-body-user .md-table-wrap th,
+.markdown-body-user .md-table-wrap td { border-color: color-mix(in srgb, currentColor 40%, transparent); }
+.markdown-body-user .md-table-wrap th { background: color-mix(in srgb, currentColor 12%, transparent); }
+.markdown-body-user .md-table-wrap tbody tr:nth-child(even) { background: color-mix(in srgb, currentColor 6%, transparent); }
+.markdown-body-user hr { background: color-mix(in srgb, currentColor 30%, transparent); }
+.markdown-body-user a { text-decoration: underline; }

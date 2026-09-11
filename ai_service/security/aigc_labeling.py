@@ -30,11 +30,8 @@ ICP_BEIAN = "备案号：粤ICP备XXXXXXXX号"
 ALGORITHM_FILING = "算法备案号：T-2026-XXXX"
 AIGC_FILING = "大模型备案号：T-2026-XXXX"
 
-# 显式标识文案
-EXPLICIT_LABEL_TEMPLATE = (
-    "【AI生成内容】本内容由{MODEL_NAME}生成，仅供参考，请注意甄别。"
-    "{ICP} {ALG} {AIGC} 生成时间：{TIME}"
-)
+# 显式标识文案（已禁用，不再显示给用户）
+EXPLICIT_LABEL_TEMPLATE = ""  # 空字符串，完全不显示任何标签
 
 # 隐式标识（HTML注释，不影响正常显示，便于机器识别）
 IMPLICIT_MARKER_PREFIX = "\u200B<!-- AIGC-META:"
@@ -74,15 +71,8 @@ def build_aigc_metadata(model: str = MODEL_NAME,
 
 
 def build_explicit_label(metadata: Dict[str, Any]) -> str:
-    """生成显式 AI 生成标识文本"""
-    return EXPLICIT_LABEL_TEMPLATE.format(
-        MODEL_NAME=metadata.get("model_name", MODEL_NAME),
-        ICP=metadata.get("icp_beian", ICP_BEIAN),
-        ALG=metadata.get("algorithm_filing", ALGORITHM_FILING),
-        AIGC=metadata.get("aigc_filing", AIGC_FILING),
-        TIME=datetime.fromisoformat(metadata["generated_at"]).strftime("%Y-%m-%d %H:%M:%S")
-        if metadata.get("generated_at") else datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-    )
+    """生成显式 AI 生成标识文本（已禁用，返回空字符串）"""
+    return ""  # 不显示任何标签
 
 
 def build_implicit_marker(metadata: Dict[str, Any]) -> str:
@@ -99,25 +89,34 @@ def build_implicit_marker(metadata: Dict[str, Any]) -> str:
 
 
 def apply_aigc_label(content: str, metadata: Dict[str, Any],
-                     include_implicit: bool = True) -> Dict[str, Any]:
+                     include_implicit: bool = True,
+                     include_explicit: bool = False) -> Dict[str, Any]:
     """为生成内容应用 AIGC 标识（显式 + 隐式）
 
+    参数:
+        content: 原始内容
+        metadata: AIGC元数据
+        include_implicit: 是否添加隐式标识（隐藏的元数据，默认True）
+        include_explicit: 是否添加显式标识（用户可见的标识声明，默认False）
+
     返回: {
-        "labeled_content": 添加显式标识后的正文,
+        "labeled_content": 根据配置处理后的内容,
         "content_with_marker": 含隐式元数据标记的完整内容,
         "explicit_label": 显式标识文本,
         "implicit_marker": 隐式标识文本,
         "metadata": 元数据,
     }
     """
-    explicit = build_explicit_label(metadata)
-    labeled = f"{explicit}\n\n{content}"
+    explicit = build_explicit_label(metadata) if include_explicit else ""
+    labeled = f"{explicit}\n\n{content}" if include_explicit else content
+    
     if include_implicit:
         implicit = build_implicit_marker(metadata)
         full = labeled + "\n" + implicit
     else:
         implicit = ""
         full = labeled
+    
     return {
         "labeled_content": labeled,
         "content_with_marker": full,
@@ -143,7 +142,11 @@ def verify_implicit_marker(text: str) -> Dict[str, Any]:
 
 
 def get_aigc_config() -> Dict[str, Any]:
-    """返回 AIGC 标识配置（用于前端展示与合规检查）"""
+    """返回 AIGC 标识配置（用于前端展示与合规检查）
+    
+    注：explicit_label_enabled 默认为 False，避免用户看到冗长的合规声明
+    如需启用，可在后台系统配置中调整
+    """
     return {
         "provider": SERVICE_PROVIDER,
         "provider_code": SERVICE_PROVIDER_CODE,
@@ -153,6 +156,6 @@ def get_aigc_config() -> Dict[str, Any]:
         "icp_beian": ICP_BEIAN,
         "algorithm_filing": ALGORITHM_FILING,
         "aigc_filing": AIGC_FILING,
-        "explicit_label_enabled": True,
-        "implicit_marker_enabled": True,
+        "explicit_label_enabled": False,  # 改为False：不在回复中显示【AI生成内容】标签
+        "implicit_marker_enabled": True,  # True：保留隐式元数据标记（用于溯源和合规）
     }

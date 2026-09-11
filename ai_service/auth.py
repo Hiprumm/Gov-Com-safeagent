@@ -70,7 +70,11 @@ def _load_jwt_secret() -> bytes:
     """
     secret = str(getattr(settings, "AUTH_JWT_SECRET", "") or "")
     if secret:
-        return secret.encode("utf-8")
+        cleaned = secret.strip()
+        if len(cleaned) < 32:
+            print(f"[AUTH][WARN] AUTH_JWT_SECRET 仅 {len(cleaned)} 字符，过短易被暴力枚举。"
+                  f"生产环境请配置 ≥32 字符的强密钥（如 `openssl rand -hex 32`）。")
+        return cleaned.encode("utf-8")
     try:
         import os
         base = os.path.dirname(os.path.abspath(__file__))
@@ -252,6 +256,7 @@ def get_user_by_token(token: Optional[str]) -> Optional[Dict]:
         "role": row["role"],
         "department": row.get("department", ""),
         "position": row.get("position", ""),
+        "status": row.get("status", "active"),
     }
 
 
@@ -541,4 +546,5 @@ def resolve_sso_identity(headers, client_ip: str = "") -> Optional[Dict]:
         "role": row["role"],
         "department": row.get("department", ""),
         "position": row.get("position", ""),
+        "status": row.get("status", "active"),
     }

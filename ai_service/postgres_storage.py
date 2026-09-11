@@ -13,6 +13,7 @@
 """
 import json
 import uuid
+import time
 from datetime import datetime, timedelta
 from threading import Lock
 from typing import Any, Dict, List, Optional
@@ -29,6 +30,15 @@ except Exception:  # pragma: no cover
     dict_row = None
     UniqueViolation = Exception
     PSYCOPG_AVAILABLE = False
+
+# 会话标题长度上限（缩略显示）
+AUTO_TITLE_MAX = 30
+
+
+def _auto_title(content: str) -> str:
+    """由消息内容生成缩略会话标题：压缩空白 + 截断 N 字。"""
+    text = " ".join(content.strip().split())
+    return text[:AUTO_TITLE_MAX]
 
 
 def _build_dsn() -> str:
@@ -132,6 +142,63 @@ _SCHEMA_STATEMENTS = [
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
     )""",
+    # ---- 治理中心：应急联动（全局熔断 / 账号封锁 / IP 封锁）----
+    """CREATE TABLE IF NOT EXISTS emergency_controls (
+        id BIGSERIAL PRIMARY KEY,
+        control_type TEXT NOT NULL,
+        target TEXT,
+        enabled INTEGER DEFAULT 1,
+        operator TEXT DEFAULT '',
+        reason TEXT DEFAULT '',
+        created_at TEXT NOT NULL,
+        removed_at TEXT
+    )""",
+    """CREATE INDEX IF NOT EXISTS idx_emergency_active ON emergency_controls(enabled)""",
+    # ---- 治理中心：开放生态（调用方 / Token 哈希 / 限流配额 / 调用日志）----
+    """CREATE TABLE IF NOT EXISTS api_clients (
+        client_id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        token_hash TEXT NOT NULL,
+        enabled INTEGER DEFAULT 1,
+        rate_limit INTEGER DEFAULT 60,
+        quota INTEGER DEFAULT 0,
+        used INTEGER DEFAULT 0,
+        created_by TEXT DEFAULT '',
+        description TEXT DEFAULT '',
+        created_at TEXT NOT NULL
+    )""",
+    """CREATE TABLE IF NOT EXISTS api_call_logs (
+        id BIGSERIAL PRIMARY KEY,
+        client_id TEXT NOT NULL,
+        name TEXT NOT NULL,
+        path TEXT DEFAULT '',
+        status INTEGER DEFAULT 200,
+        remote_ip TEXT DEFAULT '',
+        created_at TEXT NOT NULL
+    )""",
+    """CREATE INDEX IF NOT EXISTS idx_api_calls_client ON api_call_logs(client_id)""",
+    # ---- 全局流量限制（滑动窗口，落库保证多 worker 配额一致）----
+    """CREATE TABLE IF NOT EXISTS rate_limit_hits (
+        id BIGSERIAL PRIMARY KEY,
+        key TEXT NOT NULL,
+        hit_time DOUBLE PRECISION NOT NULL
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_rate_key_time ON rate_limit_hits(key, hit_time)",
+    # ---- 治理中心：PIPL 合规台账 ----
+    """CREATE TABLE IF NOT EXISTS pipl_records (
+        id BIGSERIAL PRIMARY KEY,
+        session_id TEXT NOT NULL DEFAULT '',
+        username TEXT NOT NULL DEFAULT '',
+        pii_type TEXT NOT NULL,
+        masked_value TEXT NOT NULL,
+        source TEXT DEFAULT 'chat',
+        legal_basis TEXT DEFAULT '',
+        assessment TEXT DEFAULT 'pending',
+        noted_by TEXT DEFAULT '',
+        created_at TEXT NOT NULL,
+        updated_at TEXT
+    )""",
+    """CREATE INDEX IF NOT EXISTS idx_pipl_type ON pipl_records(pii_type)""",
     "CREATE INDEX IF NOT EXISTS idx_audit_timestamp ON audit_logs(timestamp)",
     "CREATE INDEX IF NOT EXISTS idx_audit_user ON audit_logs(user_id)",
     "CREATE INDEX IF NOT EXISTS idx_audit_risk ON audit_logs(risk_level)",
@@ -187,6 +254,8 @@ class PostgresStorage:
                 # 迁移：为历史库补充 MFA(TOTP) 列（幂等）
                 cur.execute("ALTER TABLE sys_users ADD COLUMN IF NOT EXISTS totp_secret TEXT DEFAULT ''")
                 cur.execute("ALTER TABLE sys_users ADD COLUMN IF NOT EXISTS mfa_enabled BOOLEAN DEFAULT FALSE")
+                # 迁移：conversation_history 补充 metadata 列（"思考中"过程等结构化元数据持久化，幂等）
+                cur.execute("ALTER TABLE conversation_history ADD COLUMN IF NOT EXISTS metadata TEXT")
 
     @staticmethod
     def _row_to_dict(row: Any) -> Dict[str, Any]:
@@ -395,23 +464,31 @@ class PostgresStorage:
                 )
         return session_id
 
-    def add_message(self, session_id: str, role: str, content: str, message_type: str = "text"):
+    def add_message(self, session_id: str, role: str, content: str, message_type: str = "text",
+                    metadata: Optional[str] = None):
         now = datetime.now().isoformat()
         with self._lock:
             with self._get_conn() as conn:
                 conn.execute(
-                    "INSERT INTO conversation_history (session_id, role, content, type, timestamp) VALUES (%s,%s,%s,%s,%s)",
-                    (session_id, role, content, message_type, now),
+                    "INSERT INTO conversation_history (session_id, role, content, type, timestamp, metadata) VALUES (%s,%s,%s,%s,%s,%s)",
+                    (session_id, role, content, message_type, now, metadata),
                 )
                 conn.execute(
                     "UPDATE sessions SET updated_at = %s, message_count = message_count + 1 WHERE session_id = %s",
                     (now, session_id),
                 )
+                # 首次对话自动生成标题：用第一条用户消息内容缩略（已存在标题则不覆盖）
+                if role == "user":
+                    title = _auto_title(content)
+                    conn.execute(
+                        "UPDATE sessions SET title = COALESCE(title, %s) WHERE session_id = %s AND title IS NULL",
+                        (title, session_id),
+                    )
 
     def get_history(self, session_id: str, limit: int = 20) -> List[Dict[str, Any]]:
         with self._get_conn() as conn:
             rows = conn.execute(
-                "SELECT id, role, content, type, timestamp FROM conversation_history WHERE session_id = %s ORDER BY id ASC LIMIT %s",
+                "SELECT id, role, content, type, timestamp, metadata FROM conversation_history WHERE session_id = %s ORDER BY id ASC LIMIT %s",
                 (session_id, limit),
             ).fetchall()
         return [dict(r) for r in rows]
@@ -457,6 +534,23 @@ class PostgresStorage:
             with self._get_conn() as conn:
                 cur = conn.execute(
                     "DELETE FROM conversation_history WHERE session_id = %s AND id >= %s",
+                    (session_id, message_id),
+                )
+                remaining = conn.execute(
+                    "SELECT COUNT(*) AS c FROM conversation_history WHERE session_id = %s", (session_id,)
+                ).fetchone()["c"]
+                conn.execute(
+                    "UPDATE sessions SET updated_at = %s, message_count = %s WHERE session_id = %s",
+                    (datetime.now().isoformat(), int(remaining), session_id),
+                )
+                return cur.rowcount
+
+    def delete_message(self, session_id: str, message_id: int) -> int:
+        """仅删除单条消息（不影响该条之前/之后的其它消息）"""
+        with self._lock:
+            with self._get_conn() as conn:
+                cur = conn.execute(
+                    "DELETE FROM conversation_history WHERE session_id = %s AND id = %s",
                     (session_id, message_id),
                 )
                 remaining = conn.execute(
@@ -516,6 +610,157 @@ class PostgresStorage:
         with self._lock:
             with self._get_conn() as conn:
                 conn.execute("DELETE FROM notifications")
+
+    # ==================== 治理中心：应急联动（与 storage.Storage 同一接口） ====================
+
+    def add_emergency_control(self, control_type: str, target: str, operator: str = "", reason: str = "") -> int:
+        with self._lock:
+            with self._get_conn() as conn:
+                conn.execute(
+                    "UPDATE emergency_controls SET enabled = 0, removed_at = %s WHERE control_type = %s AND target = %s AND enabled = 1",
+                    (datetime.now().isoformat(), control_type, target),
+                )
+                row = conn.execute(
+                    "INSERT INTO emergency_controls (control_type, target, enabled, operator, reason, created_at) "
+                    "VALUES (%s,%s,1,%s,%s,%s) RETURNING id",
+                    (control_type, target, operator, reason, datetime.now().isoformat()),
+                ).fetchone()
+                return int(row["id"]) if row else 0
+
+    def release_emergency_control(self, control_type: str, target: str) -> None:
+        with self._lock:
+            with self._get_conn() as conn:
+                conn.execute(
+                    "UPDATE emergency_controls SET enabled = 0, removed_at = %s WHERE control_type = %s AND target = %s AND enabled = 1",
+                    (datetime.now().isoformat(), control_type, target),
+                )
+
+    def active_emergency_controls(self) -> List[Dict[str, Any]]:
+        with self._get_conn() as conn:
+            rows = conn.execute(
+                "SELECT * FROM emergency_controls WHERE enabled = 1 ORDER BY created_at DESC").fetchall()
+        return [dict(r) for r in rows]
+
+    def emergency_history(self, limit: int = 50) -> List[Dict[str, Any]]:
+        with self._get_conn() as conn:
+            rows = conn.execute(
+                "SELECT * FROM emergency_controls ORDER BY id DESC LIMIT %s", (int(limit),)).fetchall()
+        return [dict(r) for r in rows]
+
+    # ==================== 全局流量限制（滑动窗口，落库保证多 worker 配额一致） ====================
+
+    def rate_limit_check(self, key: str, max_req: int, window: float, now: Optional[float] = None) -> bool:
+        now = time.time() if now is None else now
+        if max_req <= 0:
+            return True
+        with self._lock:
+            with self._get_conn() as conn:
+                conn.execute("DELETE FROM rate_limit_hits WHERE hit_time <= %s", (now - window,))
+                cur = conn.execute(
+                    "SELECT COUNT(*) AS c FROM rate_limit_hits WHERE key = %s AND hit_time > %s",
+                    (key, now - window),
+                )
+                count = cur.fetchone()["c"]
+                if count >= max_req:
+                    return True
+                conn.execute("INSERT INTO rate_limit_hits (key, hit_time) VALUES (%s, %s)", (key, now))
+                return False
+
+    def rate_limit_reset(self, key: str) -> None:
+        with self._lock:
+            with self._get_conn() as conn:
+                conn.execute("DELETE FROM rate_limit_hits WHERE key = %s", (key,))
+
+    # ==================== 治理中心：开放生态（调用方 / Token / 调用日志） ====================
+
+    def upsert_api_client(self, client_id: str, name: str, token_hash: str, enabled: int,
+                          rate_limit: int, quota: int, created_by: str, description: str = "") -> None:
+        with self._lock:
+            with self._get_conn() as conn:
+                conn.execute(
+                    """INSERT INTO api_clients
+                       (client_id, name, token_hash, enabled, rate_limit, quota, used, created_by, description, created_at)
+                       VALUES (%s,%s,%s,%s,%s,%s,0,%s,%s,%s)
+                       ON CONFLICT (client_id) DO UPDATE SET
+                         name = EXCLUDED.name, token_hash = EXCLUDED.token_hash, enabled = EXCLUDED.enabled,
+                         rate_limit = EXCLUDED.rate_limit, quota = EXCLUDED.quota, description = EXCLUDED.description""",
+                    (client_id, name, token_hash, int(enabled), int(rate_limit), int(quota),
+                     created_by, description, datetime.now().isoformat()),
+                )
+
+    def list_api_clients(self) -> List[Dict[str, Any]]:
+        with self._get_conn() as conn:
+            rows = conn.execute("SELECT * FROM api_clients ORDER BY created_at DESC").fetchall()
+        return [dict(r) for r in rows]
+
+    def get_api_client(self, client_id: str) -> Optional[Dict[str, Any]]:
+        with self._get_conn() as conn:
+            row = conn.execute("SELECT * FROM api_clients WHERE client_id = %s", (client_id,)).fetchone()
+        return dict(row) if row else None
+
+    def delete_api_client(self, client_id: str) -> None:
+        with self._lock:
+            with self._get_conn() as conn:
+                conn.execute("DELETE FROM api_call_logs WHERE client_id = %s", (client_id,))
+                conn.execute("DELETE FROM api_clients WHERE client_id = %s", (client_id,))
+
+    def record_api_call(self, client_id: str, name: str, path: str, status: int, remote_ip: str = "") -> None:
+        with self._lock:
+            with self._get_conn() as conn:
+                conn.execute("UPDATE api_clients SET used = used + 1 WHERE client_id = %s", (client_id,))
+                conn.execute(
+                    "INSERT INTO api_call_logs (client_id, name, path, status, remote_ip, created_at) "
+                    "VALUES (%s,%s,%s,%s,%s,%s)",
+                    (client_id, name, path, int(status), remote_ip, datetime.now().isoformat()),
+                )
+
+    def list_api_call_logs(self, limit: int = 100) -> List[Dict[str, Any]]:
+        with self._get_conn() as conn:
+            rows = conn.execute(
+                "SELECT * FROM api_call_logs ORDER BY id DESC LIMIT %s", (int(limit),)).fetchall()
+        return [dict(r) for r in rows]
+
+    # ==================== 治理中心：PIPL 合规台账 ====================
+
+    def add_pipl_record(self, session_id: str, username: str, pii_type: str, masked_value: str,
+                        source: str = "chat") -> Optional[int]:
+        with self._lock:
+            with self._get_conn() as conn:
+                dup = conn.execute(
+                    "SELECT id FROM pipl_records WHERE source = %s AND pii_type = %s AND masked_value = %s AND session_id = %s LIMIT 1",
+                    (source, pii_type, masked_value, session_id),
+                ).fetchone()
+                if dup:
+                    return int(dup["id"]) if dup["id"] is not None else None
+                row = conn.execute(
+                    "INSERT INTO pipl_records (session_id, username, pii_type, masked_value, source, created_at) "
+                    "VALUES (%s,%s,%s,%s,%s,%s) RETURNING id",
+                    (session_id, username, pii_type, masked_value, source, datetime.now().isoformat()),
+                ).fetchone()
+                return int(row["id"]) if row else None
+
+    def list_pipl_records(self, limit: int = 200) -> List[Dict[str, Any]]:
+        with self._get_conn() as conn:
+            rows = conn.execute(
+                "SELECT * FROM pipl_records ORDER BY id DESC LIMIT %s", (int(limit),)).fetchall()
+        return [dict(r) for r in rows]
+
+    def update_pipl_record(self, record_id: int, legal_basis: str, assessment: str, noted_by: str = "") -> None:
+        with self._lock:
+            with self._get_conn() as conn:
+                conn.execute(
+                    "UPDATE pipl_records SET legal_basis = %s, assessment = %s, noted_by = %s, updated_at = %s WHERE id = %s",
+                    (legal_basis, assessment, noted_by, datetime.now().isoformat(), int(record_id)),
+                )
+
+    def pipl_stats(self) -> Dict[str, Any]:
+        with self._get_conn() as conn:
+            total = conn.execute("SELECT COUNT(*) AS c FROM pipl_records").fetchone()["c"]
+            pending = conn.execute("SELECT COUNT(*) AS c FROM pipl_records WHERE assessment = 'pending'").fetchone()["c"]
+            rows = conn.execute(
+                "SELECT pii_type, COUNT(*) AS c FROM pipl_records GROUP BY pii_type ORDER BY c DESC").fetchall()
+        return {"total": int(total), "pending": int(pending),
+                "by_type": {r["pii_type"]: int(r["c"]) for r in rows}}
 
     # ==================== 通用键值设置 ====================
     def get_setting(self, key: str, default: Any = None) -> Any:

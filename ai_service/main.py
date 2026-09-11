@@ -1,13 +1,13 @@
 import sys
 import os
 import time
-from collections import defaultdict
+import json
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, FileResponse
+from fastapi.responses import JSONResponse, FileResponse, StreamingResponse
 from typing import List, Dict, Any, Optional
 from datetime import datetime
 
@@ -101,20 +101,23 @@ if settings.AUTH_ENABLED and settings.AUTH_API_KEY:
             )
         return await call_next(request)
 
-# ======== 简单限流 (滑动窗口) ========
-_rate_limit_store: Dict[str, list] = defaultdict(list)
+# ======== 简单限流 (滑动窗口)，计数落库保证多 worker 配额一致 ========
 
 if settings.RATE_LIMIT_ENABLED:
     @app.middleware("http")
     async def rate_limit_middleware(request: Request, call_next):
         client_ip = request.client.host if request.client else "unknown"
-        now = time.time()
-        window = settings.RATE_LIMIT_WINDOW
-        max_req = settings.RATE_LIMIT_REQUESTS
-        _rate_limit_store[client_ip] = [t for t in _rate_limit_store[client_ip] if now - t < window]
-        if len(_rate_limit_store[client_ip]) >= max_req:
+        # 登录态按用户名限流更精确；匿名按 IP
+        identity = None
+        try:
+            identity = current_identity(request.headers.get("X-Auth-Token"))
+        except Exception:  # noqa: BLE001
+            identity = None
+        key = (identity or {}).get("username") or f"ip:{client_ip}"
+        from storage import get_storage
+        rl = get_storage()
+        if rl.rate_limit_check(key, settings.RATE_LIMIT_REQUESTS, settings.RATE_LIMIT_WINDOW):
             return JSONResponse(status_code=429, content={"detail": "Too Many Requests"})
-        _rate_limit_store[client_ip].append(now)
         return await call_next(request)
 
 # ======== 请求体大小限制 ========
@@ -129,6 +132,45 @@ async def request_size_limit_middleware(request: Request, call_next):
                 status_code=413,
                 content={"detail": f"Request body too large. Max {settings.MAX_REQUEST_SIZE_MB}MB"}
             )
+    return await call_next(request)
+
+# ======== 应急联动：IP 封锁（全局中间件，IP 维度的第一道闸） ========
+# 事故处置真实场景：全局熔断要"停止执行、但不能瞎眼"——
+#   - IP 封锁：敌对源，任何请求（含只读研判）一律拦截；
+#   - 全局熔断：阻断一切"执行/改数据"动作；但放行只读研判接口（审计/合规/台账/看板/运行时/会话史），
+#     便于应急处置期间持续查看态势与取证。这些只读接口仍受登录+角色 ACL 双重约束。
+_READONLY_INTROSPECT_GET_PREFIXES = (
+    "/api/audit/", "/api/compliance/", "/api/dashboard/", "/api/runtime/",
+    "/api/pipl/", "/api/ecosystem/", "/api/notify/", "/api/notifications",
+    "/api/policy/", "/api/agent/sessions", "/api/agent/history",
+    "/api/agent/recall_preview", "/api/security/tool_management/status",
+    "/api/metrics",
+    "/api/auth/",
+)
+
+
+@app.middleware("http")
+async def emergency_ip_middleware(request: Request, call_next):
+    path = request.url.path
+    if path.startswith(("/api/emergency", "/openapi.json", "/docs", "/api/health")):
+        return await call_next(request)
+    try:
+        from governance import get_emergency_center
+        ec = get_emergency_center()
+        client_ip = request.client.host if request.client else ""
+        # 1) IP 封锁：源 IP 被应急封锁 → 一律拦截（含只读）——实时读库，多 worker 一致
+        if client_ip and ec.is_ip_blocked(client_ip):
+            return JSONResponse(status_code=403,
+                                content={"detail": f"IP {client_ip} 已被应急封锁，禁止访问", "code": "EMERGENCY_BLOCKED"})
+        # 2) 全局熔断：仅拦截执行/改数据动作；GET 只读研判接口放行（仍需角色权限）——实时读库
+        if ec.global_circuit_active():
+            is_readonly = (request.method.upper() == "GET"
+                           and path.startswith(_READONLY_INTROSPECT_GET_PREFIXES))
+            if not is_readonly:
+                return JSONResponse(status_code=403,
+                                    content={"detail": "系统已全局熔断，暂停所有智能体执行", "code": "EMERGENCY_BLOCKED"})
+    except Exception:
+        pass
     return await call_next(request)
 
 input_detector = InputDetectionService()
@@ -175,6 +217,7 @@ def _apply_policy_hot():
 #   - "integration"   服务间调用：登录令牌 或 已配置的 X-API-Key（供 SDK / 网关）
 _PROTECTED_ROUTES: List[tuple] = [
     # ---- 安全策略与安全控制（改这些等于改防线本身）----
+    ("GET", "/api/security/policy", "policy.view"),
     ("PUT", "/api/security/policy", "policy.manage"),
     ("POST", "/api/security/tool_management/toggle", "tools.manage"),
     ("POST", "/api/security/runtime/terminate", "runtime.terminate"),
@@ -182,6 +225,18 @@ _PROTECTED_ROUTES: List[tuple] = [
     ("POST", "/api/security/session_risk/clear", "system.maintain"),
     ("POST", "/api/security/cross_source/clear", "system.maintain"),
     ("POST", "/api/kb/rebuild", "system.maintain"),
+    ("POST", "/api/kb/upload", "system.maintain"),
+    ("POST", "/api/kb/delete_document", "system.maintain"),
+    # ---- 治理中心（应急联动 / 开放生态 / PIPL / 合规报告）----
+    ("POST", "/api/emergency/", "system.maintain"),
+    ("POST", "/api/ecosystem/", "system.maintain"),
+    ("POST", "/api/pipl/", "system.maintain"),
+    ("GET", "/api/emergency/status", "system.view"),
+    ("GET", "/api/ecosystem/", "system.view"),
+    ("GET", "/api/pipl/", "system.view"),
+    ("GET", "/api/compliance/", "audit.view"),
+    # ---- 可观测性大盘（只读运维指标）----
+    ("GET", "/api/metrics", "system.view"),
     # ---- 安全检测 / 工具管控 / 扫描（安全运维职责，业务用户不可用）----
     ("POST", "/api/security/detect_input", "security.detect"),
     ("POST", "/api/security/detect_single", "security.detect"),
@@ -205,12 +260,15 @@ _PROTECTED_ROUTES: List[tuple] = [
     ("POST", "/api/agent/delete_session", "login"),
     ("POST", "/api/agent/rename_session", "login"),
     ("POST", "/api/agent/recall_messages", "login"),
+    ("POST", "/api/agent/delete_message", "login"),
+    ("GET", "/api/agent/recall_preview", "login"),
     # ---- 审计链校验 / 合规报告（登录可访问，匿名拒绝）----
     ("GET", "/api/audit/logs/verify", "login"),
     ("GET", "/api/audit/logs/verify-graded", "login"),
     ("GET", "/api/compliance/report", "login"),
     # ---- 智能体执行入口（会真实执行工具）→ 登录 或 服务间 API Key ----
     ("POST", "/api/agent/chat", "integration"),
+    ("POST", "/api/agent/chat/stream", "integration"),
     ("POST", "/api/agent/run", "integration"),
     ("POST", "/api/agent/file_upload", "integration"),
 ]
@@ -245,6 +303,28 @@ async def unified_authorization_middleware(request: Request, call_next):
             content={"detail": f"无权限：需要 {need} 权限（当前角色 {identity.get('role')}）"},
         )
     return await call_next(request)
+
+
+# ======== 可观测性：HTTP 请求指标采集（进程内，多 worker 各自计数） ========
+@app.middleware("http")
+async def metrics_middleware(request: Request, call_next):
+    """按路径前缀 + 状态类统计请求量与耗时（置于鉴权之前，连被拦截的请求也计入）"""
+    import time as _t
+    from metrics_collector import get_metrics_collector
+    start = _t.perf_counter()
+    try:
+        resp = await call_next(request)
+        status = resp.status_code
+    except Exception:
+        status = 500
+        raise
+    finally:
+        try:
+            ms = (_t.perf_counter() - start) * 1000
+            get_metrics_collector().record_http(request.url.path, status, ms)
+        except Exception:  # noqa: BLE001
+            pass
+    return resp
 
 
 # ======== 启动清理空会话 + 应用安全策略 ========
@@ -347,6 +427,14 @@ async def detect_single(request: Request, text: str, source: str = "user_input",
         # 响应附带当前策略下的实际拦截结论（阈值可在策略中心热配置，前端勿硬编码）
         resp = result.dict() if hasattr(result, "dict") else dict(result)
         resp["is_blocked"] = blocked
+        # 可观测性：检测事件计数（风险级 + 攻击类型）
+        try:
+            from metrics_collector import get_metrics_collector
+            risk_val = result.risk_level.value if hasattr(result.risk_level, "value") else str(result.risk_level)
+            attack_val = result.attack_type.value if (hasattr(result, "attack_type") and result.attack_type and hasattr(result.attack_type, "value")) else (result.attack_type or None)
+            get_metrics_collector().record_detect(risk_val, attack_val or "none")
+        except Exception:  # noqa: BLE001
+            pass
         return resp
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -1963,6 +2051,28 @@ async def run_agent(req: Request, user_input: str, input_source: str = "user_inp
 
 @app.post("/api/agent/chat")
 async def chat_with_history(req: Request, user_input: str, session_id: Optional[str] = None, input_source: str = "user_input"):
+    # 应急联动：全局熔断 / 账号封锁 在聊天入口拦截
+    try:
+        from governance import get_emergency_center, get_pipl_ledger
+        identity_block = current_identity(req.headers.get("X-Auth-Token")) if req else {}
+        block_reason = get_emergency_center().reason_blocked(
+            username=(identity_block or {}).get("username"),
+            ip=req.client.host if req.client else "",
+        )
+        if block_reason:
+            raise HTTPException(status_code=403, detail=block_reason)
+        # PIPL 输入侧识别登记（含 PII 时写入台账留痕）
+        if user_input:
+            get_pipl_ledger().scan_and_register(
+                user_input,
+                session_id=session_id or "",
+                username=(identity_block or {}).get("username") or "",
+                source="chat",
+            )
+    except HTTPException:
+        raise
+    except Exception:
+        pass
     try:
         # 审计到人：将发起调用的登录账号+部门透传给 agent，贯穿到其审计/审批
         identity = current_identity(req.headers.get("X-Auth-Token")) if req else {}
@@ -1970,6 +2080,115 @@ async def chat_with_history(req: Request, user_input: str, session_id: Optional[
         return result
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/agent/chat/stream")
+async def chat_stream(req: Request, user_input: str, session_id: Optional[str] = None, input_source: str = "user_input"):
+    """AI 问答"思考中"流式接口：SSE 逐节点实时推送推理步骤，完成后推送最终回复。
+
+    - event: thinking  → {"step", "phase", "phase_label", "title", "detail", "node"}
+    - event: done      → {"final_response", "risk_level", "session_id", "thinking_steps", ...}
+    - event: error     → {"message": ...}
+    思考步骤全部来自 LangGraph 真实节点产出，无模拟、不额外消耗 LLM。
+    """
+    identity = current_identity(req.headers.get("X-Auth-Token")) if req else {}
+    user_id = (identity or {}).get("username") or None
+
+    # 应急联动：全局熔断 / 账号封锁 在流式入口拦截
+    try:
+        from governance import get_emergency_center, get_pipl_ledger
+        block_reason = get_emergency_center().reason_blocked(
+            username=user_id, ip=req.client.host if req.client else "")
+        if block_reason:
+            raise HTTPException(status_code=403, detail=block_reason)
+        if user_input:
+            get_pipl_ledger().scan_and_register(
+                user_input, session_id=session_id or "", username=user_id or "", source="chat")
+    except HTTPException:
+        raise
+    except Exception:
+        pass
+
+    def _sse(event_type: str, payload: Any) -> str:
+        return f"event: {event_type}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+    def event_stream():
+        try:
+            # 与同步 run 一致：确保会话存在并归属当前用户
+            if not session_id:
+                gen_session = gov_agent.conversation_manager.create_session(user_id)
+            else:
+                gen_session = gov_agent.conversation_manager.ensure_session(session_id, user_id)
+        except Exception as e:
+            yield _sse("error", {"message": f"会话初始化失败：{e}"})
+            return
+        try:
+            for event_type, payload in gov_agent.run_stream(gen_session, user_input, input_source, user=identity or None):
+                yield _sse(event_type, payload)
+        except Exception as e:
+            yield _sse("error", {"message": str(e)})
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@app.post("/api/agent/file/stream")
+async def file_stream(http_req: Request, request: FileUploadRequest):
+    """附件问答流式接口：识别阶段推送"思考"步骤，之后逐 token 流式输出回答。
+
+    - event: thinking → {"step", "phase", "phase_label", "title", "detail", "node"}
+    - event: content  → {"delta": ...}
+    - event: done     → {"final_response", "risk_level", "session_id", "thinking_steps", ...}
+    - event: error    → {"message": ...}
+    与 /api/agent/chat/stream 同协议，前端复用同一套 SSE 解析。
+    """
+    identity = current_identity(http_req.headers.get("X-Auth-Token")) if http_req else {}
+    user_id = (identity or {}).get("username") or None
+    session_id = request.session_id
+
+    # 应急联动：全局熔断 / 账号封锁 在流式入口拦截
+    try:
+        from governance import get_emergency_center, get_pipl_ledger
+        block_reason = get_emergency_center().reason_blocked(
+            username=user_id, ip=http_req.client.host if http_req.client else "")
+        if block_reason:
+            raise HTTPException(status_code=403, detail=block_reason)
+        if request.user_text:
+            get_pipl_ledger().scan_and_register(
+                request.user_text, session_id=session_id or "", username=user_id or "", source="chat")
+    except HTTPException:
+        raise
+    except Exception:
+        pass
+
+    def _sse(event_type: str, payload: Any) -> str:
+        return f"event: {event_type}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+    def event_stream():
+        try:
+            if not session_id:
+                gen_session = gov_agent.conversation_manager.create_session(user_id)
+            else:
+                gen_session = gov_agent.conversation_manager.ensure_session(session_id, user_id)
+        except Exception as e:
+            yield _sse("error", {"message": f"会话初始化失败：{e}"})
+            return
+        try:
+            for event_type, payload in gov_agent.process_file_message_stream(
+                    gen_session, request.file_data, request.file_type, request.filename,
+                    user_text=request.user_text, user=identity or None):
+                yield _sse(event_type, payload)
+        except Exception as e:
+            yield _sse("error", {"message": str(e)})
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 @app.post("/api/agent/file_upload")
@@ -1982,7 +2201,8 @@ async def upload_file(http_req: Request, request: FileUploadRequest):
         if not session_id:
             session_id = gov_agent.conversation_manager.create_session(user_id)
         result = gov_agent.process_file_message(session_id, request.file_data, request.file_type,
-                                                request.filename, user=identity or None)
+                                                request.filename, user_text=request.user_text,
+                                                user=identity or None)
         return result
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -2055,6 +2275,60 @@ async def rename_session(request: Request, session_id: str, title: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/api/agent/recall_preview")
+async def recall_preview(request: Request, session_id: str, message_id: int):
+    """撤回确认预览：返回撤回该消息时会删除哪些内容（含连带消息与涉及的文件/图片附件）。
+
+    撤回语义为「删除 message_id 及之后所有消息」，此接口据实列出影响面，
+    供前端弹确认框展示（仿 agent 的"执行前告知影响面"体验）。
+    """
+    err = _assert_session_owner(request, session_id)
+    if err:
+        raise HTTPException(status_code=404 if err == "会话不存在" else 403, detail=err)
+    try:
+        from storage import get_storage
+        storage = get_storage()
+        all_msgs = storage.get_history(session_id)
+        doomed = [m for m in all_msgs if int(m.get("id")) >= int(message_id)]
+        # 目标消息：语义上取待删除集合的第一条（即被点名的那条）
+        target_msg = doomed[0] if doomed else None
+
+        affected_files = []
+        file_count = 0
+        image_count = 0
+        previews = []
+        for m in doomed:
+            mtype = m.get("type") or "text"
+            previews.append({
+                "id": m.get("id"),
+                "role": m.get("role"),
+                "type": mtype,
+                "content": (m.get("content") or ""),
+            })
+            if mtype in ("file", "image"):
+                # 文件名内嵌于 content（"[文件/图片上传] name"），一并作为"涉及文件"列出
+                affected_files.append({
+                    "type": mtype,
+                    "name": (m.get("content") or "").strip(),
+                })
+                if mtype == "file":
+                    file_count += 1
+                else:
+                    image_count += 1
+
+        return {
+            "success": True,
+            "target_message": target_msg,
+            "deleted_count": len(doomed),
+            "deleted_messages": previews,
+            "affected_files": affected_files,
+            "file_count": file_count,
+            "image_count": image_count,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.post("/api/agent/recall_messages")
 async def recall_messages(request: Request, session_id: str, message_id: int):
     """撤回/编辑消息：删除指定消息及之后的所有消息"""
@@ -2065,6 +2339,27 @@ async def recall_messages(request: Request, session_id: str, message_id: int):
         from storage import get_storage
         storage = get_storage()
         deleted = storage.truncate_messages_from(session_id, message_id)
+        history = storage.get_history(session_id)
+        return {
+            "success": True,
+            "deleted_count": deleted,
+            "remaining_messages": len(history),
+            "messages": history
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/agent/delete_message")
+async def delete_message(request: Request, session_id: str, message_id: int):
+    """仅删除单条消息（不影响该条之前/之后的其它消息），与撤回（删该条及之后）区分"""
+    err = _assert_session_owner(request, session_id)
+    if err:
+        raise HTTPException(status_code=404 if err == "会话不存在" else 403, detail=err)
+    try:
+        from storage import get_storage
+        storage = get_storage()
+        deleted = storage.delete_message(session_id, message_id)
         history = storage.get_history(session_id)
         return {
             "success": True,
@@ -2174,6 +2469,47 @@ async def auth_me(request: Request):
     token = request.headers.get("X-Auth-Token")
     user = get_user_by_token(token)
     return {"user": user, "demo_accounts": list_demo_accounts()}
+
+
+@app.put("/api/auth/profile")
+async def auth_profile_update(request: Request, body: dict):
+    """个人中心：修改自己的显示名（昵称）。
+
+    仅允许登录者修改自身 display_name；角色/部门/职位由组织架构管理，个人不可自改。
+    更新成功后返回最新身份，前端据此同步 currentUser 与全局显示。
+    """
+    identity = current_identity(request.headers.get("X-Auth-Token"))
+    if not identity or not identity.get("username"):
+        raise HTTPException(status_code=401, detail="未登录或登录已过期")
+
+    display_name = str((body or {}).get("display_name", "")).strip()
+    if not display_name:
+        raise HTTPException(status_code=422, detail="显示名不能为空")
+    if len(display_name) > 20:
+        raise HTTPException(status_code=422, detail="显示名长度不能超过 20 个字符")
+
+    from storage import get_storage
+    ok = get_storage().update_user_profile(identity["username"], display_name=display_name)
+    if not ok:
+        raise HTTPException(status_code=500, detail="资料保存失败，请稍后重试")
+
+    # 审计到人：记录本人资料修改操作
+    try:
+        audit_logger.create_log(
+            user_id=identity["username"], user_role=identity.get("role") or "user",
+            agent_id="user_profile",
+            action_type="profile_update",
+            action_details={
+                "display_name_old": identity.get("display_name") or "",
+                "display_name_new": display_name,
+                "department": identity.get("department") or "",
+            },
+            risk_level=RiskLevel.NONE,
+        )
+    except Exception:
+        pass  # 审计失败不阻断资料保存
+
+    return {"success": True, "user": get_user_by_token(request.headers.get("X-Auth-Token"))}
 
 
 @app.get("/api/auth/permissions")
@@ -3381,7 +3717,7 @@ async def get_model_config(request: Request):
 
 @app.put("/api/model/config")
 async def set_model_config(request: Request, payload: dict):
-    """更新模型接入配置（仅管理员）：provider/api_key/base_url/model，热生效。"""
+    """更新模型接入配置（仅管理员）：provider/api_key/base_url/model + 备用模型 backup_*，热生效。"""
     if not _admin_guard(request):
         return {"success": False, "error": "无权限：需要系统管理员身份"}
     from llm_runtime import save_config, load_config
@@ -3389,11 +3725,26 @@ async def set_model_config(request: Request, payload: dict):
     api_key = payload.get("api_key")          # None=不修改 / ''=清除覆盖 Key
     base_url = payload.get("base_url")
     model = payload.get("model")
+    backup_provider = payload.get("backup_provider")       # None=不修改
+    backup_api_key = payload.get("backup_api_key")          # None=不修改 / ''=清除备用 Key
+    backup_base_url = payload.get("backup_base_url")
+    backup_model = payload.get("backup_model")
     if provider not in (None, "zhipu", "openai"):
         raise HTTPException(status_code=400, detail="provider 仅支持 zhipu / openai")
     if base_url is not None and not base_url.startswith(("http://", "https://")):
         raise HTTPException(status_code=400, detail="base_url 需以 http(s):// 开头")
-    saved = save_config(provider or "zhipu", api_key, base_url or "", model or "")
+    if backup_provider not in (None, "zhipu", "openai"):
+        raise HTTPException(status_code=400, detail="backup_provider 仅支持 zhipu / openai")
+    if backup_base_url is not None and backup_base_url and not backup_base_url.startswith(("http://", "https://")):
+        raise HTTPException(status_code=400, detail="backup_base_url 需以 http(s):// 开头")
+    try:
+        saved = save_config(provider or "zhipu", api_key, base_url or "", model or "",
+                            backup_provider=backup_provider, backup_api_key=backup_api_key,
+                            backup_base_url=backup_base_url or "", backup_model=backup_model)
+    except RuntimeError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"模型配置保存失败：{e}")
     # 热生效：分类层 + 对话主链立即使用新接入参数（无需重启）
     input_detector.llm_classifier.apply_runtime(saved)
     gov_agent.refresh_llm(saved)
@@ -3415,6 +3766,19 @@ async def test_model_config(request: Request, payload: dict):
     if not ok:
         raise HTTPException(status_code=400, detail=detail)
     return {"success": True, "detail": detail}
+
+
+# ==================== 可观测性大盘（S1：运维指标只读端点） ====================
+
+@app.get("/api/metrics")
+async def get_metrics(request: Request):
+    """运维指标快照：HTTP/检测/LLM 三组计数 + 24h 分钟趋势。
+
+    - 只读：登录 + system.view（见 _PROTECTED_ROUTES），熔断期间放行（见只读前缀白名单）
+    - 多 worker 下返回 worker_pid，为当前 worker 进程视图
+    """
+    from metrics_collector import get_metrics_collector
+    return get_metrics_collector().snapshot()
 
 
 # ==================== 站内通知 & 外部通知渠道（P1-4） ====================
@@ -3491,6 +3855,83 @@ async def test_webhook_config(request: Request, payload: dict):
     if not ok:
         raise HTTPException(status_code=400, detail=detail)
     return {"success": True, "detail": detail}
+
+
+# ==================== 应急通知通道（飞书机器人 / SMTP 邮件） ====================
+
+@app.get("/api/notifications/channels")
+async def get_notify_channels(request: Request):
+    """查询全部通知通道配置（仅管理员；SMTP 密码脱敏返回）。"""
+    if not _admin_guard(request):
+        return {"success": False, "error": "无权限：需要系统管理员身份"}
+    from notify_webhook import load_channels
+    channels = load_channels()
+    if channels["smtp"].get("smtp_password"):
+        channels["smtp"]["smtp_password"] = "******"
+    return {"success": True, "channels": channels}
+
+
+@app.put("/api/notifications/channels/{name}")
+async def set_notify_channel(name: str, request: Request, payload: dict):
+    """配置某一通知通道（webhook | lark | smtp），仅管理员。"""
+    if not _admin_guard(request):
+        return {"success": False, "error": "无权限：需要系统管理员身份"}
+    from notify_webhook import save_channel
+    if name not in ("webhook", "lark", "smtp"):
+        raise HTTPException(status_code=400, detail="通道仅支持 webhook/lark/smtp")
+    if name in ("webhook", "lark"):
+        url = str(payload.get("url", "")).strip()
+        enabled = bool(payload.get("enabled", False))
+        if enabled and not url.startswith(("http://", "https://")):
+            raise HTTPException(status_code=400, detail="Webhook 地址需以 http(s):// 开头")
+        save_channel(name, {"url": url, "enabled": enabled})
+        return {"success": True, "channel": name, "config": {"url": url, "enabled": enabled}}
+    save_channel("smtp", {
+        "smtp_host": str(payload.get("smtp_host", "")).strip(),
+        "smtp_port": int(payload.get("smtp_port", 465) or 465),
+        "smtp_user": str(payload.get("smtp_user", "")).strip(),
+        "smtp_password": str(payload.get("smtp_password", "")).strip(),
+        "from_addr": str(payload.get("from_addr", "")).strip(),
+        "to_addrs": list(payload.get("to_addrs", []) or []),
+        "use_ssl": bool(payload.get("use_ssl", True)),
+        "enabled": bool(payload.get("enabled", False)),
+    })
+    return {"success": True, "channel": "smtp"}
+
+
+@app.post("/api/notifications/channels/{name}/test")
+async def test_notify_channel(name: str, request: Request, payload: dict):
+    """测试通知通道连通性（仅管理员）。webhook/lark 传 url；smtp 传邮件参数。"""
+    if not _admin_guard(request):
+        return {"success": False, "error": "无权限：需要系统管理员身份"}
+    if name not in ("webhook", "lark", "smtp"):
+        raise HTTPException(status_code=400, detail="通道仅支持 webhook/lark/smtp")
+    try:
+        if name in ("webhook", "lark"):
+            from notify_webhook import test_webhook, test_lark
+            url = str(payload.get("url", "")).strip()
+            if not url.startswith(("http://", "https://")):
+                raise HTTPException(status_code=400, detail="请输入有效的 http(s) 地址")
+            fn = test_webhook if name == "webhook" else test_lark
+            ok, detail = fn(url)
+        else:
+            from notify_webhook import test_smtp
+            ok, detail = test_smtp({
+                "smtp_host": str(payload.get("smtp_host", "")).strip(),
+                "smtp_port": int(payload.get("smtp_port", 465) or 465),
+                "smtp_user": str(payload.get("smtp_user", "")).strip(),
+                "smtp_password": str(payload.get("smtp_password", "")).strip(),
+                "from_addr": str(payload.get("from_addr", "")).strip(),
+                "to_addrs": list(payload.get("to_addrs", []) or []),
+                "use_ssl": bool(payload.get("use_ssl", True)),
+            })
+        if not ok:
+            raise HTTPException(status_code=400, detail=detail or "发送失败")
+        return {"success": True, "detail": detail}
+    except HTTPException:
+        raise
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail=str(e)[:180])
 
 
 # ==================== 系统自检与数据维护（运维视角） ====================
@@ -3584,12 +4025,47 @@ async def ws_status():
 
 @app.get("/api/kb/status")
 def kb_status():
-    """知识库索引状态（用于前端展示语料规模与就绪度）"""
-    from knowledge.rag_engine import get_kb
+    """知识库索引状态（用于前端展示语料规模与就绪度，含文档清单）"""
+    from knowledge.rag_engine import get_kb, KnowledgeBase
     try:
-        return {"success": True, "kb": get_kb().stats()}
+        return {"success": True, "kb": get_kb().stats(), "documents": KnowledgeBase.list_documents()}
     except Exception as e:  # noqa: BLE001
-        return {"success": False, "error": str(e), "kb": {"ready": False}}
+        return {"success": False, "error": str(e), "kb": {"ready": False}, "documents": []}
+
+
+@app.post("/api/kb/upload")
+async def kb_upload(payload: dict):
+    """上传一份知识文档（.md/.txt）到语料目录并重建索引"""
+    from knowledge.rag_engine import get_kb, KnowledgeBase
+    filename = str(payload.get("filename", "")).strip()
+    content = str(payload.get("content", ""))
+    if not filename:
+        return {"success": False, "error": "缺少文件名", "documents": KnowledgeBase.list_documents()}
+    try:
+        name = KnowledgeBase.add_document(filename, content)
+        get_kb().rebuild()
+        return {"success": True, "document": name, "kb": get_kb().stats(), "documents": KnowledgeBase.list_documents()}
+    except ValueError as e:
+        return {"success": False, "error": str(e), "documents": KnowledgeBase.list_documents()}
+    except Exception as e:  # noqa: BLE001
+        return {"success": False, "error": f"上传失败：{e}", "documents": KnowledgeBase.list_documents()}
+
+
+@app.post("/api/kb/delete_document")
+async def kb_delete_document(payload: dict):
+    """删除一份知识文档并重建索引"""
+    from knowledge.rag_engine import get_kb, KnowledgeBase
+    filename = str(payload.get("filename", "")).strip()
+    if not filename:
+        return {"success": False, "error": "缺少文件名", "documents": KnowledgeBase.list_documents()}
+    try:
+        KnowledgeBase.remove_document(filename)
+        get_kb().rebuild()
+        return {"success": True, "document": filename, "kb": get_kb().stats(), "documents": KnowledgeBase.list_documents()}
+    except (ValueError, FileNotFoundError) as e:
+        return {"success": False, "error": str(e), "documents": KnowledgeBase.list_documents()}
+    except Exception as e:  # noqa: BLE001
+        return {"success": False, "error": f"删除失败：{e}", "documents": KnowledgeBase.list_documents()}
 
 
 @app.post("/api/kb/search")
@@ -3621,3 +4097,171 @@ def kb_rebuild():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8080)
+
+
+# ==================== 治理中心：应急联动 / 开放生态 / PIPL / 合规报告 ====================
+
+def _operator(req: Request) -> str:
+    return (current_identity(req.headers.get("X-Auth-Token")) or {}).get("username") or "system"
+
+
+@app.get("/api/emergency/status")
+def emergency_status():
+    from governance import get_emergency_center
+    return {"success": True, **get_emergency_center().status()}
+
+
+@app.post("/api/emergency/engage")
+async def emergency_engage(req: Request, payload: dict):
+    from governance import get_emergency_center
+    return get_emergency_center().engage(str(payload.get("reason", "")), _operator(req))
+
+
+@app.post("/api/emergency/disengage")
+async def emergency_disengage(req: Request):
+    from governance import get_emergency_center
+    return get_emergency_center().disengage(_operator(req))
+
+
+@app.post("/api/emergency/block_user")
+async def emergency_block_user(req: Request, payload: dict):
+    from governance import get_emergency_center
+    return get_emergency_center().block_user(str(payload.get("username", "")).strip(),
+                                             str(payload.get("reason", "")), _operator(req))
+
+
+@app.post("/api/emergency/unblock_user")
+async def emergency_unblock_user(req: Request, payload: dict):
+    from governance import get_emergency_center
+    return get_emergency_center().unblock_user(str(payload.get("username", "")).strip(), _operator(req))
+
+
+@app.post("/api/emergency/block_ip")
+async def emergency_block_ip(req: Request, payload: dict):
+    from governance import get_emergency_center
+    return get_emergency_center().block_ip(str(payload.get("ip", "")).strip(),
+                                           str(payload.get("reason", "")), _operator(req))
+
+
+@app.post("/api/emergency/unblock_ip")
+async def emergency_unblock_ip(req: Request, payload: dict):
+    from governance import get_emergency_center
+    return get_emergency_center().unblock_ip(str(payload.get("ip", "")).strip(), _operator(req))
+
+
+# ---- 开放生态管理（管理端）----
+@app.get("/api/ecosystem/clients")
+def ecosystem_clients():
+    from governance import get_openapi_manager
+    m = get_openapi_manager()
+    return {"success": True, "clients": m.list_clients(), **m.stats()}
+
+
+@app.post("/api/ecosystem/create")
+async def ecosystem_create(req: Request, payload: dict):
+    from governance import get_openapi_manager
+    return get_openapi_manager().create(
+        str(payload.get("name", "")).strip(), int(payload.get("rate_limit", 60)),
+        int(payload.get("quota", 0)), str(payload.get("description", "")), _operator(req))
+
+
+@app.post("/api/ecosystem/toggle")
+async def ecosystem_toggle(req: Request, payload: dict):
+    from governance import get_openapi_manager
+    return get_openapi_manager().toggle(str(payload.get("client_id", "")).strip(),
+                                        bool(payload.get("enabled")))
+
+
+@app.post("/api/ecosystem/delete")
+async def ecosystem_delete(req: Request, payload: dict):
+    from governance import get_openapi_manager
+    return get_openapi_manager().delete(str(payload.get("client_id", "")).strip())
+
+
+@app.get("/api/ecosystem/logs")
+def ecosystem_logs(limit: int = 100):
+    from governance import get_openapi_manager
+    return {"success": True, "logs": get_openapi_manager().log_calls(limit)}
+
+
+# ---- 开放生态：受保护示例接口（演示 Token 鉴权 + 限流配额 + 调用留痕）----
+@app.post("/api/open/chat")
+async def open_chat(req: Request, payload: dict):
+    from governance import get_openapi_manager, get_emergency_center
+    m = get_openapi_manager()
+    token = req.headers.get("X-Client-Token", "")
+    ip = req.client.host if req.client else ""
+    client, status = m.authenticate(token, "/api/open/chat", ip)
+    if status != 200:
+        reason = {401: "未授权：无效或缺失 X-Client-Token",
+                  403: "调用方已被停用", 402: "配额已用尽", 429: "超出限流（60s 窗口）"}.get(status, "拒绝")
+        m.storage.record_api_call(client["client_id"] if client else "-", client["name"] if client else "-",
+                                  "/api/open/chat", status, ip)
+        return {"success": False, "code": status, "error": reason}
+    # 应急联动：对外开放入口同样受全局熔断约束
+    reason = get_emergency_center().reason_blocked(username=client["client_id"], ip=ip)
+    if reason:
+        return {"success": False, "code": 403, "error": reason}
+    question = str(payload.get("question", "")).strip()
+    if not question:
+        return {"success": False, "error": "缺少 question 参数"}
+    return {"success": True, "client": {"client_id": client["client_id"], "name": client["name"]},
+            "echo": f"已收到调用方「{client['name']}」的提问：{question}"}
+
+
+# ---- PIPL 合规台账 ----
+@app.get("/api/pipl/records")
+def pipl_records():
+    from governance import get_pipl_ledger
+    mgr = get_pipl_ledger()
+    return {"success": True, "records": mgr.records(), **mgr.stats()}
+
+
+@app.post("/api/pipl/update")
+async def pipl_update(req: Request, payload: dict):
+    from governance import get_pipl_ledger
+    ok = get_pipl_ledger().update(
+        int(payload.get("id", 0)), str(payload.get("legal_basis", "")),
+        str(payload.get("assessment", "pending")), _operator(req))
+    return ok if ok else {"success": False, "error": "更新失败"}
+
+
+@app.post("/api/pipl/scan")
+async def pipl_scan(req: Request, payload: dict):
+    from governance import get_pipl_ledger
+    return get_pipl_ledger().scan_and_register(
+        str(payload.get("text", "")), str(payload.get("session_id", "")),
+        _operator(req), source=str(payload.get("source", "manual")))
+
+
+@app.get("/api/pipl/export")
+async def pipl_export(req: Request, fmt: str = "csv"):
+    """导出合规台账（CSV/JSON，仅含脱敏值），并审计留痕到真实操作人。"""
+    if fmt not in ("csv", "json"):
+        raise HTTPException(status_code=400, detail="fmt 仅支持 csv/json")
+    actor = _operator(req)
+    actor = actor or (current_identity(req.headers.get("X-Auth-Token")) or {}).get("username", "")
+    from governance import get_pipl_ledger
+    from audit.audit_logger import AuditLogger
+    result = get_pipl_ledger().export(fmt=fmt)
+    # 审计联动：台账导出属敏感操作，须记录谁在何时导出了多少条
+    try:
+        AuditLogger().create_log(
+            user_id=actor or "unknown", user_role="admin", agent_id="pipl",
+            action_type="pipl_export", action_details={"fmt": fmt, "count": result["count"]},
+            risk_level="medium", is_blocked=False,
+        )
+    except Exception as e:  # noqa: BLE001
+        pass
+    return result
+
+
+# ---- 合规对标报告 ----
+@app.get("/api/compliance/report")
+def compliance_report(fmt: str = "json"):
+    from audit.compliance_report import ComplianceReportGenerator
+    gen = ComplianceReportGenerator()
+    report = gen.generate(fmt=fmt)
+    if fmt in ("html", "markdown", "md"):
+        return {"success": True, "fmt": fmt, "content": report}
+    return {"success": True, "fmt": "json", "data": report}

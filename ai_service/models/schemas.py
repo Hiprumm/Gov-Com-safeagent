@@ -84,6 +84,7 @@ class FileUploadRequest(BaseModel):
     file_type: str
     filename: str
     session_id: Optional[str] = None
+    user_text: Optional[str] = None
 
 
 class ToolCallRequest(BaseModel):
