@@ -189,7 +189,9 @@ _PROTECTED_ROUTES: List[tuple] = [
     ("POST", "/api/security/pssu/assess", "security.scan"),
     ("POST", "/api/scenarios/", "security.scan"),
     ("POST", "/api/replay/", "security.scan"),
-    # ---- 会话管理（用户操作）----
+    # ---- 会话管理（用户操作；含查询：会话/历史按登录用户隔离）----
+    ("GET", "/api/agent/sessions", "login"),
+    ("GET", "/api/agent/history", "login"),
     ("POST", "/api/agent/new_session", "login"),
     ("POST", "/api/agent/clear_session", "login"),
     ("POST", "/api/agent/delete_session", "login"),
@@ -1961,11 +1963,12 @@ async def chat_with_history(req: Request, user_input: str, session_id: Optional[
 @app.post("/api/agent/file_upload")
 async def upload_file(http_req: Request, request: FileUploadRequest):
     try:
-        session_id = request.session_id
-        if not session_id:
-            session_id = gov_agent.conversation_manager.create_session()
         # 审计到人：解析登录账号透传给 agent 处理
         identity = current_identity(http_req.headers.get("X-Auth-Token")) if http_req else {}
+        user_id = (identity or {}).get("username") or None
+        session_id = request.session_id
+        if not session_id:
+            session_id = gov_agent.conversation_manager.create_session(user_id)
         result = gov_agent.process_file_message(session_id, request.file_data, request.file_type,
                                                 request.filename, user=identity or None)
         return result
@@ -1974,7 +1977,10 @@ async def upload_file(http_req: Request, request: FileUploadRequest):
 
 
 @app.get("/api/agent/history")
-async def get_conversation_history(session_id: str):
+async def get_conversation_history(request: Request, session_id: str):
+    err = _assert_session_owner(request, session_id)
+    if err:
+        raise HTTPException(status_code=404 if err == "会话不存在" else 403, detail=err)
     try:
         result = gov_agent.get_conversation_history(session_id)
         return result
@@ -1983,16 +1989,21 @@ async def get_conversation_history(session_id: str):
 
 
 @app.post("/api/agent/new_session")
-async def create_new_session():
+async def create_new_session(request: Request):
+    identity = current_identity(request.headers.get("X-Auth-Token")) or {}
+    user_id = identity.get("username") or None
     try:
-        result = gov_agent.create_new_session()
+        result = gov_agent.create_new_session(user_id)
         return result
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/api/agent/clear_session")
-async def clear_conversation(session_id: str):
+async def clear_conversation(request: Request, session_id: str):
+    err = _assert_session_owner(request, session_id)
+    if err:
+        raise HTTPException(status_code=404 if err == "会话不存在" else 403, detail=err)
     try:
         result = gov_agent.clear_conversation(session_id)
         return result
@@ -2001,8 +2012,11 @@ async def clear_conversation(session_id: str):
 
 
 @app.post("/api/agent/delete_session")
-async def delete_conversation(session_id: str):
+async def delete_conversation(request: Request, session_id: str):
     """删除整个历史会话（会话记录及全部消息）"""
+    err = _assert_session_owner(request, session_id)
+    if err:
+        raise HTTPException(status_code=404 if err == "会话不存在" else 403, detail=err)
     try:
         result = gov_agent.delete_session(session_id)
         return result
@@ -2011,8 +2025,11 @@ async def delete_conversation(session_id: str):
 
 
 @app.post("/api/agent/rename_session")
-async def rename_session(session_id: str, title: str):
+async def rename_session(request: Request, session_id: str, title: str):
     """重命名历史会话（title 传空字符串恢复为未命名）"""
+    err = _assert_session_owner(request, session_id)
+    if err:
+        raise HTTPException(status_code=404 if err == "会话不存在" else 403, detail=err)
     try:
         if len(title) > 100:
             raise HTTPException(status_code=400, detail="会话标题过长（上限 100 字符）")
@@ -2027,8 +2044,11 @@ async def rename_session(session_id: str, title: str):
 
 
 @app.post("/api/agent/recall_messages")
-async def recall_messages(session_id: str, message_id: int):
+async def recall_messages(request: Request, session_id: str, message_id: int):
     """撤回/编辑消息：删除指定消息及之后的所有消息"""
+    err = _assert_session_owner(request, session_id)
+    if err:
+        raise HTTPException(status_code=404 if err == "会话不存在" else 403, detail=err)
     try:
         from storage import get_storage
         storage = get_storage()
@@ -2045,9 +2065,12 @@ async def recall_messages(session_id: str, message_id: int):
 
 
 @app.get("/api/agent/sessions")
-async def list_sessions():
+async def list_sessions(request: Request):
+    # 账户会话隔离：仅返回当前登录用户自己的会话
+    identity = current_identity(request.headers.get("X-Auth-Token")) or {}
+    user_id = identity.get("username") or None
     try:
-        result = gov_agent.list_sessions()
+        result = gov_agent.list_sessions(user_id)
         return result
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -2327,6 +2350,24 @@ def _login_guard(request: Request):
     用于系统配置类端点，避免匿名访客读写/破坏系统级配置与数据。
     """
     return current_identity(request.headers.get("X-Auth-Token")) or None
+
+
+def _assert_session_owner(request: Request, session_id: str) -> str:
+    """校验会话归属：仅会话所有者可操作，返回错误信息（空串表示通过）。
+
+    账户数据独立分离：智能问答会话属用户隐私数据，即使是系统管理员也仅能访问
+    自己的会话，不得查看/操作他人会话。迁移前无主会话（user_id 为空）视为不可归属，拒绝操作。
+    """
+    identity = current_identity(request.headers.get("X-Auth-Token")) or {}
+    username = identity.get("username")
+    if not username:
+        return "未登录"
+    s = gov_agent.conversation_manager.storage.get_session(session_id)
+    if not s:
+        return "会话不存在"
+    if s.get("user_id") != username:
+        return "无权操作他人会话"
+    return ""
 
 
 def _pw_fields(password: str):

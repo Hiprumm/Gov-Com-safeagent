@@ -83,6 +83,7 @@ _SCHEMA_STATEMENTS = [
     )""",
     """CREATE TABLE IF NOT EXISTS sessions (
         session_id TEXT PRIMARY KEY,
+        user_id TEXT,
         title TEXT,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL,
@@ -371,26 +372,26 @@ class PostgresStorage:
                 return [self._row_to_dict(r) for r in rows]
 
     # ==================== 会话管理 ====================
-    def create_session(self) -> str:
+    def create_session(self, user_id: str = None) -> str:
         session_id = str(uuid.uuid4())
         now = datetime.now().isoformat()
         with self._lock:
             with self._get_conn() as conn:
                 conn.execute(
-                    "INSERT INTO sessions (session_id, created_at, updated_at) VALUES (%s,%s,%s)",
-                    (session_id, now, now),
+                    "INSERT INTO sessions (session_id, user_id, created_at, updated_at) VALUES (%s,%s,%s,%s)",
+                    (session_id, user_id, now, now),
                 )
         return session_id
 
-    def ensure_session(self, session_id: str) -> str:
+    def ensure_session(self, session_id: str, user_id: str = None) -> str:
         if not session_id:
-            return self.create_session()
+            return self.create_session(user_id)
         now = datetime.now().isoformat()
         with self._lock:
             with self._get_conn() as conn:
                 conn.execute(
-                    "INSERT INTO sessions (session_id, created_at, updated_at) VALUES (%s,%s,%s) ON CONFLICT (session_id) DO NOTHING",
-                    (session_id, now, now),
+                    "INSERT INTO sessions (session_id, user_id, created_at, updated_at) VALUES (%s,%s,%s,%s) ON CONFLICT (session_id) DO NOTHING",
+                    (session_id, user_id, now, now),
                 )
         return session_id
 
@@ -415,11 +416,17 @@ class PostgresStorage:
             ).fetchall()
         return [dict(r) for r in rows]
 
-    def list_sessions(self) -> List[Dict[str, Any]]:
+    def list_sessions(self, user_id: str = None) -> List[Dict[str, Any]]:
         with self._get_conn() as conn:
-            rows = conn.execute(
-                "SELECT session_id, title, created_at, updated_at, message_count FROM sessions WHERE message_count > 0 ORDER BY updated_at DESC"
-            ).fetchall()
+            if user_id:
+                rows = conn.execute(
+                    "SELECT session_id, title, created_at, updated_at, message_count FROM sessions WHERE message_count > 0 AND user_id = %s ORDER BY updated_at DESC",
+                    (user_id,),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT session_id, title, created_at, updated_at, message_count FROM sessions WHERE message_count > 0 ORDER BY updated_at DESC"
+                ).fetchall()
         return [dict(r) for r in rows]
 
     def cleanup_empty_sessions(self) -> int:
@@ -431,7 +438,7 @@ class PostgresStorage:
     def get_session(self, session_id: str) -> Optional[Dict[str, Any]]:
         with self._get_conn() as conn:
             row = conn.execute(
-                "SELECT session_id, title, created_at, updated_at, message_count FROM sessions WHERE session_id = %s",
+                "SELECT session_id, user_id, title, created_at, updated_at, message_count FROM sessions WHERE session_id = %s",
                 (session_id,),
             ).fetchone()
         return dict(row) if row else None

@@ -439,8 +439,11 @@ st, d = call("GET", "/api/security/tool_management/status")
 cur = d.get("enabled") if isinstance(d, dict) else True
 st, d = call("POST", "/api/security/tool_management/toggle", token=admin_tk, body={"enabled": bool(cur)})
 check("L5 admin 可操作工具管控（原值回写）", st == 200 and d.get("enabled") == bool(cur), (st, d))
-st, d = call("POST", "/api/agent/delete_session?session_id=qa_probe_none", token=admin_tk)
-check("L6 登录后可管理会话", st == 200, (st, str(d)[:100]))
+# 会话隔离后：登录用户仅能管理自己的会话。新建归属自己的会话再删除，应返回 200。
+st, d = call("POST", "/api/agent/new_session", token=admin_tk)
+_sid = d.get("session_id") if isinstance(d, dict) else ""
+st, d = call("POST", f"/api/agent/delete_session?session_id={_sid}", token=admin_tk)
+check("L6 登录后可管理（自己的）会话", st == 200, (st, str(d)[:100]))
 
 # ==================== H. 登录锁定（独立账号：登录失败计数在进程内存，跨运行会残留） ====================
 call("DELETE", "/api/admin/users/qa_lock_probe", token=admin_tk)

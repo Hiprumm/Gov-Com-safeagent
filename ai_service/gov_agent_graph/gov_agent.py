@@ -27,17 +27,18 @@ class ConversationManager:
     def __init__(self):
         self.storage = get_storage()
 
-    def create_session(self) -> str:
-        return self.storage.create_session()
+    def create_session(self, user_id: str = None) -> str:
+        return self.storage.create_session(user_id)
 
-    def ensure_session(self, session_id: str) -> str:
+    def ensure_session(self, session_id: str, user_id: str = None) -> str:
         """确保 session_id 存在，不存在则创建（保留外部传入 ID）。
 
         走存储后端的统一幂等方法，兼容 SQLite / PostgreSQL。
+        新会话绑定 user_id（账户会话隔离）。
         """
         if not session_id:
-            return self.storage.create_session()
-        return self.storage.ensure_session(session_id)
+            return self.storage.create_session(user_id)
+        return self.storage.ensure_session(session_id, user_id)
 
     def add_message(self, session_id: str, role: str, content: str, message_type: str = 'text'):
         self.storage.add_message(session_id, role, content, message_type)
@@ -48,8 +49,8 @@ class ConversationManager:
     def clear_session(self, session_id: str):
         self.storage.clear_session(session_id)
 
-    def list_sessions(self) -> List[Dict[str, Any]]:
-        return self.storage.list_sessions()
+    def list_sessions(self, user_id: str = None) -> List[Dict[str, Any]]:
+        return self.storage.list_sessions(user_id)
 
     def delete_session(self, session_id: str):
         self.storage.delete_session(session_id)
@@ -1448,11 +1449,13 @@ class GovAgent:
     
     def run(self, user_input: str, input_source: str = "user_input", session_id: Optional[str] = None,
             user: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        # 会话归属当前登录用户：新会话/首次落库时绑定 user_id，实现账户会话隔离
+        user_id = (user or {}).get("username") or None
         if not session_id:
-            session_id = self.conversation_manager.create_session()
+            session_id = self.conversation_manager.create_session(user_id)
         else:
             # 外部传入的 session_id 可能尚未在 DB 中创建，确保存在以避免外键失败
-            session_id = self.conversation_manager.ensure_session(session_id)
+            session_id = self.conversation_manager.ensure_session(session_id, user_id)
 
         return self.run_with_history(session_id, user_input, input_source, user=user)
 
@@ -1494,8 +1497,8 @@ class GovAgent:
             "count": len(history)
         }
     
-    def create_new_session(self) -> Dict[str, Any]:
-        session_id = self.conversation_manager.create_session()
+    def create_new_session(self, user_id: str = None) -> Dict[str, Any]:
+        session_id = self.conversation_manager.create_session(user_id)
         return {
             "session_id": session_id,
             "message": "新会话已创建"
@@ -1508,8 +1511,8 @@ class GovAgent:
             "message": "会话历史已清除"
         }
     
-    def list_sessions(self) -> Dict[str, Any]:
-        sessions = self.conversation_manager.list_sessions()
+    def list_sessions(self, user_id: str = None) -> Dict[str, Any]:
+        sessions = self.conversation_manager.list_sessions(user_id)
         return {
             "sessions": sessions,
             "count": len(sessions)
