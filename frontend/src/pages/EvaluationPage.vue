@@ -462,7 +462,8 @@ const printReport = () => {
 </script>
 
 <template>
-  <div class="eval-page" :style="{ background: PAGE_BG, minHeight: '100vh', color: TEXT_BRIGHT }">
+  <!-- 独立路由页：#app 全局 overflow-hidden，需在页面容器内滚动 -->
+  <div class="eval-page" :style="{ background: PAGE_BG, height: '100%', overflowY: 'auto', color: TEXT_BRIGHT }">
     <!-- ========== Header ========== -->
     <header :style="{ background: 'linear-gradient(135deg, #1e293b 0%, #0f172a 100%)', borderBottom: '1px solid #334155' }">
       <div class="max-w-7xl mx-auto px-4 py-5 flex items-center justify-between">

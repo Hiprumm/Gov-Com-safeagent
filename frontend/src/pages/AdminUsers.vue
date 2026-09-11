@@ -181,7 +181,9 @@ const statCards = computed(() => [
 </script>
 
 <template>
-  <div class="min-h-screen bg-canvas text-primary">
+  <!-- 独立路由页依赖自身滚动：#app 全局 overflow-hidden（为主工作台 h-full 布局服务），
+       故此处用 h-full + overflow-y-auto 在页面容器内滚动，避免后台管理页无法下滑 -->
+  <div class="h-full overflow-y-auto bg-canvas text-primary">
     <!-- 顶栏 -->
     <header class="sticky top-0 z-20 border-b border-border-default bg-surface/90 backdrop-blur">
       <div class="max-w-[1200px] mx-auto px-4 sm:px-6 h-14 flex items-center gap-3">
