@@ -76,6 +76,30 @@ const metrics = computed(() => report.value?.metrics ?? null)
 const classification = computed(() => report.value?.classification ?? null)
 const generatedAt = computed(() => report.value?.generated_at ?? '')
 
+// 生成/重新生成评测报告（后台异步，轮询状态完成后刷新）
+const generating = ref(false)
+const generateReport = async () => {
+  if (generating.value) return
+  try {
+    const r = await axios.post('/api/evaluation/generate')
+    if (!r.data?.success) { window.alert(r.data?.error || '生成失败'); return }
+    generating.value = true
+    const poll = setInterval(async () => {
+      try {
+        const { data: st } = await axios.get('/api/evaluation/status')
+        if (!st.running) {
+          clearInterval(poll)
+          generating.value = false
+          const { data } = await axios.get('/api/evaluation/report')
+          report.value = data
+        }
+      } catch { /* 轮询容错 */ }
+    }, 5000)
+  } catch (e: any) {
+    window.alert(e.response?.data?.error || e.response?.data?.detail || '生成失败')
+  }
+}
+
 // Attack-type list sorted by total sample count (desc), "normal" excluded
 const attackTypesSorted = computed(() => {
   if (!classification.value?.by_type) return []
@@ -477,6 +501,11 @@ const printReport = () => {
           </div>
         </div>
         <div :style="{ display: 'flex', alignItems: 'center', gap: '10px', flexWrap: 'wrap' }">
+          <button
+            @click="generateReport"
+            :disabled="generating"
+            :style="{ padding: '8px 14px', background: generating ? '#334155' : '#7c3aed', color: '#e9d5ff', borderRadius: '8px', fontSize: '14px', fontWeight: 500, border: '1px solid #8b5cf6', cursor: generating ? 'not-allowed' : 'pointer' }"
+          >{{ generating ? '生成中…' : '生成报告' }}</button>
           <button
             v-if="report"
             @click="downloadMarkdown"

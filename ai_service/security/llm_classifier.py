@@ -159,7 +159,7 @@ class LLMClassifier:
         # LLM 结果缓存：同文本不重复调 API（temperature=0.1 判定基本稳定）
         # 生产场景常见重复输入（常见问题/模板化请求），命中时延迟从 ~2s 降到 ~0ms
         self._cache: dict = {}
-        self._cache_max = 512
+        self._cache_max = 2048
         self._cache_hits = 0
         self._cache_misses = 0
 
@@ -266,9 +266,11 @@ class LLMClassifier:
             logger.exception("LLM 分类异常，回退到本地启发式检测")
             verdict = self._local_heuristic_check(text)
 
-        # 缓存写入（容量超限时整体清空，简化 LRU）
+        # 缓存写入（容量超限时按插入序淘汰最旧 1/4，近似 LRU，提升重复输入命中率）
         if len(self._cache) >= self._cache_max:
-            self._cache.clear()
+            evict = max(1, self._cache_max // 4)
+            for k in list(self._cache.keys())[:evict]:
+                self._cache.pop(k, None)
         self._cache[cache_key] = verdict
         return verdict
 

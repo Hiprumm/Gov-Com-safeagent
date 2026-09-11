@@ -165,6 +165,31 @@ const addDept = async () => {
   }
 }
 
+const renameDept = async (oldName: string) => {
+  const newName = window.prompt(`重命名部门「${oldName}」为：`, oldName)
+  if (!newName?.trim() || newName.trim() === oldName) return
+  try {
+    const r = await axios.put('/api/admin/departments', { old_name: oldName, new_name: newName.trim() })
+    if (!r.data?.success) return toast.error(r.data?.error || '操作失败')
+    toast.success(r.data.message || '已重命名')
+    load()
+  } catch (e: any) {
+    toast.error(e.response?.data?.detail || e.response?.data?.error || '操作失败')
+  }
+}
+
+const delDept = async (name: string) => {
+  if (!window.confirm(`确定删除部门「${name}」吗？该部门下用户的部门归属将置空。`)) return
+  try {
+    const r = await axios.delete('/api/admin/departments', { params: { name } })
+    if (!r.data?.success) return toast.error(r.data?.error || '操作失败')
+    toast.success(r.data.message || '已删除')
+    load()
+  } catch (e: any) {
+    toast.error(e.response?.data?.detail || e.response?.data?.error || '操作失败')
+  }
+}
+
 const roleColor = (r: string) => ({
   admin: 'bg-medium/15 text-medium',
   operator: 'bg-accent/15 text-accent',
@@ -279,7 +304,11 @@ const statCards = computed(() => [
               <button @click="addDept" class="text-xs text-accent hover:underline">＋新增</button>
             </div>
             <div class="flex flex-wrap gap-1.5">
-              <span v-for="d in departments" :key="d" class="text-[11px] px-2 py-1 rounded-full bg-elevated border border-border-default text-secondary">{{ d }}</span>
+              <span v-for="d in departments" :key="d" class="group inline-flex items-center gap-1 text-[11px] px-2 py-1 rounded-full bg-elevated border border-border-default text-secondary">
+                {{ d }}
+                <button @click="renameDept(d)" class="hidden group-hover:inline text-accent hover:underline" title="重命名">改</button>
+                <button @click="delDept(d)" class="hidden group-hover:inline text-critical hover:underline" title="删除">删</button>
+              </span>
               <span v-if="!departments.length" class="text-xs text-muted">暂未录入部门</span>
             </div>
           </div>

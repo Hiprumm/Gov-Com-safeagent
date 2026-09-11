@@ -693,10 +693,39 @@ class Storage:
                     return False
 
     def remove_department(self, name: str) -> bool:
+        """删除部门；该部门下用户的 department 置空（避免悬挂引用，保持数据范围收敛一致）。"""
         with self._lock:
             with self._get_conn() as conn:
                 cur = conn.execute("DELETE FROM sys_departments WHERE name = ?", (name,))
-                return cur.rowcount > 0
+                if cur.rowcount == 0:
+                    return False
+                conn.execute(
+                    "UPDATE sys_users SET department = '' WHERE department = ?",
+                    (name,),
+                )
+                return True
+
+    def rename_department(self, old_name: str, new_name: str) -> bool:
+        """重命名部门；同步更新该部门下用户的 department 归属。"""
+        new_name = (new_name or "").strip()
+        if not new_name:
+            return False
+        with self._lock:
+            with self._get_conn() as conn:
+                try:
+                    cur = conn.execute(
+                        "UPDATE sys_departments SET name = ? WHERE name = ?",
+                        (new_name, old_name),
+                    )
+                    if cur.rowcount == 0:
+                        return False
+                    conn.execute(
+                        "UPDATE sys_users SET department = ? WHERE department = ?",
+                        (new_name, old_name),
+                    )
+                    return True
+                except sqlite3.IntegrityError:
+                    return False
 
     # ==================== 工具方法 ====================
 

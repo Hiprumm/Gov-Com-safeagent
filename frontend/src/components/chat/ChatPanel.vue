@@ -3,6 +3,7 @@ import { ref, watch, onMounted, onUnmounted } from 'vue'
 import axios from 'axios'
 import { toast } from '@/composables/useToast'
 import { useWebSocket } from '@/composables/useWebSocket'
+import { renderMarkdown } from '@/utils/markdown'
 
 interface Message {
   id: number
@@ -929,7 +930,8 @@ onUnmounted(() => {
                 : 'bg-elevated text-primary rounded-tl-sm border border-border-default'
             ]"
           >
-            <p class="whitespace-pre-wrap break-words">{{ message.content }}</p>
+            <p v-if="message.role === 'user'" class="whitespace-pre-wrap break-words">{{ message.content }}</p>
+            <div v-else class="markdown-body text-sm leading-relaxed" v-html="renderMarkdown(message.content)"></div>
           </div>
           
           <!-- 风险标签 -->

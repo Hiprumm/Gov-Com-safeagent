@@ -182,6 +182,14 @@ _PROTECTED_ROUTES: List[tuple] = [
     ("POST", "/api/security/session_risk/clear", "system.maintain"),
     ("POST", "/api/security/cross_source/clear", "system.maintain"),
     ("POST", "/api/kb/rebuild", "system.maintain"),
+    # ---- 安全检测 / 工具管控 / 扫描（安全运维职责，业务用户不可用）----
+    ("POST", "/api/security/detect_input", "security.detect"),
+    ("POST", "/api/security/detect_single", "security.detect"),
+    ("POST", "/api/security/detect_file", "security.detect"),
+    ("POST", "/api/security/plugin_scan", "security.scan"),
+    ("POST", "/api/security/mcp_scan", "security.scan"),
+    ("POST", "/api/security/skill_scan", "security.scan"),
+    ("GET", "/api/security/tool_management/status", "tools.view"),
     # ---- 检测调优 / 对抗评测 / 回放（安全分析类）----
     ("POST", "/api/optimization/", "security.scan"),
     ("POST", "/api/security/bypass_test", "security.scan"),
@@ -197,6 +205,10 @@ _PROTECTED_ROUTES: List[tuple] = [
     ("POST", "/api/agent/delete_session", "login"),
     ("POST", "/api/agent/rename_session", "login"),
     ("POST", "/api/agent/recall_messages", "login"),
+    # ---- 审计链校验 / 合规报告（登录可访问，匿名拒绝）----
+    ("GET", "/api/audit/logs/verify", "login"),
+    ("GET", "/api/audit/logs/verify-graded", "login"),
+    ("GET", "/api/compliance/report", "login"),
     # ---- 智能体执行入口（会真实执行工具）→ 登录 或 服务间 API Key ----
     ("POST", "/api/agent/chat", "integration"),
     ("POST", "/api/agent/run", "integration"),
@@ -2539,6 +2551,34 @@ async def admin_add_department(request: Request):
     return {"success": ok, "message": ("已新增部门" if ok else "部门已存在")}
 
 
+@app.put("/api/admin/departments")
+async def admin_rename_department(request: Request):
+    """重命名部门（仅 admin）：{old_name, new_name}，同步更新该部门下用户归属"""
+    from storage import get_storage
+    if not _admin_guard(request):
+        return {"success": False, "error": "无权限：需要系统管理员身份"}
+    body = await _body(request)
+    old_name = str(body.get("old_name", "")).strip()
+    new_name = str(body.get("new_name", "")).strip()
+    if not old_name or not new_name:
+        return {"success": False, "error": "原部门名与新部门名均不能为空"}
+    ok = get_storage().rename_department(old_name, new_name)
+    return {"success": ok, "message": ("已重命名" if ok else "部门不存在或名称重复")}
+
+
+@app.delete("/api/admin/departments")
+async def admin_delete_department(request: Request, name: str):
+    """删除部门（仅 admin）：该部门下用户的部门归属置空"""
+    from storage import get_storage
+    if not _admin_guard(request):
+        return {"success": False, "error": "无权限：需要系统管理员身份"}
+    name = (name or "").strip()
+    if not name:
+        return {"success": False, "error": "部门名称不能为空"}
+    ok = get_storage().remove_department(name)
+    return {"success": ok, "message": ("已删除部门" if ok else "部门不存在")}
+
+
 # ==================== 审批管理 API ====================
 
 @app.post("/api/security/approval/approve/{request_id}")
@@ -3282,6 +3322,50 @@ async def get_evaluation_report():
         with open(report_path, "r", encoding="utf-8") as f:
             return json.load(f)
     raise HTTPException(status_code=404, detail="评测报告未生成，请先运行评测")
+
+
+# 评测生成状态（进程内存；仅演示场景，避免并发重跑）
+_eval_gen_state = {"running": False, "started_at": None}
+
+
+@app.post("/api/evaluation/generate")
+async def generate_evaluation_report(request: Request):
+    """触发评测报告（重新）生成（仅管理员，后台异步运行）。"""
+    if not _admin_guard(request):
+        return {"success": False, "error": "无权限：需要系统管理员身份"}
+    if _eval_gen_state["running"]:
+        return {"success": False, "error": "评测正在生成中，请稍后刷新"}
+    import threading
+
+    def _run():
+        try:
+            _eval_gen_state["running"] = True
+            _eval_gen_state["started_at"] = datetime.now().isoformat()
+            from audit.run_evaluation import (
+                load_samples, run_detection, compute_metrics, classify_results, save_report,
+            )
+            from security.input_detector import InputDetectionService
+            samples_path = os.path.join(os.path.dirname(__file__), "audit", "attack_samples.json")
+            report_path = os.path.join(os.path.dirname(__file__), "audit", "evaluation_report.json")
+            samples = load_samples(samples_path)
+            detector = InputDetectionService()
+            results = run_detection(samples, detector)
+            metrics = compute_metrics(results)
+            classification = classify_results(results)
+            save_report(metrics, classification, results, report_path)
+        except Exception as e:
+            print(f"[EVAL] 评测生成失败: {e}")
+        finally:
+            _eval_gen_state["running"] = False
+
+    threading.Thread(target=_run, daemon=True).start()
+    return {"success": True, "message": "评测已在后台开始生成，完成后刷新页面即可查看最新报告"}
+
+
+@app.get("/api/evaluation/status")
+async def evaluation_generate_status():
+    """评测生成状态查询（前端轮询用）。"""
+    return {"running": _eval_gen_state["running"], "started_at": _eval_gen_state["started_at"]}
 
 
 # ==================== 模型接入配置（P2-6：内网/离线 OpenAI 兼容端点） ====================

@@ -198,6 +198,53 @@ def _fmt_any(val, default=""):
     return str(val)
 
 
+_SECURITY_REPORT_KEYWORDS = ("安全", "风险", "检测", "审计", "威胁", "攻击", "拦截", "告警", "漏洞", "检出", "防护")
+
+
+def _is_security_report(name: str) -> bool:
+    return any(k in name for k in _SECURITY_REPORT_KEYWORDS)
+
+
+def _real_security_stats() -> str:
+    """从系统真实审计日志统计安全检测数据，生成确定性 Markdown 表格。
+
+    合计由代码计算，不依赖 LLM，杜绝"数据无依据 / 算数错误 / 胡乱生成"。
+    """
+    try:
+        from storage import get_storage
+        logs = get_storage().get_audit_logs_recent(limit=5000)
+        if not logs:
+            return ""
+        risk_count: dict = {}
+        type_count: dict = {}
+        blocked = 0
+        for log in logs:
+            rl = str(log.get("risk_level") or "none").lower()
+            risk_count[rl] = risk_count.get(rl, 0) + 1
+            at = str(log.get("action_type") or "other")
+            type_count[at] = type_count.get(at, 0) + 1
+            if log.get("is_blocked"):
+                blocked += 1
+        total = len(logs)
+        lines = ["### 安全检测统计（基于系统真实审计日志）", "",
+                 "| 风险等级 | 数量 | 占比 |", "| --- | ---: | ---: |"]
+        for rl in ("critical", "high", "medium", "low", "none"):
+            c = risk_count.get(rl, 0)
+            if c == 0 and rl == "none":
+                continue
+            pct = f"{c * 100.0 / total:.1f}%" if total else "0%"
+            lines.append(f"| {rl} | {c} | {pct} |")
+        lines.append(f"| **合计** | **{total}** | 100% |")
+        lines += ["", f"- 被拦截：**{blocked}** 条　·　放行：**{total - blocked}** 条"]
+        lines += ["", "### 操作类型分布", "", "| 操作类型 | 数量 |", "| --- | ---: |"]
+        for at, c in sorted(type_count.items(), key=lambda x: -x[1])[:12]:
+            lines.append(f"| {at} | {c} |")
+        return "\n".join(lines)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("真实安全统计失败: %s", e)
+        return ""
+
+
 def generate_report(args: dict) -> dict:
     """生成结构化报表。args: {report_name, report_type(可选), columns(表头，可选), rows(数据，可选), note(口径说明,可选)}"""
     name = (args.get("report_name") or args.get("name") or args.get("subject") or "汇总报表").strip()
@@ -209,6 +256,21 @@ def generate_report(args: dict) -> dict:
     guide = REPORT_TYPES.get(rtype, REPORT_TYPES["汇总表"])
     basis = _retrieve_basis(rtype, name)
     basis_text = _fmt_basis(basis)
+
+    # 安全检测/风险/审计类报表（且用户未提供具体数据）→ 用系统真实审计日志统计，
+    # 合计由代码计算，杜绝 LLM 臆造数字与算错
+    if _is_security_report(name) and not rows:
+        real_text = _real_security_stats()
+        if real_text:
+            full = (
+                f"[AI 报表助手 · {rtype}] 已生成《{name}》。\n"
+                "以下数据来自系统审计日志的实时统计，合计由系统程序计算，确保准确。\n"
+                "━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"{real_text}\n"
+                "━━━━━━━━━━━━━━━━━━━━━━\n"
+                "生成引擎：真实数据统计　·　口径来源：系统审计日志"
+            )
+            return {"success": True, "report_name": name, "report_type": rtype, "text": full, "engine": "真实数据统计"}
 
     prompt = (
         "你是一名机关办公室业务骨干，请根据以下要求生成一份规范的结构化报表（用 Markdown 表格呈现）。\n"

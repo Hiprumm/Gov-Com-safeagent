@@ -684,4 +684,28 @@ class PostgresStorage:
         with self._lock:
             with self._get_conn() as conn:
                 cur = conn.execute("DELETE FROM sys_departments WHERE name = %s", (name,))
-                return cur.rowcount > 0
+                if cur.rowcount == 0:
+                    return False
+                conn.execute("UPDATE sys_users SET department = '' WHERE department = %s", (name,))
+                return True
+
+    def rename_department(self, old_name: str, new_name: str) -> bool:
+        new_name = (new_name or "").strip()
+        if not new_name:
+            return False
+        with self._lock:
+            with self._get_conn() as conn:
+                try:
+                    cur = conn.execute(
+                        "UPDATE sys_departments SET name = %s WHERE name = %s",
+                        (new_name, old_name),
+                    )
+                    if cur.rowcount == 0:
+                        return False
+                    conn.execute(
+                        "UPDATE sys_users SET department = %s WHERE department = %s",
+                        (new_name, old_name),
+                    )
+                    return True
+                except UniqueViolation:
+                    return False
