@@ -14,7 +14,7 @@
 - [3. 系统架构](#3-系统架构)
 - [4. 功能模块](#4-功能模块)
 - [5. 配置说明](#5-配置说明)
-- [6. 评测与报告](#6-评测与报告)
+- [6. 评测、复现与验证](#6-评测复现与验证)
 - [7. 项目结构](#7-项目结构)
 - [8. 常见问题](#8-常见问题)
 
@@ -309,18 +309,20 @@ AUDIT_RETENTION_DAYS=180                # 审计日志留存天数
 
 ---
 
-## 6. 评测与报告
+## 6. 评测、复现与验证
 
-### 运行评测
+### 6.1 运行评测（离线复现）
 
 ```bash
 cd ai_service/audit
 python run_evaluation.py
 ```
 
-评测将逐条检测 `attack_samples.json` 中全部 210 条样本并生成 `evaluation_report.json`。
+评测逐条检测 `attack_samples.json` 中全部 **335 条样本**（275 攻击 / 60 正常，覆盖 27 类攻击类型、多源输入标注），生成 `evaluation_report.json` 并输出 TP/FP/TN/FN、准确率、精确率、召回率、F1、误报率、漏报率。
 
-### 生成报告
+> **指标口径**：README 概览中的检测基线（准确率 98.5% / 漏报率 1.5%）为**启用 LLM 语义仲裁**（智谱 GLM-4-Flash，配置 `ZHIPU_API_KEY`）的基准结果；`run_evaluation.py` 离线复现默认不加载 LLM 仲裁（模型不可用/未配置时规则引擎 + AI 检测器自动兜底），因此离线实测值低于 LLM 仲裁基线。
+
+### 6.2 生成报告
 
 ```bash
 cd ai_service/audit
@@ -328,7 +330,7 @@ python generate_report.py           # 仅 Markdown
 python generate_report.py --pdf     # Markdown + HTML（浏览器打印 PDF）
 ```
 
-### 复现攻击
+### 6.3 复现攻击
 
 ```bash
 # 在 Swagger UI 或 curl 中调用
@@ -336,6 +338,51 @@ POST /api/replay/all                # 批量复现所有攻击样本
 POST /api/replay/{record_id}        # 复现单条攻击
 GET  /api/replay/records            # 查看复现记录
 ```
+
+### 6.4 关键攻击类型检测目标
+
+| 攻击类型 | 目标检测率 | 保障机制 |
+|----------|-----------|----------|
+| prompt_injection（提示注入） | 100% | 规则引擎 + AI 语义 + LLM 仲裁 |
+| jailbreak（越狱诱导） | 100% | LLM 语义仲裁（间接攻击识别） |
+| combined_attack（组合攻击） | 100% | 跨来源关联分析（`cross_source_correlator`） |
+| data_exfiltration（数据外泄） | 100% | 工具风险评估 + 浏览器访问控制 + 数据外传链检测 |
+
+> 离线基线下 prompt_injection / data_leakage / memory_poisoning / indirect_injection 等类型已稳定 100% 检出；jailbreak / combined_attack / data_exfiltration 的 100% 检出依赖 LLM 语义仲裁协同。
+
+### 6.5 审计链验证
+
+审计日志采用「哈希链 + HMAC + 分级 Agent 签名 + ZKP 证明 + 批量 TSA」防篡改链路，验证入口：
+
+```bash
+cd ai_service/audit
+python -c "from graded_signer import GradedAuditSigner, AgentIdentity, AuditActionType; s = GradedAuditSigner(AgentIdentity('verify-demo')); rec = s.sign_record('log-1', '2026-09-13T00:00:00', 'prev-hash', {'op': 'demo'}, AuditActionType.EXECUTE); print(s.verify_record(rec, {'op': 'demo'}))"   # True
+```
+
+- 分级签名密钥持久化于 `ai_service/data/graded_hmac.key`、`ai_service/data/zkp_proving.key`（多实例共享，保证 sign/verify 一致）
+- 审计日志字段含 `graded_sensitivity` / `graded_hmac` / `graded_agent_signature` / `graded_zkp_proof`（见 `evidence/audit_log_sample.json` 样例）
+- 合规报告与 PIPL 台账：`ai_service/audit/compliance_report.py`，治理中心「合规报告」页导出
+
+### 6.6 能力验证（可选补充材料）
+
+| 能力 | 验证方式 |
+|------|----------|
+| 插件/脚本供应链检测 | `POST /api/security/plugin_scan`（恶意包、高危函数、危险导入、A/B/C/D 评级） |
+| 审批控制 | 高风险工具调用触发审批 → WebSocket 推送 → manager/admin 审批放行（approval_engine） |
+| 熔断/封锁 | 应急开关（IP 封锁、全局熔断）后，写操作全部拦截、只读分析接口保留 |
+| 红队对抗 | `test_innovations.py` / P3 弱项复测（10/10 可修复样本 + 0 误报 + 3/3 对抗样本） |
+
+### 6.7 提交材料（evidence）
+
+面向比赛提交的可复现导出材料位于 [`evidence/`](evidence/README.md)：
+
+| 材料 | 说明 |
+|------|------|
+| `evidence/audit_log_sample.json` | 50 条真实审计日志样例（含分级签名链字段） |
+| `evidence/evaluation_results.md` | 335 条评测结果导出（分型检测率 + 误报/漏报明细） |
+| `evidence/attack_samples_index.md` | 攻击样例库索引（来源/类型分布 + 关键类型示例 ID） |
+
+重新导出：`cd evidence && python export_evidence.py`（幂等）。
 
 ---
 
@@ -362,7 +409,7 @@ Gov-Com-safeagent/
 │   ├── websocket/                   # WebSocket 实时通信
 │   │   └── manager.py               # 连接管理 & 事件推送
 │   ├── audit/                       # 审计 & 评测
-│   │   ├── attack_samples.json      # 210条评测样本
+│   │   ├── attack_samples.json      # 335条评测样本（275攻击/60正常，27类攻击）
 │   │   ├── run_evaluation.py        # 评测运行脚本
 │   │   ├── generate_report.py       # 报告生成脚本
 │   │   ├── evaluation_report.json   # 评测结果
