@@ -1701,8 +1701,26 @@ async def get_evaluation_report():
     raise HTTPException(status_code=404, detail="评测报告未生成，请先运行评测")
 
 
-# 评测生成状态（进程内存；仅演示场景，避免并发重跑）
-_eval_gen_state = {"running": False, "started_at": None}
+# 评测生成状态（持久化到 storage，跨 uvicorn worker 共享：
+# 进程内存态在 --workers N 下各 worker 相互不可见，会导致前端轮询到"未收到请求的
+# worker"而误判生成完成、拉到旧报告（生成时间不更新））
+_EVAL_STATE_KEY = "evaluation_gen_state"
+
+
+def _eval_state() -> dict:
+    from storage import get_storage
+    st = get_storage().get_setting(_EVAL_STATE_KEY) or {}
+    return {"running": bool(st.get("running")), "started_at": st.get("started_at"), "step": st.get("step")}
+
+
+def _set_eval_state(running: bool, started_at: str = None, step: str = None):
+    from storage import get_storage
+    prev = get_storage().get_setting(_EVAL_STATE_KEY) or {}
+    get_storage().set_setting(_EVAL_STATE_KEY, {
+        "running": running,
+        "started_at": started_at if started_at else prev.get("started_at"),
+        "step": step if step else prev.get("step"),
+    })
 
 
 @router.post("/api/evaluation/generate")
@@ -1710,30 +1728,42 @@ async def generate_evaluation_report(request: Request):
     """触发评测报告（重新）生成（仅管理员，后台异步运行）。"""
     if not _admin_guard(request):
         return {"success": False, "error": "无权限：需要系统管理员身份"}
-    if _eval_gen_state["running"]:
+    if _eval_state().get("running"):
         return {"success": False, "error": "评测正在生成中，请稍后刷新"}
     import threading
 
     def _run():
+        import traceback
+
+        def _log(msg):
+            try:
+                _set_eval_state(True, datetime.now().isoformat(), step=msg)
+            except Exception:  # noqa: BLE001 —— 诊断打点失败不阻塞评测
+                pass
+
         try:
-            _eval_gen_state["running"] = True
-            _eval_gen_state["started_at"] = datetime.now().isoformat()
+            _log("STEP1 thread start")
             from audit.run_evaluation import (
                 load_samples, run_detection, compute_metrics, classify_results, save_report,
             )
+            _log("STEP2 imported")
             from security.input_detector import InputDetectionService
             samples_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "audit", "attack_samples.json")
             report_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "audit", "evaluation_report.json")
             samples = load_samples(samples_path)
+            _log(f"STEP3 loaded {len(samples)} samples")
             detector = InputDetectionService()
+            _log("STEP4 detector ready")
             results = run_detection(samples, detector)
+            _log(f"STEP5 detection done {len(results)}")
             metrics = compute_metrics(results)
             classification = classify_results(results)
             save_report(metrics, classification, results, report_path)
+            _log("STEP6 report saved")
         except Exception as e:
-            print(f"[EVAL] 评测生成失败: {e}")
+            _set_eval_state(True, None, step="ERR " + traceback.format_exc()[:500])
         finally:
-            _eval_gen_state["running"] = False
+            _set_eval_state(False, None, step="DONE")
 
     threading.Thread(target=_run, daemon=True).start()
     return {"success": True, "message": "评测已在后台开始生成，完成后刷新页面即可查看最新报告"}
@@ -1742,7 +1772,8 @@ async def generate_evaluation_report(request: Request):
 @router.get("/api/evaluation/status")
 async def evaluation_generate_status():
     """评测生成状态查询（前端轮询用）。"""
-    return {"running": _eval_gen_state["running"], "started_at": _eval_gen_state["started_at"]}
+    st = _eval_state()
+    return {"running": st["running"], "started_at": st["started_at"]}
 
 
 # ==================== 模型接入配置（P2-6：内网/离线 OpenAI 兼容端点） ====================

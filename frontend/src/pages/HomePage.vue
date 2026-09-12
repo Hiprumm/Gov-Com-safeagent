@@ -5,7 +5,7 @@ import {
   ShieldX, Clock, AlertTriangle, ShieldCheck,
   MessageSquare, Shield, Settings, FileText, ClipboardCheck,
   Sun, Moon, LayoutDashboard, Swords, SlidersHorizontal, Activity, Server, LogIn, LogOut,
-  Landmark,
+  Landmark, ChevronUp,
 } from 'lucide-vue-next'
 import ChatPanel from '@/components/chat/ChatPanel.vue'
 import DashboardPanel from '@/components/dashboard/DashboardPanel.vue'
@@ -28,6 +28,7 @@ import { useRouter } from 'vue-router'
 import { useToast } from '@/composables/useToast'
 import { useTheme } from '@/composables/useTheme'
 import { useDashboard, useDashboardRealtime } from '@/composables/useDashboard'
+import { useStoredBoolean } from '@/composables/useStoredBoolean'
 
 const { isDark, toggleTheme } = useTheme()
 
@@ -53,7 +54,8 @@ const kpiIconMap: Record<string, any> = {
 }
 
 const activeTab = ref('chat')
-const sidebarCollapsed = ref(false)
+/** 桌面端主侧边栏收起状态：localStorage 记忆用户最后一次设置（移动端收起走 mobileSidebarOpen，不持久化） */
+const { value: sidebarCollapsed, toggle: toggleSidebarCollapsed } = useStoredBoolean('safeagent_home_sidebar_collapsed', () => false)
 const mobileSidebarOpen = ref(false)
 const isMobile = ref(false)
 const showCommandPalette = ref(false)
@@ -165,6 +167,9 @@ const breadcrumbs = computed(() => [
 const { overview } = useDashboard()
 useDashboardRealtime()
 
+// 状态总览KPI 收拉状态：localStorage 记忆用户最后一次设置，页面刷新后保持一致
+const { value: kpiExpanded, toggle: toggleKpiExpanded } = useStoredBoolean('safeagent_home_kpi_expanded', () => true)
+
 const statusKPIs = computed(() => {
   const kpi = overview.value?.kpi
   return [
@@ -208,7 +213,7 @@ function toggleSidebar() {
   if (isMobile.value) {
     mobileSidebarOpen.value = !mobileSidebarOpen.value
   } else {
-    sidebarCollapsed.value = !sidebarCollapsed.value
+    toggleSidebarCollapsed()
   }
 }
 
@@ -255,9 +260,11 @@ onUnmounted(() => {
           <Menu class="w-5 h-5 text-secondary" />
         </button>
 
-        <div class="w-9 h-9 rounded-lg flex items-center justify-center flex-shrink-0 transition-transform hover:scale-105" style="background: linear-gradient(135deg, #06B6D4 0%, #3B82F6 100%)">
-          <span class="text-white text-lg font-bold">智</span>
-        </div>
+        <img
+          src="/logo.png"
+          alt="政企大模型智能体安全平台"
+          class="w-9 h-9 rounded-lg object-contain flex-shrink-0 transition-transform hover:scale-105"
+        />
         <div class="min-w-0">
           <h1 class="text-sm sm:text-base font-bold text-primary leading-tight truncate">政企大模型智能体安全平台</h1>
           <p class="text-xs text-muted leading-tight hidden sm:block">SafeAgent · 面向政企场景的安全关键技术</p>
@@ -353,40 +360,66 @@ onUnmounted(() => {
       </div>
     </header>
 
-    <!-- ========== 面包屑 + 状态总览 ========== -->
-    <div class="bg-surface/50 border-b border-border-default px-4 sm:px-6 py-3 flex-shrink-0">
-      <!-- 面包屑 + 数据视角 -->
-      <div class="flex items-center gap-2 text-sm mb-3">
+    <!-- ========== 面包屑 + 状态总览（可收拉） ========== -->
+    <div
+      class="bg-surface/50 border-b border-border-default px-4 sm:px-6 flex-shrink-0 transition-[padding] duration-300"
+      :class="kpiExpanded ? 'py-3' : 'py-2'"
+    >
+      <!-- 面包屑 + 数据视角 + 收拉控制按钮 -->
+      <div
+        class="flex items-center gap-2 text-sm"
+        :class="kpiExpanded ? 'mb-3' : 'mb-0'"
+      >
         <template v-for="(crumb, idx) in breadcrumbs" :key="idx">
           <div v-if="idx > 0" class="text-disabled">/</div>
           <span :class="idx === breadcrumbs.length - 1 ? 'text-accent font-medium' : 'text-muted'">
             {{ crumb.label }}
           </span>
         </template>
-        <div class="ml-auto"></div>
-        <span
-          v-if="dataScopeLabel"
-          class="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full border text-[11px] font-medium bg-accent/10 text-accent border-accent/25"
-          title="按当前登录角色收敛：admin/operator/auditor=全平台，manager=本部门，user=仅本人"
-        >
-          <span class="w-1.5 h-1.5 rounded-full bg-current opacity-70"></span>
-          {{ dataScopeLabel }}
-        </span>
+        <div class="ml-auto flex items-center gap-2">
+          <span
+            v-if="dataScopeLabel"
+            class="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full border text-[11px] font-medium bg-accent/10 text-accent border-accent/25"
+            title="按当前登录角色收敛：admin/operator/auditor=全平台，manager=本部门，user=仅本人"
+          >
+            <span class="w-1.5 h-1.5 rounded-full bg-current opacity-70"></span>
+            {{ dataScopeLabel }}
+          </span>
+          <button
+            @click="toggleKpiExpanded()"
+            class="flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-elevated/60 border border-border-default text-muted hover:text-accent hover:border-accent/40 transition-colors active:scale-95 text-xs font-medium flex-shrink-0"
+            :title="kpiExpanded ? '收起状态总览，为下方内容腾出空间' : '展开状态总览'"
+            :aria-expanded="kpiExpanded"
+          >
+            <span class="hidden sm:inline">状态总览</span>
+            <ChevronUp
+              class="w-4 h-4 transition-transform duration-300"
+              :class="kpiExpanded ? '' : 'rotate-180'"
+            />
+          </button>
+        </div>
       </div>
-      <!-- KPI 状态条 -->
-      <div class="grid grid-cols-2 lg:grid-cols-4 gap-3">
-        <div
-          v-for="kpi in statusKPIs"
-          :key="kpi.label"
-          class="flex items-center gap-3 px-3 py-2 rounded-lg bg-elevated/50 border border-border-default animate-card-in"
-          :style="{ animationDelay: `${statusKPIs.indexOf(kpi) * 50}ms` }"
-        >
-          <div :class="['w-8 h-8 rounded-lg flex items-center justify-center flex-shrink-0', `bg-${kpi.color}/10`]">
-            <component :is="kpiIconMap[kpi.icon]" class="w-4 h-4" :class="`text-${kpi.color}`" />
-          </div>
-          <div class="min-w-0">
-            <div :class="['text-lg font-bold tabular-nums leading-tight', `text-${kpi.color}`]">{{ kpi.value }}</div>
-            <div class="text-xs text-muted leading-tight truncate">{{ kpi.label }}</div>
+      <!-- KPI 状态条（grid-rows 过渡实现平滑收起/展开） -->
+      <div
+        class="grid transition-[grid-template-rows] duration-300 ease-in-out"
+        :class="kpiExpanded ? 'grid-rows-[1fr]' : 'grid-rows-[0fr]'"
+      >
+        <div class="overflow-hidden min-h-0">
+          <div class="grid grid-cols-2 lg:grid-cols-4 gap-3">
+            <div
+              v-for="kpi in statusKPIs"
+              :key="kpi.label"
+              class="flex items-center gap-3 px-3 py-2 rounded-lg bg-elevated/50 border border-border-default animate-card-in"
+              :style="{ animationDelay: `${statusKPIs.indexOf(kpi) * 50}ms` }"
+            >
+              <div :class="['w-8 h-8 rounded-lg flex items-center justify-center flex-shrink-0', `bg-${kpi.color}/10`]">
+                <component :is="kpiIconMap[kpi.icon]" class="w-4 h-4" :class="`text-${kpi.color}`" />
+              </div>
+              <div class="min-w-0">
+                <div :class="['text-lg font-bold tabular-nums leading-tight', `text-${kpi.color}`]">{{ kpi.value }}</div>
+                <div class="text-xs text-muted leading-tight truncate">{{ kpi.label }}</div>
+              </div>
+            </div>
           </div>
         </div>
       </div>

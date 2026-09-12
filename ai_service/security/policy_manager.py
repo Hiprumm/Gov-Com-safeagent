@@ -22,7 +22,7 @@ POLICY_DEFAULTS: Dict[str, Any] = {
     "block_threshold": "high",          # medium=中风险即拦截 | high=高风险拦截（默认） | critical=仅严重拦截
     "audit_retention_days": 180,        # 等保2.0三级建议 ≥180 天
     "trusted_domain_suffixes": [".gov.cn", ".gov.org", ".gov", ".edu.cn", ".edu", ".ac.cn"],
-    "aigc_explicit_label_enabled": False,  # 是否在回复中显示【AI生成内容】标签（默认False，避免影响用户体验）
+    "aigc_explicit_label_enabled": True,   # 回复中显示【AI生成内容】标签（合规达标；可在系统配置关闭）
     "aigc_implicit_marker_enabled": True,  # 是否添加隐式元数据标记（默认True，保留合规溯源）
 }
 

@@ -23,6 +23,15 @@ dependencies = [
     "pytesseract>=0.3",
 ]
 
+[project.optional-dependencies]
+# PaddleOCR 可选接入：中英文识别精度显著优于 Tesseract。
+# 安装：pip install ".[ocr]" 或 pip install paddleocr paddlepaddle
+# 未安装时自动降级回 Tesseract / LLM 视觉识别，不影响服务运行。
+ocr = [
+    "paddlepaddle>=2.6,<3.0",
+    "paddleocr>=2.7,<3.0",
+]
+
 [project.scripts]
 gov-ai-service = "main:app"
 

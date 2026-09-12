@@ -95,6 +95,17 @@ def _canonical_content(d: Dict[str, Any], prev_hash: str) -> str:
     return json.dumps(payload, sort_keys=True, ensure_ascii=False, default=str)
 
 
+# 操作客体默认值：无具体工具/资源时归为平台会话（等保2.0审计要素-客体兜底）
+DEFAULT_OPERATION_OBJECT = "平台会话/API调用"
+
+
+def derive_operation_object(action_details: Dict[str, Any]) -> str:
+    """从操作详情推导操作客体（与 create_log 写时兜底同规则，供合规统计读时复用）"""
+    ad = action_details or {}
+    return ad.get("tool_name", "") or ad.get("url", "") or ad.get("input", "") \
+        or DEFAULT_OPERATION_OBJECT
+
+
 class AuditLogger:
     """审计日志记录器（等保2.0合规）
 
@@ -168,9 +179,8 @@ class AuditLogger:
         if not operation_subject:
             operation_subject = f"{user_id}/{user_role}"
         if not operation_object:
-            operation_object = (action_details or {}).get("tool_name", "") or \
-                               (action_details or {}).get("url", "") or \
-                               (action_details or {}).get("input", "")
+            # 兜底推导：优先工具/URL/输入，无具体客体时归为平台会话（保证审计要素完整性）
+            operation_object = derive_operation_object(action_details)
         if not operation_result:
             if is_blocked:
                 operation_result = "blocked"

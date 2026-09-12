@@ -32,6 +32,13 @@ const currentUser = ref<AuthUser | null>(null)
 const demoAccounts = ref<DemoAccount[]>([])
 /** MFA 二步登录挂起态：密码校验通过但待输入 TOTP 验证码 */
 const mfaPending = ref<{ ticket: string; username: string } | null>(null)
+/**
+ * 认证状态版本号：登录/登出/身份切换时自增。
+ * 用于丢弃过期的 initAuth 响应——登录页 onMounted 发出的 /auth/me 请求若在后端慢时
+ * 晚于登录完成才返回（user=null），会覆盖掉刚写入的 currentUser，把用户弹回登录页
+ * （表现：点击登录不跳转，刷新后因 token 仍在才跳转）。版本号比对可安全丢弃过期响应。
+ */
+let authEpoch = 0
 
 /** 本地是否持有令牌（同步、可靠的“已登录”判据，供路由守卫使用） */
 const hasToken = computed(() => !!localStorage.getItem(TOKEN_KEY))
@@ -45,10 +52,13 @@ function setToken(t: string) {
 
 /** 初始化：恢复持久化登录态；无/失效 token 时清空并保留演示账号列表供登录页展示 */
 async function initAuth(): Promise<boolean> {
+  const epoch = authEpoch
   const token = localStorage.getItem(TOKEN_KEY) || ''
   try {
     const res = await axios.get('/ai/auth/me')
     demoAccounts.value = res.data.demo_accounts || []
+    // 请求期间发生了登录/登出等身份变更：本次结果已过期，丢弃以免覆盖新状态
+    if (epoch !== authEpoch) return currentUser.value !== null
     if (res.data.user) {
       currentUser.value = res.data.user
       return true
@@ -57,14 +67,24 @@ async function initAuth(): Promise<boolean> {
       setToken('')
     }
   } catch {
+    if (epoch !== authEpoch) return currentUser.value !== null
     setToken('')
   }
-  currentUser.value = null
+  if (epoch === authEpoch) currentUser.value = null
   return false
 }
 
-/** 登录成功后跳转首页；若账号启用 MFA 则进入二步验证（返回 false 并置 mfaPending） */
-async function login(username: string, password: string): Promise<boolean> {
+/** 登录后跳转：优先客户端路由导航；失败（如懒加载 chunk 加载异常）时硬跳转兜底，保证登录必然离开登录页 */
+async function navigateTo(path: string) {
+  try {
+    await router.replace(path)
+  } catch {
+    window.location.href = path
+  }
+}
+
+/** 登录成功后跳转 redirect（默认首页）；若账号启用 MFA 则进入二步验证（返回 false 并置 mfaPending） */
+async function login(username: string, password: string, redirect = '/'): Promise<boolean> {
   try {
     const res = await axios.post('/ai/auth/login', { username, password })
     // 二步验证：密码通过但需输入 TOTP
@@ -72,11 +92,12 @@ async function login(username: string, password: string): Promise<boolean> {
       mfaPending.value = { ticket: res.data.mfa_ticket, username: res.data.username || username }
       return false
     }
+    authEpoch++ // 使仍在途的旧 initAuth 响应失效，避免其晚到覆盖本次登录
     setToken(res.data.token)
     currentUser.value = res.data.user
     mfaPending.value = null
     toast.success(`欢迎，${res.data.user.display_name}`)
-    router.replace('/')
+    await navigateTo(redirect)
     return true
   } catch (e: any) {
     toast.error(e.response?.data?.detail || '登录失败，请检查账号与口令')
@@ -85,18 +106,19 @@ async function login(username: string, password: string): Promise<boolean> {
 }
 
 /** MFA 二步：校验 TOTP 验证码完成登录 */
-async function verifyMfa(code: string): Promise<boolean> {
+async function verifyMfa(code: string, redirect = '/'): Promise<boolean> {
   if (!mfaPending.value) return false
   try {
     const res = await axios.post('/ai/auth/mfa/verify', {
       ticket: mfaPending.value.ticket,
       code: code.trim(),
     })
+    authEpoch++ // 使仍在途的旧 initAuth 响应失效
     setToken(res.data.token)
     currentUser.value = res.data.user
     mfaPending.value = null
     toast.success(`欢迎，${res.data.user.display_name}`)
-    router.replace('/')
+    await navigateTo(redirect)
     return true
   } catch (e: any) {
     toast.error(e.response?.data?.detail || '验证码不正确')
@@ -124,6 +146,7 @@ async function refreshProfile(): Promise<AuthUser | null> {
 
 /** 登出：清令牌并回到登录页 */
 async function logout() {
+  authEpoch++ // 使在途的 initAuth 响应失效，避免其晚到重新写回身份
   try {
     if (localStorage.getItem(TOKEN_KEY)) await axios.post('/ai/auth/logout')
   } catch { /* ignore */ }

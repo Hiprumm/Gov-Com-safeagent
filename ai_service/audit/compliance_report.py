@@ -72,9 +72,11 @@ class ComplianceReportGenerator:
         chain_head = self.audit_logger.get_chain_head()
 
         total = len(logs)
+        # 客体覆盖：已记录的直接统计；空客体按写时同规则读时推导（不写库、不破坏哈希链）
+        from audit.audit_logger import derive_operation_object
         with_source_ip = sum(1 for l in logs if l.source_ip)
         with_subject = sum(1 for l in logs if l.operation_subject)
-        with_object = sum(1 for l in logs if l.operation_object)
+        with_object = sum(1 for l in logs if (l.operation_object or derive_operation_object(l.action_details)))
         with_result = sum(1 for l in logs if l.operation_result)
         blocked = sum(1 for l in logs if l.is_blocked)
         risks = {"none": 0, "low": 0, "medium": 0, "high": 0, "critical": 0}
@@ -195,11 +197,15 @@ class ComplianceReportGenerator:
         # ---- 算法/大模型备案 ----
         aigc = self.aigc_config
         _add("B1", "AIGC显式标识", "《生成式AI服务管理暂行办法》",
-             aigc["explicit_label_enabled"], 1.0,
-             "输出内容附加【AI生成内容】声明")
+             aigc["explicit_label_enabled"],
+             1.0 if aigc["explicit_label_enabled"] else 0.0,
+             "输出内容附加【AI生成内容】声明",
+             "后台系统配置中开启显式标识（aigc_explicit_label_enabled）即可达标" if not aigc["explicit_label_enabled"] else "")
         _add("B2", "AIGC隐式标识+元数据", "GB/T 45654-2025",
-             aigc["implicit_marker_enabled"], 1.0,
-             f"嵌入模型[{aigc['model_name']}]/提供方[{aigc['provider_code']}]/备案号")
+             aigc["implicit_marker_enabled"],
+             1.0 if aigc["implicit_marker_enabled"] else 0.0,
+             f"嵌入模型[{aigc['model_name']}]/提供方[{aigc['provider_code']}]/备案号",
+             "后台系统配置中开启隐式标识（aigc_implicit_marker_enabled）即可达标" if not aigc["implicit_marker_enabled"] else "")
         _add("B3", "生成内容安全合格率(≥90%)", "GB/T 45654-2025",
              content_safety["pass_rate"] >= 0.9, content_safety["pass_rate"],
              f"合格率 {content_safety['pass_rate']:.1%}（{content_safety['safe_count']}/{content_safety['total']}）")
@@ -208,7 +214,8 @@ class ComplianceReportGenerator:
              min(refusal["refusal_rate"], refusal["non_refusal_rate"]),
              f"拒答率 {refusal['refusal_rate']:.1%} 非拒答率 {refusal['non_refusal_rate']:.1%}")
         _add("B5", "关键词库规模(≥10000)", "GB/T 45654-2025",
-             self.lexicon_stats["total_keywords"] >= 10000, 1.0,
+             self.lexicon_stats["total_keywords"] >= 10000,
+             1.0 if self.lexicon_stats["total_keywords"] >= 10000 else 0.0,
              f"检测关键词 {self.lexicon_stats['total_keywords']} 条，覆盖 {self.lexicon_stats['risk_categories']} 类风险")
 
         # ---- 平台安全能力 ----

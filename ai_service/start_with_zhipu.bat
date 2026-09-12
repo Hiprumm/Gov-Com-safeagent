@@ -1,4 +1,6 @@
 @echo off
 echo Starting SafeAgent AI Service...
 echo Loading config from .env file...
-python -m uvicorn main:app --host 0.0.0.0 --port 8080
+set "PY=%~dp0.venv\Scripts\python.exe"
+if not exist "%PY%" set "PY=python"
+"%PY%" -m uvicorn main:app --host 0.0.0.0 --port 8080

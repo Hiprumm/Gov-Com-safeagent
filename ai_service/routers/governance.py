@@ -57,28 +57,6 @@ router = APIRouter()
 # T5 合规标准对接：合规报告 / 关键词库 / AIGC标识 / 哈希链校验
 # ============================================================================
 
-@router.get("/api/compliance/report")
-async def compliance_report(format: str = "json"):
-    """生成等保2.0/算法备案/大模型备案安全评估报告
-
-    Args:
-        format: json | markdown(md) | html
-    """
-    try:
-        from audit.compliance_report import get_compliance_generator
-        generator = get_compliance_generator()
-        data = generator.generate(format)
-        if format.lower() in ("md", "markdown"):
-            from fastapi.responses import PlainTextResponse
-            return PlainTextResponse(data, media_type="text/markdown")
-        if format.lower() == "html":
-            from fastapi.responses import HTMLResponse
-            return HTMLResponse(data)
-        return data
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
 @router.get("/api/compliance/keywords/stats")
 async def compliance_keywords_stats():
     """关键词库规模统计（GB/T 45654-2025）"""

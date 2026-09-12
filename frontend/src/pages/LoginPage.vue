@@ -1,15 +1,14 @@
 <script setup lang="ts">
 import { ref, onMounted } from 'vue'
-import { useRoute, useRouter } from 'vue-router'
-import { ShieldCheck, LogIn, Sun, Moon } from 'lucide-vue-next'
+import { useRoute } from 'vue-router'
+import { LogIn, Sun, Moon, ShieldCheck } from 'lucide-vue-next'
 import { useAuth } from '@/composables/useAuth'
 import { useTheme } from '@/composables/useTheme'
 
 const route = useRoute()
-const router = useRouter()
 const { isDark, toggleTheme } = useTheme()
 
-const { login, demoAccounts, initAuth, mfaPending, verifyMfa, cancelMfa } = useAuth()
+const { login, initAuth, mfaPending, verifyMfa, cancelMfa } = useAuth()
 const username = ref('')
 const password = ref('')
 const submitting = ref(false)
@@ -17,17 +16,17 @@ const errorMsg = ref('')
 const mfaCode = ref('')
 const mfaSubmitting = ref(false)
 
-// 首次进入拉取演示账号列表（未登录时 /me 也返回 demo_accounts）
+// 首次进入初始化认证状态（校验本地令牌有效性）
 onMounted(async () => {
   try {
     await initAuth()
   } catch { /* ignore */ }
 })
 
-const pickAccount = (u: string) => {
-  username.value = u
-  password.value = 'admin123' // 演示统一口令
-  errorMsg.value = ''
+/** 登录成功后的回跳目标：带 redirect 参数（来源页）则回跳，否则回首页 */
+const resolveRedirect = (): string => {
+  const redirect = typeof route.query.redirect === 'string' ? route.query.redirect : ''
+  return redirect && redirect.startsWith('/') && redirect !== '/login' ? redirect : '/'
 }
 
 const submit = async () => {
@@ -37,15 +36,9 @@ const submit = async () => {
   }
   submitting.value = true
   errorMsg.value = ''
-  const ok = await login(username.value.trim(), password.value)
+  // 跳转由 useAuth 内部完成（一次性导航 + 失败硬跳转兜底），避免二次导航竞态
+  await login(username.value.trim(), password.value, resolveRedirect())
   submitting.value = false
-  if (ok) {
-    // 登录成功由 useAuth 内部跳转；若带 redirect 参数则回跳来源页
-    const redirect = typeof route.query.redirect === 'string' ? route.query.redirect : ''
-    if (redirect && redirect.startsWith('/') && redirect !== '/login') {
-      router.replace(redirect)
-    }
-  }
   // 若需 MFA，useAuth 会置 mfaPending，模板自动切换到二步验证
 }
 
@@ -56,14 +49,8 @@ const submitMfa = async () => {
   }
   mfaSubmitting.value = true
   errorMsg.value = ''
-  const ok = await verifyMfa(mfaCode.value)
+  await verifyMfa(mfaCode.value, resolveRedirect())
   mfaSubmitting.value = false
-  if (ok) {
-    const redirect = typeof route.query.redirect === 'string' ? route.query.redirect : ''
-    if (redirect && redirect.startsWith('/') && redirect !== '/login') {
-      router.replace(redirect)
-    }
-  }
 }
 
 const backToPassword = () => {
@@ -92,10 +79,11 @@ const backToPassword = () => {
     <div class="w-full max-w-md relative animate-card-in">
       <!-- 品牌头 -->
       <div class="mb-6 text-center">
-        <div class="w-14 h-14 mx-auto rounded-2xl flex items-center justify-center mb-3 shadow-lg"
-             style="background: linear-gradient(135deg, #06B6D4 0%, #3B82F6 100%)">
-          <ShieldCheck class="w-8 h-8 text-white" />
-        </div>
+        <img
+          src="/logo.png"
+          alt="政企大模型智能体安全平台"
+          class="w-16 h-16 mx-auto mb-3 object-contain rounded-2xl shadow-lg"
+        />
         <h1 class="text-xl font-bold text-primary">政企大模型智能体安全平台</h1>
         <p class="text-xs text-muted mt-1">SafeAgent · 面向政企场景的安全关键技术 · 请登录后使用</p>
       </div>
@@ -110,35 +98,13 @@ const backToPassword = () => {
 
         <div class="p-6 space-y-4">
           <template v-if="!mfaPending">
-          <!-- 演示账号快捷选择 -->
-          <div>
-            <p class="text-xs text-muted mb-2">选择演示账号体验不同角色（口令统一 <span class="text-accent font-medium">admin123</span>）：</p>
-            <div class="grid grid-cols-2 gap-1.5">
-              <button
-                v-for="acc in demoAccounts"
-                :key="acc.username"
-                @click="pickAccount(acc.username)"
-                class="px-2.5 py-2 rounded-lg text-xs border transition-colors text-left"
-                :class="username === acc.username
-                  ? 'bg-accent/15 text-accent border-accent/50'
-                  : 'bg-elevated text-secondary border-border-default hover:border-accent/40'"
-                :title="acc.desc"
-              >
-                <span class="block font-medium truncate">{{ acc.display_name }}</span>
-                <span class="text-[10px] text-disabled">{{ acc.role }} · {{ acc.desc }}</span>
-              </button>
-            </div>
-          </div>
-
-          <div class="h-px bg-border-default/70"></div>
-
           <div>
             <label class="block text-sm text-secondary mb-1.5">用户名</label>
             <input
               v-model="username"
               type="text"
               autocomplete="username"
-              placeholder="admin / operator / auditor / user"
+              placeholder="请输入用户名"
               class="w-full px-3.5 py-2.5 bg-canvas border border-border-default text-primary placeholder:text-disabled rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-accent/20 focus:border-accent"
             />
           </div>
@@ -148,7 +114,7 @@ const backToPassword = () => {
               v-model="password"
               type="password"
               autocomplete="current-password"
-              placeholder="演示口令：admin123"
+              placeholder="请输入登录口令"
               @keydown.enter="submit"
               class="w-full px-3.5 py-2.5 bg-canvas border border-border-default text-primary placeholder:text-disabled rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-accent/20 focus:border-accent"
             />
@@ -163,9 +129,16 @@ const backToPassword = () => {
           >
             {{ submitting ? '登录中...' : '登 录' }}
           </button>
-          <p class="text-[11px] text-disabled text-center leading-relaxed">
-            登录后导航将按角色收敛 · 审批与审计操作将记录到当前账号
-          </p>
+
+          <!-- 安全提示（真实政企场景） -->
+          <div class="flex items-start gap-2 px-3 py-2.5 rounded-lg bg-canvas border border-border-default">
+            <ShieldCheck class="w-4 h-4 text-safe flex-shrink-0 mt-0.5" />
+            <p class="text-[11px] text-muted leading-relaxed">
+              安全提示：本系统仅限授权用户访问，登录与操作行为将被完整审计记录。请妥善保管口令，谨防钓鱼与社会工程攻击。
+            </p>
+          </div>
+
+          <p class="text-[11px] text-disabled text-center">忘记口令？请联系本单位系统管理员重置</p>
           </template>
 
           <!-- MFA 二步验证 -->
@@ -206,7 +179,7 @@ const backToPassword = () => {
         </div>
       </div>
 
-      <p class="text-center text-[11px] text-disabled mt-4">SafeAgent v5.0 · 面向政企场景的大模型智能体安全关键技术研究</p>
+      <p class="text-center text-[11px] text-disabled mt-4">© 2026 政企大模型智能体安全平台 SafeAgent · 安全审计 · 全程留痕</p>
     </div>
   </div>
 </template>

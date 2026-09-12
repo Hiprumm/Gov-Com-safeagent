@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, onMounted } from 'vue'
+import { ref, computed, onMounted, onUnmounted } from 'vue'
 import axios from 'axios'
 import { toast } from '@/composables/useToast'
 import { useAuth } from '@/composables/useAuth'
@@ -18,17 +18,34 @@ const status = ref<SystemStatus | null>(null)
 const loading = ref(false)
 const cleaning = ref(false)
 
-const load = async () => {
-  loading.value = true
+// ---------- 自动刷新：动态数据定时拉取 + 运行时长实时跳动 ----------
+const AUTO_REFRESH_MS = 20000   // 动态数据自动刷新周期（WebSocket/策略/数据规模等）
+const uptimeBase = ref(0)       // 最近一次拉取到的运行秒数基线
+const uptimeRefTime = ref(0)    // 基线对应的时间戳（客户端在此基础上每秒累计）
+const nowTick = ref(0)          // 每秒跳动，驱动运行时长实时刷新
+let tickTimer: ReturnType<typeof setInterval> | null = null
+let statusTimer: ReturnType<typeof setInterval> | null = null
+
+const load = async (silent = false) => {
+  if (!silent) loading.value = true
   try {
     const res = await axios.get('/ai/system/status')
     status.value = res.data
+    uptimeBase.value = res.data?.service?.uptime_seconds ?? 0
+    uptimeRefTime.value = Date.now()
   } catch (e: any) {
     toast.error(e.response?.data?.detail || '系统状态获取失败')
   } finally {
     loading.value = false
   }
 }
+
+// 实时运行时长：基线秒数 + 自基线以来经过的秒数（每秒刷新，无需请求后端）
+const uptimeSeconds = computed(() => {
+  void nowTick.value
+  if (!uptimeRefTime.value) return uptimeBase.value
+  return uptimeBase.value + Math.max(0, Math.floor((Date.now() - uptimeRefTime.value) / 1000))
+})
 
 const cleanEmptySessions = async () => {
   if (!window.confirm('将清理全部“无消息”的空会话（多次新建/清空对话产生的残留）。有内容的会话不受影响。确认继续？')) return
@@ -216,6 +233,10 @@ const applyPreset = (target: 'main' | 'backup', label: string) => {
     modelCfg.value.backup_model = p.model
   }
 }
+// 已保存密钥标记（密钥安全隐藏不回显；标记用于「留空=保留」与「清除密钥」交互）
+const hasSavedKey = ref(false)
+const hasSavedBackupKey = ref(false)
+
 const loadModel = async () => {
   try {
     const res = await axios.get('/ai/model/config')
@@ -229,6 +250,8 @@ const loadModel = async () => {
       modelCfg.value.backup_base_url = res.data.config.backup_base_url || ''
       modelCfg.value.backup_model = res.data.config.backup_model || ''
       modelCfg.value.backup_api_key = ''
+      hasSavedKey.value = !!res.data.config.has_key
+      hasSavedBackupKey.value = !!res.data.config.backup_has_key
     }
   } catch { /* ignore */ }
 }
@@ -239,27 +262,138 @@ const saveModel = async () => {
   }
   mdSaving.value = true
   try {
-    const res = await axios.put('/ai/model/config', {
+    // 密钥语义：已存密钥且输入框留空 → null（保留原密钥）；输入新值 → 覆盖；
+    // 未存密钥 → 按输入保存（留空即不覆盖、回落 .env）
+    const payload: Record<string, any> = {
       provider: modelCfg.value.provider,
-      api_key: modelCfg.value.api_key,   // 留空=清除覆盖 Key（回落 .env）
       base_url: modelCfg.value.base_url,
       model: modelCfg.value.model,
       backup_provider: modelCfg.value.backup_provider,
-      backup_api_key: modelCfg.value.backup_api_key,   // 留空=清除备用 Key（关闭容灾）
       backup_base_url: modelCfg.value.backup_base_url,
       backup_model: modelCfg.value.backup_model,
-    })
+    }
+    payload.api_key = hasSavedKey.value && !modelCfg.value.api_key ? null : modelCfg.value.api_key
+    payload.backup_api_key = hasSavedBackupKey.value && !modelCfg.value.backup_api_key ? null : modelCfg.value.backup_api_key
+    const res = await axios.put('/ai/model/config', payload)
     if (!res.data?.success) {
       toast.error(res.data?.error || '保存失败')
       return
     }
     modelStatus.value = res.data.config
+    hasSavedKey.value = !!res.data.config?.has_key
+    hasSavedBackupKey.value = !!res.data.config?.backup_has_key
     toast.success('模型接入配置已保存并热生效')
   } catch (e: any) {
     toast.error(e.response?.data?.detail || '保存失败')
   } finally {
     mdSaving.value = false
   }
+}
+// 显式清除已存密钥（主/备）：清除覆盖 Key，回落 .env / 关闭备用容灾
+const clearSavedKey = async (which: 'main' | 'backup') => {
+  const payload: Record<string, any> = {
+    provider: modelCfg.value.provider,
+    base_url: modelCfg.value.base_url,
+    model: modelCfg.value.model,
+  }
+  if (which === 'backup') {
+    Object.assign(payload, {
+      backup_provider: modelCfg.value.backup_provider,
+      backup_base_url: modelCfg.value.backup_base_url,
+      backup_model: modelCfg.value.backup_model,
+      backup_api_key: '',
+    })
+  } else {
+    payload.api_key = ''
+  }
+  mdSaving.value = true
+  try {
+    const res = await axios.put('/ai/model/config', payload)
+    if (!res.data?.success) {
+      toast.error(res.data?.error || '清除失败')
+      return
+    }
+    modelStatus.value = res.data.config
+    if (which === 'backup') hasSavedBackupKey.value = false
+    else hasSavedKey.value = false
+    toast.success(which === 'backup' ? '已清除备用模型密钥（容灾 Key 关闭）' : '已清除主模型密钥（回落 .env）')
+  } catch (e: any) {
+    toast.error(e.response?.data?.detail || '清除失败')
+  } finally {
+    mdSaving.value = false
+  }
+}
+
+// ---------- 联网搜索（博查合规 API，豆包式联网搜索） ----------
+const wsCfg = ref({ enabled: false, provider: 'bocha', has_key: false, max_results: 5 })
+const wsApiKey = ref('')
+const wsSaving = ref(false)
+const wsTesting = ref(false)
+const wsLoading = ref(false)
+const wsStatus = ref('')
+
+const loadWs = async () => {
+  wsLoading.value = true
+  try {
+    const res = await axios.get('/api/web-search/config')
+    if (res.data?.config) {
+      wsCfg.value.enabled = !!res.data.config.enabled
+      wsCfg.value.provider = res.data.config.provider || 'bocha'
+      wsCfg.value.has_key = !!res.data.config.has_key
+      wsCfg.value.max_results = res.data.config.max_results ?? 5
+      wsApiKey.value = ''
+    }
+  } catch { /* ignore */ } finally { wsLoading.value = false }
+}
+
+const saveWs = async () => {
+  wsSaving.value = true
+  try {
+    const payload: Record<string, any> = {
+      enabled: wsCfg.value.enabled,
+      provider: wsCfg.value.provider,
+      max_results: wsCfg.value.max_results,
+    }
+    // 已存 Key + 输入框留空 → null（保留）；输入新值 → 覆盖
+    payload.api_key = wsCfg.value.has_key && !wsApiKey.value ? null : wsApiKey.value
+    const res = await axios.put('/api/web-search/config', payload)
+    if (!res.data?.success) { wsStatus.value = res.data?.error || '保存失败'; return }
+    wsCfg.value.has_key = !!res.data.config?.has_key
+    wsApiKey.value = ''
+    wsStatus.value = '已保存并热生效'
+  } catch (e: any) { wsStatus.value = e.response?.data?.detail || '保存失败' }
+  finally { wsSaving.value = false }
+}
+
+const clearWsKey = async () => {
+  wsSaving.value = true
+  try {
+    const res = await axios.put('/api/web-search/config', {
+      enabled: wsCfg.value.enabled,
+      provider: wsCfg.value.provider,
+      max_results: wsCfg.value.max_results,
+      api_key: '',
+    })
+    if (!res.data?.success) { wsStatus.value = res.data?.error || '清除失败'; return }
+    wsCfg.value.has_key = false
+    wsStatus.value = '已清除搜索 Key（联网搜索将不可用）'
+  } catch (e: any) { wsStatus.value = e.response?.data?.detail || '清除失败' }
+  finally { wsSaving.value = false }
+}
+
+const testWs = async () => {
+  wsTesting.value = true
+  try {
+    const res = await axios.post('/api/web-search/config/test', {
+      api_key: wsApiKey.value || undefined,
+      provider: wsCfg.value.provider,
+      query: '最新国家政策',
+    })
+    wsStatus.value = res.data?.success
+      ? `搜索连通，返回 ${res.data.count ?? 0} 条结果`
+      : (res.data?.error || '测试失败')
+  } catch (e: any) { wsStatus.value = e.response?.data?.detail || '测试失败' }
+  finally { wsTesting.value = false }
 }
 const testModel = async () => {
   if (!modelCfg.value.base_url || !modelCfg.value.model) {
@@ -302,11 +436,13 @@ const testBackupModel = async () => {
   }
 }
 
+// 运行时长：时:分:秒（超 1 天则带「X 天」前缀，秒级跳动）
 const fmtUptime = (s: number) => {
-  if (s < 60) return `${s} 秒`
-  if (s < 3600) return `${Math.floor(s / 60)} 分钟`
-  if (s < 86400) return `${Math.floor(s / 3600)} 小时 ${Math.floor((s % 3600) / 60)} 分`
-  return `${Math.floor(s / 86400)} 天 ${Math.floor((s % 86400) / 3600)} 小时`
+  const h = String(Math.floor(s / 3600)).padStart(2, '0')
+  const m = String(Math.floor((s % 3600) / 60)).padStart(2, '0')
+  const sec = String(s % 60).padStart(2, '0')
+  const d = Math.floor(s / 86400)
+  return d > 0 ? `${d} 天 ${h}:${m}:${sec}` : `${h}:${m}:${sec}`
 }
 
 const thresholdText = (t: string) => {
@@ -319,6 +455,14 @@ onMounted(() => {
   loadWebhook()
   loadModel()
   loadKb()
+  loadWs()
+  // 运行时长每秒跳动 + 动态数据定时自动刷新（无需手动点刷新）
+  tickTimer = setInterval(() => { nowTick.value++ }, 1000)
+  statusTimer = setInterval(() => load(true), AUTO_REFRESH_MS)
+})
+onUnmounted(() => {
+  if (tickTimer) clearInterval(tickTimer)
+  if (statusTimer) clearInterval(statusTimer)
 })
 </script>
 
@@ -326,13 +470,19 @@ onMounted(() => {
   <div class="h-full space-y-4">
     <div class="flex items-center justify-between mb-1">
       <h2 class="text-xl font-bold text-primary">系统状态</h2>
-      <button
-        @click="load"
-        :disabled="loading"
-        class="px-4 py-2 bg-gradient-to-r from-accent to-low text-white rounded-lg text-sm hover:opacity-90 transition-all active:scale-95 disabled:opacity-40"
-      >
-        {{ loading ? '刷新中...' : '刷新' }}
-      </button>
+      <div class="flex items-center gap-3">
+        <span class="text-[11px] text-muted flex items-center gap-1.5">
+          <span class="w-1.5 h-1.5 rounded-full bg-safe animate-pulse"></span>
+          每 {{ AUTO_REFRESH_MS / 1000 }} 秒自动刷新
+        </span>
+        <button
+          @click="load()"
+          :disabled="loading"
+          class="px-4 py-2 bg-gradient-to-r from-accent to-low text-white rounded-lg text-sm hover:opacity-90 transition-all active:scale-95 disabled:opacity-40"
+        >
+          {{ loading ? '刷新中...' : '刷新' }}
+        </button>
+      </div>
     </div>
 
     <!-- 健康横幅 -->
@@ -348,7 +498,7 @@ onMounted(() => {
         {{ status.service.name }} v{{ status.service.version }}
       </span>
       <span v-if="status" class="ml-auto text-xs text-muted tabular-nums">
-        启动 {{ status.service.started_at }} · 已运行 {{ fmtUptime(status.service.uptime_seconds) }}
+        启动 {{ status.service.started_at }} · 已运行 {{ fmtUptime(uptimeSeconds) }}
       </span>
     </div>
 
@@ -572,7 +722,8 @@ onMounted(() => {
           </div>
           <div>
             <label class="block text-xs text-muted mb-1">API Key</label>
-            <input v-model="modelCfg.api_key" type="password" autocomplete="off" placeholder="留空保存 = 清除覆盖 Key（回落 .env）"
+            <input v-model="modelCfg.api_key" type="password" autocomplete="off"
+              :placeholder="hasSavedKey ? '已保存密钥（安全隐藏）· 输入新值可更换，留空保存则保留' : '留空 = 不覆盖（回落 .env）'"
               class="w-full px-3 py-2 bg-canvas border border-border-default text-primary placeholder:text-disabled rounded-lg text-sm font-mono focus:outline-none focus:ring-2 focus:ring-accent/20 focus:border-accent" />
           </div>
         </div>
@@ -584,6 +735,7 @@ onMounted(() => {
           >{{ mdTesting ? '测试中...' : '主模型连通测试' }}</button>
           <span v-if="modelStatus" class="text-[11px] text-muted">
             <span :class="modelStatus.has_key ? 'text-safe' : 'text-critical'">{{ modelStatus.has_key ? '已配置 Key（安全隐藏，不在输入框回显）' : '未配置 Key（回退规则检测）' }}</span>
+            <button v-if="hasSavedKey" @click="clearSavedKey('main')" class="ml-1.5 text-[11px] text-critical hover:underline">清除密钥</button>
             <template v-if="modelStatus.backup_has_key && modelStatus.backup_base_url"> · 已启用备用容灾</template>
           </span>
         </div>
@@ -622,7 +774,8 @@ onMounted(() => {
           </div>
           <div>
             <label class="block text-xs text-muted mb-1">API Key</label>
-            <input v-model="modelCfg.backup_api_key" type="password" autocomplete="off" placeholder="留空保存 = 关闭备用容灾"
+            <input v-model="modelCfg.backup_api_key" type="password" autocomplete="off"
+              :placeholder="hasSavedBackupKey ? '已保存密钥（安全隐藏）· 输入新值可更换，留空保存则保留' : '留空 = 不配置备用 Key（关闭容灾）'"
               class="w-full px-3 py-2 bg-canvas border border-border-default text-primary placeholder:text-disabled rounded-lg text-sm font-mono focus:outline-none focus:ring-2 focus:ring-accent/20 focus:border-accent" />
           </div>
         </div>
@@ -632,6 +785,10 @@ onMounted(() => {
             :disabled="mdBackupTesting"
             class="px-3.5 py-1.5 rounded-lg text-xs bg-elevated border border-border-default text-secondary hover:border-accent/40 hover:text-accent transition-colors disabled:opacity-50"
           >{{ mdBackupTesting ? '测试中...' : '备用模型连通测试' }}</button>
+          <span v-if="modelStatus?.backup_has_key" class="text-[11px]">
+            <span class="text-safe">已配置备用 Key（安全隐藏）</span>
+            <button @click="clearSavedKey('backup')" class="ml-1.5 text-[11px] text-critical hover:underline">清除密钥</button>
+          </span>
         </div>
       </div>
 
@@ -645,6 +802,72 @@ onMounted(() => {
           {{ modelStatus.provider === 'openai' ? 'OpenAI 兼容' : '智谱' }} · {{ modelStatus.model }}
           · <span :class="modelStatus.has_key ? 'text-safe' : 'text-critical'">{{ modelStatus.has_key ? '已配置 Key' : '未配置 Key（回退规则检测）' }}</span>
         </span>
+      </div>
+
+      <!-- 联网搜索（豆包式联网：博查合规 API） -->
+      <div class="rounded-xl border border-border-default p-4 bg-canvas/40">
+        <div class="flex items-center justify-between mb-2">
+          <h3 class="text-sm font-semibold text-secondary">联网搜索</h3>
+          <button
+            @click="loadWs"
+            :disabled="wsLoading"
+            class="px-2.5 py-1 rounded-md text-xs bg-elevated border border-border-default text-secondary hover:border-accent/40 hover:text-accent transition-colors disabled:opacity-50"
+          >{{ wsLoading ? '刷新中...' : '刷新' }}</button>
+        </div>
+        <p class="text-xs text-muted mb-3">
+          为智能问答提供<strong class="text-primary">豆包式联网搜索</strong>：当提问涉及最新新闻、实时政策、天气行情等外部实时信息时，AI 将联网检索并附来源。
+          搜索后端为<code class="text-accent">博查 Bocha</code>（国内合规 LLM 搜索 API）；结果链接自动经过域名黑名单 / 内网 IP / 危险协议过滤，全程审计留痕。
+        </p>
+
+        <div class="flex items-center justify-between rounded-lg bg-canvas border border-border-default px-3 py-2 mb-3">
+          <div>
+            <div class="text-sm text-primary font-medium">启用联网搜索</div>
+            <div class="text-[11px] text-muted">关闭后智能问答不发起任何联网请求（安全优先）</div>
+          </div>
+          <button role="switch" :aria-checked="wsCfg.enabled"
+            @click="wsCfg.enabled = !wsCfg.enabled"
+            class="relative w-11 h-6 rounded-full transition-colors shrink-0"
+            :class="wsCfg.enabled ? 'bg-accent' : 'bg-border-default'">
+            <span class="absolute top-0.5 left-0.5 w-5 h-5 rounded-full bg-white transition-transform"
+              :class="wsCfg.enabled ? 'translate-x-5' : ''"></span>
+          </button>
+        </div>
+
+        <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+          <div>
+            <label class="block text-xs text-muted mb-1">搜索服务</label>
+            <select v-model="wsCfg.provider"
+              class="w-full px-3 py-2 bg-canvas border border-border-default text-primary rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-accent/20 focus:border-accent">
+              <option value="bocha">博查 Bocha（国内合规）</option>
+            </select>
+          </div>
+          <div>
+            <label class="block text-xs text-muted mb-1">最大结果数（1-10）</label>
+            <input v-model.number="wsCfg.max_results" type="number" min="1" max="10"
+              class="w-full px-3 py-2 bg-canvas border border-border-default text-primary rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-accent/20 focus:border-accent" />
+          </div>
+        </div>
+
+        <div class="mt-3">
+          <label class="block text-xs text-muted mb-1">API Key</label>
+          <input v-model="wsApiKey" type="password" autocomplete="off"
+            :placeholder="wsCfg.has_key ? '已保存 Key（安全隐藏）· 输入新值可更换，留空保存则保留' : '博查 API Key（https://open.bochaai.com 申请）'"
+            class="w-full px-3 py-2 bg-canvas border border-border-default text-primary placeholder:text-disabled rounded-lg text-sm font-mono focus:outline-none focus:ring-2 focus:ring-accent/20 focus:border-accent" />
+        </div>
+
+        <div class="mt-2 flex items-center gap-2 flex-wrap">
+          <button @click="saveWs" :disabled="wsSaving"
+            class="px-3.5 py-1.5 rounded-lg text-xs bg-accent/15 text-accent border border-accent/30 hover:bg-accent/25 transition-colors disabled:opacity-50">
+            {{ wsSaving ? '保存中...' : '保存并热生效' }}</button>
+          <button @click="testWs" :disabled="wsTesting"
+            class="px-3.5 py-1.5 rounded-lg text-xs bg-elevated border border-border-default text-secondary hover:border-accent/40 hover:text-accent transition-colors disabled:opacity-50">
+            {{ wsTesting ? '测试中...' : '搜索连通测试' }}</button>
+          <span v-if="wsCfg.has_key" class="text-[11px]">
+            <span class="text-safe">已配置 Key（安全隐藏）</span>
+            <button @click="clearWsKey" class="ml-1.5 text-[11px] text-critical hover:underline">清除密钥</button>
+          </span>
+          <span v-if="wsStatus" class="text-[11px] text-muted">{{ wsStatus }}</span>
+        </div>
       </div>
     </div>
 

@@ -102,6 +102,9 @@ class DockerToolExecutor:
         Returns:
             ToolResult
         """
+        # 联网搜索：真实联网调用（需本地 API Key 与出网，不走沙箱/模拟）
+        if tool_name == "web_search":
+            return self._execute_local(tool_name, args)
         if self.docker_available:
             return self._execute_in_docker(tool_name, args)
         else:
@@ -219,6 +222,8 @@ class DockerToolExecutor:
                 output = self._sim_generate_report(args)
             elif tool_name == "export_data":
                 output = self._sim_export_data(args)
+            elif tool_name == "web_search":
+                output = self._run_web_search(args)
             else:
                 return ToolResult(
                     success=False,
@@ -309,6 +314,18 @@ class DockerToolExecutor:
             return "\n".join(lines)
         except Exception as e:  # noqa: BLE001
             return f"[知识库] 检索服务暂不可用: {e}"
+
+    def _run_web_search(self, args: dict) -> str:
+        """真实联网搜索（博查合规 API）：调用 web_search 模块并格式化为模型可读文本"""
+        query = (args.get("query") or "").strip()
+        if not query:
+            return "[web_search] 缺少参数 query"
+        try:
+            from security.web_search import WebSearchProvider, _fmt_results_for_agent
+            out = WebSearchProvider().search(query)
+            return _fmt_results_for_agent(out)
+        except Exception as e:  # noqa: BLE001 —— 搜索异常不允许拖垮问答主流程
+            return f"[web_search] 联网搜索服务异常: {str(e)[:120]}"
 
     def _sim_draft_document(self, args: dict) -> str:
         """拟稿助手：依据知识库起草公文/通知（草稿，含 AIGC 标识与人工核定提示）"""

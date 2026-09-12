@@ -260,6 +260,53 @@ async def test_model_config(request: Request, payload: dict):
     return {"success": True, "detail": detail}
 
 
+# ==================== 联网搜索配置（P2-3 产品线扩展：豆包式联网搜索，博查合规 API） ====================
+
+
+@router.get("/api/web-search/config")
+async def get_web_search_config(request: Request):
+    """联网搜索配置查询（仅管理员：含启用状态与 Key 存在性，Key 安全隐藏）。"""
+    if not _admin_guard(request):
+        return {"success": False, "error": "无权限：需要系统管理员身份"}
+    from security.web_search import WebSearchProvider
+    return {"success": True, "config": WebSearchProvider().runtime_status()}
+
+
+@router.put("/api/web-search/config")
+async def set_web_search_config(request: Request):
+    """更新联网搜索配置（仅管理员）：enabled/provider/api_key/max_results，热生效。"""
+    if not _admin_guard(request):
+        return {"success": False, "error": "无权限：需要系统管理员身份"}
+    from security.web_search import WebSearchProvider
+    body = await _body(request)
+    if body.get("provider") not in (None, "bocha"):
+        return {"success": False, "error": "provider 仅支持 bocha"}
+    try:
+        WebSearchProvider().save_config(body)
+    except ValueError as e:
+        return {"success": False, "error": str(e)}
+    return {"success": True, "config": WebSearchProvider().runtime_status()}
+
+
+@router.post("/api/web-search/config/test")
+async def test_web_search_config(request: Request):
+    """联网搜索连通性测试（仅管理员）：用给定 Key（或当前已存 Key）执行一次搜索，不落库。"""
+    if not _admin_guard(request):
+        return {"success": False, "error": "无权限：需要系统管理员身份"}
+    from security.web_search import WebSearchProvider
+    body = await _body(request)
+    out = WebSearchProvider().test_connect(
+        api_key=body.get("api_key"),
+        provider=body.get("provider"),
+        query=str(body.get("query") or "最新国家政策"),
+    )
+    return {
+        "success": out.get("success", False),
+        "error": out.get("error"),
+        "count": len(out.get("results", [])),
+    }
+
+
 # ==================== 可观测性大盘（S1：运维指标只读端点） ====================
 
 

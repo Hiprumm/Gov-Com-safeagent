@@ -1,10 +1,12 @@
 <script setup lang="ts">
-import { ref, watch, onMounted, onUnmounted, nextTick } from 'vue'
+import { ref, computed, watch, onMounted, onUnmounted, nextTick } from 'vue'
 import axios from 'axios'
 import { toast } from '@/composables/useToast'
 import { useWebSocket } from '@/composables/useWebSocket'
+import { useSessionSidebar } from '@/composables/useSessionSidebar'
 import { renderMarkdown } from '@/utils/markdown'
 import ThinkingBlock from './ThinkingBlock.vue'
+import FileTypeIcon from './FileTypeIcon.vue'
 
 /** AI 思考过程中的一条推理步骤（后端 /api/agent/chat/stream 的 thinking 事件） */
 interface ThinkingStep {
@@ -27,6 +29,8 @@ interface Message {
   imageUrl?: string
   /** assistant 消息的思考过程（历史回显时从 metadata 还原） */
   thinkingSteps?: ThinkingStep[]
+  /** 思考时长（秒）：从发起请求（开始思考）到首个内容输出为止，实时计算 */
+  thinkingSeconds?: number
   /** 流式回答中的临时气泡标记（接收 content 增量期间为 true，done 后收敛） */
   streaming?: boolean
 }
@@ -52,18 +56,53 @@ const messages = ref<Message[]>([
 ])
 
 const inputMessage = ref('')
+/** 输入框自动增高：随内容行数自适应高度（上限 200px 后内部滚动） */
+const inputRef = ref<HTMLTextAreaElement | null>(null)
+function autoResizeTextarea() {
+  const el = inputRef.value
+  if (!el) return
+  el.style.height = 'auto'
+  el.style.height = `${Math.min(el.scrollHeight, 200)}px`
+}
+watch(inputMessage, () => nextTick(autoResizeTextarea))
 const isLoading = ref(false)
 /**
  * 按会话隔离的输入框草稿：切换会话时还原各自的未发送内容。
  * keys: session_id -> 输入框文本
  */
 const sessionDrafts = ref<Record<string, string>>({})
-/** 待发送的附件（图片/文件）：选择后暂存预览，点击「发送」才真正上传 */
-const pendingAttachment = ref<{ dataUrl: string; name: string; type: string; isImage: boolean } | null>(null)
+/** 单个待发送附件（图片/文件） */
+interface PendingAttachment {
+  dataUrl: string
+  /** 缩略图 dataUrl（图片：canvas 压缩生成；非图片为空，用类型图标占位） */
+  thumbnail: string
+  name: string
+  type: string
+  /** 文件字节数，用于展示大小 */
+  size: number
+  isImage: boolean
+  /** 上传状态：pending 待发送 / uploading 上传中 / success 成功 / error 失败 */
+  status: 'pending' | 'uploading' | 'success' | 'error'
+  errorMsg?: string
+}
+/** 待发送的附件列表（多文件上传）：选择后暂存预览，点击「发送」才真正上传 */
+const pendingAttachments = ref<PendingAttachment[]>([])
+/** 发送后的上传队列：展示上传中/成功/失败状态，与待发送预览区互斥显示 */
+const uploadQueue = ref<PendingAttachment[]>([])
+/** 非图片文件的点击预览（大图标 + 文件信息） */
+const previewAttachment = ref<PendingAttachment | null>(null)
 /** 引用回复：点「引用」后置此引用目标，发送时作为上下文带上 */
 const quoteMessage = ref<Message | null>(null)
 /** 当前流式"思考中"已到达的步骤（边推边渲染，done 后随正式消息落库） */
 const activeThinking = ref<ThinkingStep[]>([])
+/** 思考计时（秒，实时跳动）：从发起请求（开始思考）到首个内容输出为止 */
+const thinkingElapsed = ref(0)
+let thinkTicker: ReturnType<typeof setInterval> | null = null
+/** 停止思考计时并返回最终思考秒数 */
+function stopThinkTimer(): number {
+  if (thinkTicker) { clearInterval(thinkTicker); thinkTicker = null }
+  return thinkingElapsed.value
+}
 /** 尚无流式内容气泡时的"思考中"独立展示开关：首个 content 事件后移交消息内部展示，
  *  保证思考块始终位于内容气泡上方（流式期间与完成态布局一致，不再跳动） */
 const thinkingOnly = ref(false)
@@ -72,7 +111,6 @@ let streamAbortController: AbortController | null = null
 const messageIdCounter = ref(2)
 const sessionId = ref<string | null>(null)
 const fileInput = ref<HTMLInputElement | null>(null)
-const imageInput = ref<HTMLInputElement | null>(null)
 /** 聊天消息滚动容器：新增内容时自动滚到底部，确保最新消息始终可见 */
 const scrollContainer = ref<HTMLElement | null>(null)
 /** 撤回确认预览（GET /ai/agent/recall_preview 返回的影响面） */
@@ -93,7 +131,8 @@ const recallModal = ref<{
 }>({ show: false, message: null, preview: null, loading: false })
 const sessions = ref<SessionItem[]>([])
 const isLoadingSessions = ref(false)
-const showSessionSidebar = ref(false)
+// ---- 会话列表侧边栏收拉：状态记忆（localStorage）+ 平滑过渡（逻辑在 useSessionSidebar，便于单测） ----
+const { expanded: showSessionSidebar, toggle: toggleSessionSidebar, close: closeSessionSidebar } = useSessionSidebar(() => { loadSessions() })
 const editingMessageId = ref<number | null>(null)
 /** 悬停中的消息 ID：仅用于控制消息操作选项的显示（hover 时显示，移开后隐藏） */
 const hoveredMessageId = ref<number | null>(null)
@@ -109,6 +148,9 @@ function closeImagePreview() {
 function onPreviewKeydown(e: KeyboardEvent) {
   if (e.key === 'Escape' && previewImageUrl.value) {
     closeImagePreview()
+  }
+  if (e.key === 'Escape' && previewAttachment.value) {
+    closeAttachmentPreview()
   }
 }
 
@@ -314,7 +356,7 @@ const createNewSession = async () => {
     sessionId.value = response.data.session_id
     // 新会话：清空输入框草稿与待发送附件
     inputMessage.value = ''
-    pendingAttachment.value = null
+    pendingAttachments.value = []
     messages.value = [
       {
         id: messageIdCounter.value++,
@@ -388,20 +430,28 @@ async function trySyncHistoryIds(): Promise<void> {
 /**
  * 通过 SSE 接口 /ai/agent/chat/stream 实时消费 AI 思考步骤与最终回复。
  * 思考步骤仅来自后端真实节点产出；期间以 activeThinking 实时驱动"思考中"气泡。
+ * @returns true 正常完成 / false 失败 / null 用户主动中止
  */
 async function streamAnswer(
   userContent: string,
   opts: { url?: string; init?: RequestInit } = {},
-): Promise<void> {
+): Promise<boolean | null> {
   // 绑定本次流式的中止控制器，供用户撤回提问时立即取消
   const controller = new AbortController()
   streamAbortController = controller
   let didAbort = false
+  let outcome: boolean | null = false
 
   const token = localStorage.getItem('auth_token') || ''
 
   activeThinking.value = []
   thinkingOnly.value = true
+  // 思考计时起点：发起请求即视为"开始思考"，实时跳动至首个内容输出
+  const thinkStart = Date.now()
+  thinkingElapsed.value = 0
+  if (thinkTicker) clearInterval(thinkTicker)
+  thinkTicker = setInterval(() => { thinkingElapsed.value = (Date.now() - thinkStart) / 1000 }, 200)
+  let thinkSeconds: number | null = null
   let committed: Message | null = null
   try {
     // 附件（图片/文件）流式：opts.init 提供完整请求（POST JSON 携带文件数据与附言）；
@@ -447,6 +497,7 @@ async function streamAnswer(
             if (!delta) continue
             if (streamingIdx === -1) {
               thinkingOnly.value = false  // 内容气泡已出现：思考块移交消息内部（内容上方）展示
+              thinkSeconds = stopThinkTimer()  // 首个内容输出：思考计时截止
               streamingIdx = messages.value.length
               messages.value.push({
                 id: messageIdCounter.value++,
@@ -454,13 +505,15 @@ async function streamAnswer(
                 role: 'assistant',
                 timestamp: new Date(),
                 type: 'text',
-                streaming: true
+                streaming: true,
+                thinkingSeconds: thinkSeconds
               })
             } else {
               const prev = messages.value[streamingIdx]
               messages.value[streamingIdx] = { ...prev, content: (prev.content || '') + delta }
             }
           } else if (event === 'done') {
+            outcome = true
             sessionId.value = data.session_id || sessionId.value
             thinkingSteps = data.thinking_steps || thinkingSteps
             try {
@@ -474,7 +527,8 @@ async function streamAnswer(
               timestamp: new Date(),
               riskLevel: data.risk_level,
               type: 'text',
-              thinkingSteps
+              thinkingSteps,
+              thinkingSeconds: thinkSeconds ?? 0
             }
             if (streamingIdx !== -1) {
               // 用最终内容收敛已流式显示的气泡，避免重复追加
@@ -497,6 +551,7 @@ async function streamAnswer(
     if ((e as Error).name === 'AbortError') {
       // 用户已撤回提问：安静中止，不再回填错误或继续推送回复
       didAbort = true
+      outcome = null
     } else {
       const msg = (e as Error).message || '网络错误，请稍后重试'
       if (msg.includes('401')) {
@@ -504,9 +559,11 @@ async function streamAnswer(
       } else {
         toast.error(msg)
       }
+      outcome = false
     }
     committed = null
   } finally {
+    stopThinkTimer()  // 清理思考计时（已出内容时返回值不再被使用）
     isLoading.value = false
     activeThinking.value = []
     thinkingOnly.value = false
@@ -528,6 +585,7 @@ async function streamAnswer(
       type: 'text'
     })
   }
+  return outcome
 }
 
 /** 立即中止当前正在进行的流式问答（用于用户撤回提问：不再继续思考与回复） */
@@ -547,34 +605,41 @@ function stopGenerating(): void {
 
 const sendMessage = async () => {
   const text = inputMessage.value.trim()
-  const attachment = pendingAttachment.value
+  const attachments = pendingAttachments.value
   const quote = quoteMessage.value
-  if ((!text && !attachment && !quote) || isLoading.value) return
+  if ((!text && !attachments.length && !quote) || isLoading.value) return
 
   isLoading.value = true
 
-  // 1) 有附件（图片/文件）：附件与输入的文字合并为同一条用户消息发送，
+  // 1) 有附件（图片/文件，支持多个）：附件与输入的文字合并为同一条用户消息发送，
   //    图片/文件 + 文字描述一起展示在一个对话框里，不分开发送
-  if (attachment) {
-    pendingAttachment.value = null
+  if (attachments.length) {
+    // 附件转入上传队列，实时展示「上传中 → 成功/失败」状态
+    uploadQueue.value = attachments.map(a => ({ ...a, status: 'uploading' as const }))
+    pendingAttachments.value = []
     const userText = quote ? buildQuotedText(quote, text) : text
-    const fileData = (attachment.dataUrl.split(',')[1] || attachment.dataUrl)
+    const files = attachments.map(a => ({
+      file_data: a.dataUrl.split(',')[1] || a.dataUrl,
+      file_type: a.type,
+      filename: a.name,
+    }))
+    const names = attachments.map(a => a.name).join('、')
+    const hasImage = attachments.some(a => a.isImage)
     const userMessage: Message = {
       id: messageIdCounter.value++,
-      content: userText || (attachment.isImage ? `[图片上传] ${attachment.name}` : `[文件上传] ${attachment.name}`),
+      content: userText || (hasImage ? `[图片上传] ${names}` : `[文件上传] ${names}`),
       role: 'user',
       timestamp: new Date(),
-      type: attachment.isImage ? 'image' : 'file',
-      fileName: attachment.name,
-      ...(attachment.isImage ? { imageUrl: attachment.dataUrl } : {})
+      type: hasImage ? 'image' : 'file',
+      fileName: names,
+      ...(hasImage ? { imageUrl: attachments.find(a => a.isImage)?.dataUrl } : {})
     }
     messages.value.push(userMessage)
     inputMessage.value = ''
     quoteMessage.value = null
 
     // 附件问答走流式：识别阶段"思考中" + AI 逐 token 输出，与普通问答体验一致
-    // （isLoading 复位与失败兜底由 streamAnswer 内部处理）
-    await streamAnswer(userText || `[图片上传] ${attachment.name}`, {
+    const outcome = await streamAnswer(userText || (hasImage ? `[图片上传] ${names}` : `[文件上传] ${names}`), {
       url: '/ai/agent/file/stream',
       init: {
         method: 'POST',
@@ -583,14 +648,31 @@ const sendMessage = async () => {
           'X-Auth-Token': localStorage.getItem('auth_token') || '',
         },
         body: JSON.stringify({
-          file_data: fileData,
-          file_type: attachment.type,
-          filename: attachment.name,
+          files,
           session_id: sessionId.value,
           user_text: userText || undefined,
         }),
       },
     })
+    if (outcome === true) {
+      // 上传成功：短暂展示「已上传」后自动收起
+      uploadQueue.value = uploadQueue.value.map(a => ({ ...a, status: 'success' as const }))
+      setTimeout(() => {
+        if (uploadQueue.value.length && uploadQueue.value.every(a => a.status === 'success')) {
+          uploadQueue.value = []
+        }
+      }, 2500)
+    } else if (outcome === false) {
+      // 上传失败：保留队列并标记失败，提供「重试 / 移除」
+      uploadQueue.value = uploadQueue.value.map(a => ({
+        ...a,
+        status: 'error' as const,
+        errorMsg: '上传失败，请重试或移除后重新发送',
+      }))
+    } else {
+      // 用户主动停止/取消：不再保留队列
+      uploadQueue.value = []
+    }
   } else if (text || quote) {
     // 2) 仅文字（或仅有引用）：作为普通文本问题发送
     const finalText = quote ? buildQuotedText(quote, text) : text
@@ -617,53 +699,127 @@ function isAttachmentPlaceholder(content?: string): boolean {
   return !!(content && (content.startsWith('[图片上传]') || content.startsWith('[文件上传]')))
 }
 
+/** 格式化文件大小：B / KB / MB / GB */
+function formatFileSize(bytes: number): string {
+  if (!bytes || bytes <= 0) return '0 B'
+  const units = ['B', 'KB', 'MB', 'GB']
+  let value = bytes
+  let unit = 0
+  while (value >= 1024 && unit < units.length - 1) {
+    value /= 1024
+    unit++
+  }
+  return `${value >= 100 ? Math.round(value) : value.toFixed(1)} ${units[unit]}`
+}
+
+/** 为图片 dataUrl 生成合适尺寸的缩略图（canvas 等比压缩，最长边 maxSize） */
+function createImageThumbnail(dataUrl: string, maxSize = 220): Promise<string> {
+  return new Promise((resolve) => {
+    const img = new Image()
+    img.onload = () => {
+      try {
+        const scale = Math.min(1, maxSize / Math.max(img.width, img.height))
+        const w = Math.max(1, Math.round(img.width * scale))
+        const h = Math.max(1, Math.round(img.height * scale))
+        const canvas = document.createElement('canvas')
+        canvas.width = w
+        canvas.height = h
+        const ctx = canvas.getContext('2d')
+        if (!ctx) { resolve(dataUrl); return }
+        ctx.drawImage(img, 0, 0, w, h)
+        resolve(canvas.toDataURL('image/jpeg', 0.85))
+      } catch {
+        resolve(dataUrl)
+      }
+    }
+    img.onerror = () => resolve(dataUrl)
+    img.src = dataUrl
+  })
+}
+
 const handleFileUpload = (event: Event) => {
   const target = event.target as HTMLInputElement
-  const file = target.files?.[0]
+  const fileList = target.files
 
-  if (!file || isLoading.value) {
+  if (!fileList || !fileList.length || isLoading.value) {
     target.value = ''
     return
   }
 
-  const reader = new FileReader()
-  reader.onload = (e) => {
-    pendingAttachment.value = {
-      dataUrl: e.target?.result as string,
-      name: file.name,
-      type: file.type || 'application/octet-stream',
-      isImage: (file.type || '').startsWith('image/')
-    }
-  }
-  reader.readAsDataURL(file)
-  target.value = ''
-}
-
-const handleImageUpload = (event: Event) => {
-  const target = event.target as HTMLInputElement
-  const file = target.files?.[0]
-
-  if (!file || isLoading.value || !file.type.startsWith('image/')) {
+  const selected = Array.from(fileList)
+  const MAX_ATTACHMENTS = 9
+  if (pendingAttachments.value.length + selected.length > MAX_ATTACHMENTS) {
+    toast.warning(`最多同时上传 ${MAX_ATTACHMENTS} 个附件`)
     target.value = ''
     return
   }
 
-  const reader = new FileReader()
-  reader.onload = (e) => {
-    pendingAttachment.value = {
-      dataUrl: e.target?.result as string,
-      name: file.name,
-      type: file.type,
-      isImage: true
+  selected.forEach(file => {
+    const reader = new FileReader()
+    reader.onload = (e) => {
+      const dataUrl = e.target?.result as string
+      const isImage = (file.type || '').startsWith('image/')
+      const attachment: PendingAttachment = {
+        dataUrl,
+        thumbnail: isImage ? dataUrl : '',
+        name: file.name,
+        type: file.type || 'application/octet-stream',
+        size: file.size,
+        isImage,
+        status: 'pending',
+      }
+      pendingAttachments.value.push(attachment)
+      // 图片异步生成压缩缩略图，完成后原地替换，避免大图直接渲染
+      if (isImage) {
+        createImageThumbnail(dataUrl).then(thumb => {
+          const idx = pendingAttachments.value.indexOf(attachment)
+          if (idx !== -1) {
+            pendingAttachments.value[idx] = { ...pendingAttachments.value[idx], thumbnail: thumb }
+          }
+        })
+      }
     }
-  }
-  reader.readAsDataURL(file)
+    reader.readAsDataURL(file)
+  })
   target.value = ''
 }
 
-/** 移除待发送的附件（不发） */
-const removePendingAttachment = () => {
-  pendingAttachment.value = null
+/** 预览区统一数据源：发送后显示上传队列，发送前显示待发送列表 */
+const displayAttachments = computed<PendingAttachment[]>(() =>
+  uploadQueue.value.length ? uploadQueue.value : pendingAttachments.value
+)
+
+/** 点击缩略图：图片放大预览；非图片弹出文件信息预览 */
+const handleAttachmentClick = (att: PendingAttachment) => {
+  if (att.status === 'uploading' || att.status === 'error') return
+  if (att.isImage) {
+    previewImageUrl.value = att.dataUrl
+  } else {
+    previewAttachment.value = att
+  }
+}
+
+/** 移除待发送/已失败的附件 */
+const removeDisplayAttachment = (index: number) => {
+  if (uploadQueue.value.length) {
+    uploadQueue.value.splice(index, 1)
+  } else {
+    pendingAttachments.value.splice(index, 1)
+  }
+}
+
+/** 失败附件重试：移回待发送列表（状态重置），用户再次点「发送」重新上传 */
+const retryUpload = (index: number) => {
+  const [att] = uploadQueue.value.splice(index, 1)
+  if (att) {
+    pendingAttachments.value.push({ ...att, status: 'pending', errorMsg: undefined })
+    toast.warning(`「${att.name}」已移回待发送，请重新发送`)
+  }
+}
+
+/** 关闭非图片文件预览弹窗 */
+function closeAttachmentPreview() {
+  previewAttachment.value = null
 }
 
 const getRiskLevelColor = (riskLevel?: string) => {
@@ -1027,7 +1183,7 @@ const switchSession = async (sessionItem: SessionItem) => {
   // 切换前，先保存当前会话的输入框草稿（及待发送附件）
   saveCurrentDraft()
   isLoading.value = true
-  showSessionSidebar.value = false
+  closeSessionSidebar()
   try {
     const response = await axios.get('/ai/agent/history', {
       params: {
@@ -1177,30 +1333,42 @@ onUnmounted(() => {
 <template>
   <div class="h-full flex relative">
     <!-- 移动端会话侧边栏遮罩 -->
+    <Transition name="fade">
+      <div
+        v-if="showSessionSidebar"
+        @click="closeSessionSidebar()"
+        class="absolute inset-0 bg-black/50 backdrop-blur-sm z-10 sm:hidden"
+      ></div>
+    </Transition>
+    <!-- 会话列表侧边栏（可收拉：桌面端宽度过渡让出空间，移动端滑入/滑出不占布局） -->
     <div
-      v-if="showSessionSidebar"
-      @click="showSessionSidebar = false"
-      class="absolute inset-0 bg-black/50 backdrop-blur-sm z-10 sm:hidden"
-    ></div>
-    <!-- 会话列表侧边栏 -->
-    <div
-      v-if="showSessionSidebar"
-      class="w-64 sm:w-72 absolute sm:relative z-20 h-full bg-surface border-r border-border-default flex flex-col"
+      :class="[
+        'z-20 h-full bg-surface border-r border-border-default flex flex-col overflow-hidden',
+        'absolute sm:relative transition-all duration-300 ease-in-out',
+        showSessionSidebar
+          ? 'w-64 sm:w-72 translate-x-0'
+          : 'w-64 sm:w-0 -translate-x-full sm:translate-x-0 sm:border-r-0'
+      ]"
     >
       <div class="p-4 border-b border-border-default flex items-center justify-between">
         <h3 class="font-semibold text-primary">历史会话</h3>
         <button
-          @click="showSessionSidebar = false"
-          class="p-1 hover:bg-hover rounded-lg transition-all active:scale-95"
+          @click="toggleSessionSidebar()"
+          class="p-1.5 hover:bg-hover rounded-lg transition-all active:scale-95"
+          :title="showSessionSidebar ? '收起会话列表（聊天区域将自动加宽）' : '展开会话列表'"
         >
-          <svg class="w-5 h-5 text-muted" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path>
+          <svg
+            class="w-5 h-5 text-muted transition-transform duration-300"
+            :class="showSessionSidebar ? '' : 'rotate-180'"
+            fill="none" stroke="currentColor" viewBox="0 0 24 24"
+          >
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 19l-7-7 7-7"></path>
           </svg>
         </button>
       </div>
       <div class="flex-1 overflow-y-auto min-h-0 p-2">
         <button
-          @click="createNewSession(); showSessionSidebar = false"
+          @click="createNewSession(); closeSessionSidebar()"
           class="w-full p-3 mb-2 text-left bg-accent/10 text-accent rounded-lg hover:bg-accent/20 transition-all active:scale-95 flex items-center gap-2"
         >
           <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -1272,10 +1440,10 @@ onUnmounted(() => {
       </div>
     </div>
 
-    <!-- 主聊天区域 -->
-    <div class="flex-1 flex flex-col">
+    <!-- 主聊天区域（整体共享对话栏底色，让输入胶囊悬浮其上） -->
+    <div class="flex-1 flex flex-col bg-elevated/50 rounded-lg">
       <!-- 聊天区域 -->
-      <div ref="scrollContainer" class="flex-1 overflow-y-auto space-y-4 p-4 bg-elevated/50 rounded-lg mb-4">
+      <div ref="scrollContainer" class="flex-1 overflow-y-auto space-y-4 p-4">
       <div
         v-for="message in messages"
         :key="message.id"
@@ -1309,11 +1477,13 @@ onUnmounted(() => {
             v-if="message.role === 'assistant' && message.thinkingSteps && message.thinkingSteps.length"
             :steps="message.thinkingSteps"
             :streaming="false"
+            :elapsed="message.thinkingSeconds"
           />
           <ThinkingBlock
             v-else-if="message.role === 'assistant' && message.streaming"
             :steps="activeThinking"
             :streaming="true"
+            :elapsed="thinkingElapsed"
           />
           <!-- 图片消息 -->
           <div
@@ -1517,7 +1687,7 @@ onUnmounted(() => {
           智
         </div>
         <div class="flex-1 min-w-0 max-w-[70%]">
-          <ThinkingBlock :steps="activeThinking" :streaming="true" />
+          <ThinkingBlock :steps="activeThinking" :streaming="true" :elapsed="thinkingElapsed" />
         </div>
       </div>
     </div>
@@ -1570,57 +1740,44 @@ onUnmounted(() => {
       </div>
     </div>
 
-    <!-- 工具栏 -->
-    <div class="bg-surface border-t border-border-default p-4 flex-shrink-0">
-      <!-- 功能按钮 -->
-      <div class="flex items-center gap-2 mb-3">
+    <!-- 工具栏（悬浮胶囊输入区） -->
+    <div class="flex-shrink-0 px-4 sm:px-6 pt-2 pb-5">
+      <!-- 功能行（极简：会话侧边栏 / 清空对话） -->
+      <div class="flex items-center gap-1.5 max-w-3xl mx-auto mb-2.5">
         <button
-          @click="showSessionSidebar = !showSessionSidebar; loadSessions()"
+          @click="toggleSessionSidebar()"
           :disabled="isLoading"
-          class="p-2 rounded-lg hover:bg-hover transition-all active:scale-95 disabled:opacity-50"
-          title="历史会话"
+          class="p-2 rounded-full transition-all active:scale-95 disabled:opacity-50 hover:bg-hover"
+          :class="showSessionSidebar ? 'bg-accent/10 text-accent' : 'text-muted hover:text-accent'"
+          :title="showSessionSidebar ? '收起历史会话列表（聊天区域将自动加宽）' : '展开历史会话列表'"
         >
-          <svg class="w-5 h-5 text-secondary" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10"></path>
-          </svg>
-        </button>
-        <button
-          @click="imageInput?.click()"
-          :disabled="isLoading"
-          class="p-2 rounded-lg hover:bg-hover transition-all active:scale-95 disabled:opacity-50"
-          title="上传图片"
-        >
-          <svg class="w-5 h-5 text-secondary" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z"></path>
-          </svg>
-        </button>
-        <button
-          @click="fileInput?.click()"
-          :disabled="isLoading"
-          class="p-2 rounded-lg hover:bg-hover transition-all active:scale-95 disabled:opacity-50"
-          title="上传文件"
-        >
-          <svg class="w-5 h-5 text-secondary" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12"></path>
-          </svg>
+          <span class="relative block">
+            <svg class="w-[18px] h-[18px]" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10"></path>
+            </svg>
+            <svg
+              class="w-3 h-3 absolute -bottom-1.5 -right-1.5 rounded-full bg-elevated border border-border-default transition-transform duration-300"
+              :class="showSessionSidebar ? '' : 'rotate-180'"
+              fill="none" stroke="currentColor" viewBox="0 0 24 24"
+            >
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 19l-7-7 7-7"></path>
+            </svg>
+          </span>
         </button>
         <button
           @click="clearChat"
           :disabled="isLoading"
-          class="p-2 rounded-lg hover:bg-hover transition-all active:scale-95 disabled:opacity-50"
+          class="p-2 rounded-full hover:bg-hover transition-all active:scale-95 disabled:opacity-50 text-muted hover:text-critical"
           title="清空对话"
         >
-          <svg class="w-5 h-5 text-secondary" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <svg class="w-[18px] h-[18px]" fill="none" stroke="currentColor" viewBox="0 0 24 24">
             <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"></path>
           </svg>
         </button>
-        <span v-if="sessionId" class="ml-auto text-xs text-disabled">
-          会话ID: {{ sessionId.slice(0, 8) }}...
-        </span>
       </div>
       
       <!-- 编辑状态提示 -->
-      <div v-if="editingMessageId" class="flex items-center gap-2 mb-2 px-3 py-1.5 bg-accent/10 rounded-lg text-sm">
+      <div v-if="editingMessageId" class="flex items-center gap-2 mb-2 px-3 py-1.5 bg-accent/10 rounded-lg text-sm max-w-3xl mx-auto">
         <svg class="w-4 h-4 text-accent" fill="none" stroke="currentColor" viewBox="0 0 24 24">
           <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z"></path>
         </svg>
@@ -1636,7 +1793,7 @@ onUnmounted(() => {
       </div>
 
       <!-- 编辑图片预览 -->
-      <div v-if="editingMessageImageUrl" class="mb-2 relative inline-block">
+      <div v-if="editingMessageImageUrl" class="mb-2 relative w-fit mx-auto max-w-full">
         <img :src="editingMessageImageUrl" alt="编辑中的图片" class="max-w-xs rounded-lg border-2 border-accent/30" />
         <button
           @click="editingMessageImageUrl = null"
@@ -1649,35 +1806,123 @@ onUnmounted(() => {
         </button>
       </div>
 
-      <!-- 待发送附件预览 -->
-      <div v-if="pendingAttachment" class="mb-2 p-2 pr-10 relative rounded-lg bg-surface border border-border-default">
-        <div class="flex items-center gap-3">
-          <div v-if="pendingAttachment.isImage" class="shrink-0">
-            <img :src="pendingAttachment.dataUrl" alt="待发送图片" class="w-16 h-16 object-cover rounded-md border border-border-default" />
-          </div>
-          <div v-else class="w-8 h-8 rounded-md bg-accent/10 text-accent flex items-center justify-center">
-            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 13h6m-3-3v6m-5-9A3 3 0 015 7V5a2 2 0 012-2h7.586A2 2 0 0116 3.586l3.414 3.414A2 2 0 0120 8.414V19a2 2 0 01-2 2H7a2 2 0 01-2-2v-1" />
-            </svg>
-          </div>
-          <div class="min-w-0">
-            <p class="text-sm text-primary truncate max-w-[180px]">{{ pendingAttachment.name }}</p>
-            <p class="text-[11px] text-disabled">{{ pendingAttachment.isImage ? '图片待发送' : '文件待发送' }}</p>
+      <!-- 附件缩略图网格：待发送预览 与 上传中/成功/失败 状态队列互斥显示 -->
+      <div v-if="displayAttachments.length" class="mb-2 max-w-3xl mx-auto">
+        <p class="text-[11px] text-disabled mb-1.5 pl-0.5">
+          <template v-if="uploadQueue.length && uploadQueue.some(a => a.status === 'uploading')">正在上传 {{ uploadQueue.length }} 个附件…</template>
+          <template v-else-if="uploadQueue.length && uploadQueue.some(a => a.status === 'error')">{{ uploadQueue.filter(a => a.status === 'error').length }} 个附件上传失败，可重试或移除</template>
+          <template v-else-if="uploadQueue.length">全部附件上传成功</template>
+          <template v-else>{{ displayAttachments.length }} 个附件待发送</template>
+        </p>
+        <div class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 gap-2.5">
+          <div
+            v-for="(attachment, index) in displayAttachments"
+            :key="attachment.name + index"
+            :class="[
+              'group relative rounded-xl border bg-surface overflow-hidden transition-all duration-200',
+              attachment.status === 'error'
+                ? 'border-critical/50'
+                : 'border-border-default hover:border-accent/60 hover:shadow-lg hover:shadow-accent/10 hover:-translate-y-0.5',
+              attachment.status === 'success' ? 'border-safe/40' : ''
+            ]"
+          >
+            <!-- 缩略图区域：图片缩略图 / 文件类型图标 -->
+            <div
+              class="relative aspect-square overflow-hidden cursor-pointer"
+              @click="handleAttachmentClick(attachment)"
+              :title="attachment.status === 'pending' || attachment.status === 'success' ? '点击预览' : ''"
+            >
+              <img
+                v-if="attachment.isImage && attachment.thumbnail"
+                :src="attachment.thumbnail"
+                alt="缩略图"
+                class="w-full h-full object-cover transition-transform duration-300 group-hover:scale-110"
+              />
+              <div v-else class="w-full h-full flex items-center justify-center bg-elevated/60">
+                <FileTypeIcon :type="attachment.type" :name="attachment.name" />
+              </div>
+              <!-- 悬停遮罩（可预览态） -->
+              <div
+                v-if="attachment.status === 'pending' || attachment.status === 'success'"
+                class="absolute inset-0 bg-black/35 flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity duration-200"
+              >
+                <svg class="w-7 h-7 text-white drop-shadow" fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                  <circle cx="11" cy="11" r="7"></circle>
+                  <path d="m21 21-4.35-4.35M11 8v6M8 11h6"></path>
+                </svg>
+              </div>
+              <!-- 状态角标 -->
+              <div
+                v-if="attachment.status === 'uploading'"
+                class="absolute top-1.5 right-1.5 w-6 h-6 rounded-full bg-black/55 flex items-center justify-center"
+                title="上传中"
+              >
+                <svg class="w-3.5 h-3.5 text-white animate-spin" viewBox="0 0 24 24" fill="none">
+                  <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+                  <path class="opacity-90" fill="currentColor" d="M4 12a8 8 0 0 1 8-8v4a4 4 0 0 0-4 4H4z"></path>
+                </svg>
+              </div>
+              <div
+                v-else-if="attachment.status === 'success'"
+                class="absolute top-1.5 right-1.5 w-5 h-5 rounded-full bg-safe text-white flex items-center justify-center shadow"
+                title="上传成功"
+              >
+                <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="3" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M20 6 9 17l-5-5"></path>
+                </svg>
+              </div>
+              <div
+                v-else-if="attachment.status === 'error'"
+                class="absolute top-1.5 right-1.5 w-5 h-5 rounded-full bg-critical text-white flex items-center justify-center shadow"
+                title="上传失败"
+              >
+                <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="3" stroke-linecap="round">
+                  <path d="M12 5v8m0 4h.01"></path>
+                </svg>
+              </div>
+              <!-- 移除按钮（上传中不可移除） -->
+              <button
+                v-if="attachment.status !== 'uploading'"
+                @click.stop="removeDisplayAttachment(index)"
+                class="absolute top-1.5 left-1.5 w-5 h-5 rounded-full bg-black/50 text-white flex items-center justify-center opacity-0 group-hover:opacity-100 hover:bg-critical transition-all"
+                :title="attachment.status === 'pending' ? '移除附件' : '移除'"
+              >
+                <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="2.5" stroke-linecap="round">
+                  <path d="M6 18L18 6M6 6l12 12"></path>
+                </svg>
+              </button>
+            </div>
+            <!-- 文件名 + 大小 + 状态文字 -->
+            <div class="px-2 py-1.5 min-w-0">
+              <p class="text-xs text-primary truncate" :title="attachment.name">{{ attachment.name }}</p>
+              <p class="text-[10px] text-disabled mt-0.5 flex items-center gap-1">
+                {{ formatFileSize(attachment.size) }}
+                <template v-if="attachment.status === 'uploading'"><span class="text-accent">· 上传中</span></template>
+                <template v-else-if="attachment.status === 'success'"><span class="text-safe">· 已上传</span></template>
+                <template v-else-if="attachment.status === 'error'"><span class="text-critical">· 失败</span></template>
+              </p>
+            </div>
+            <!-- 失败操作条 -->
+            <div v-if="attachment.status === 'error'" class="flex gap-1.5 px-2 pb-2">
+              <button
+                @click.stop="retryUpload(index)"
+                class="flex-1 text-[11px] py-1 rounded-md bg-critical/10 text-critical border border-critical/20 hover:bg-critical/20 transition-colors"
+              >
+                重试
+              </button>
+              <button
+                @click.stop="removeDisplayAttachment(index)"
+                class="flex-1 text-[11px] py-1 rounded-md bg-elevated text-secondary border border-border-default hover:bg-hover transition-colors"
+              >
+                移除
+              </button>
+            </div>
           </div>
         </div>
-        <button
-          @click="removePendingAttachment"
-          class="absolute top-2 right-2 w-6 h-6 bg-red-500 text-white rounded-full flex items-center justify-center hover:bg-red-600 transition-colors"
-          title="移除附件"
-        >
-          <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path>
-          </svg>
-        </button>
       </div>
 
       <!-- 引用条：点「引用」后显示，发送时作为上下文带上 -->
-      <div v-if="quoteMessage" class="mb-2 p-2 pr-10 relative rounded-lg bg-elevated border-l-2 border-accent">
+      <div v-if="quoteMessage" class="mb-2 p-2 pr-10 relative rounded-lg bg-elevated border-l-2 border-accent max-w-3xl mx-auto">
         <div class="flex items-start gap-2">
           <svg class="w-4 h-4 shrink-0 text-accent mt-0.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
             <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 6h2a2 2 0 012 2v2a2 2 0 01-2 2h-2a4 4 0 004 4m-10 0a4 4 0 010-8 4 4 0 00-4 0H5a2 2 0 01-2-2V8a2 2 0 012-2h2a2 2 0 012 2"></path>
@@ -1698,60 +1943,67 @@ onUnmounted(() => {
         </button>
       </div>
 
-      <!-- 输入框 -->
-      <div class="flex gap-3">
+      <!-- 悬浮胶囊输入框（水平居中 · 超圆角 · 浅毛玻璃 · 聚焦品牌色辉光） -->
+      <div
+        class="max-w-3xl mx-auto flex items-end gap-1.5 rounded-[26px] border border-border-default bg-surface/70 backdrop-blur-xl px-2.5 py-2 shadow-lg shadow-black/5 transition-all duration-300 focus-within:border-accent/50 focus-within:ring-4 focus-within:ring-accent/15 focus-within:shadow-lg focus-within:shadow-accent/20"
+      >
+        <!-- 圆形附件按钮 -->
+        <button
+          @click="fileInput?.click()"
+          :disabled="isLoading"
+          class="w-9 h-9 rounded-full flex items-center justify-center flex-shrink-0 text-muted hover:text-accent hover:bg-accent/10 transition-all active:scale-95 disabled:opacity-50"
+          title="上传图片或文件"
+        >
+          <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4"></path>
+          </svg>
+        </button>
+        <!-- 多行自动增高输入区 -->
         <textarea
+          ref="inputRef"
           v-model="inputMessage"
           @keydown.enter.exact.prevent="editingMessageId ? sendEditedMessage() : sendMessage()"
-          :placeholder="editingMessageImageUrl ? '图片将重新上传进行分析...' : (editingMessageId ? '修改您的问题后重新发送...' : '请输入您的问题...')"
-          class="flex-1 px-4 py-3 bg-elevated border border-border-default text-primary placeholder:text-disabled rounded-xl resize-none focus:outline-none focus:ring-2 focus:ring-accent/20 focus:border-accent"
-          rows="2"
+          @input="autoResizeTextarea"
+          :placeholder="editingMessageImageUrl ? '图片将重新上传进行分析...' : (editingMessageId ? '修改您的问题后重新发送...' : '给 SafeAgent 发送消息…')"
+          class="flex-1 bg-transparent text-primary placeholder:text-disabled text-sm sm:text-base leading-relaxed resize-none outline-none py-1.5 px-1 max-h-[200px]"
+          rows="1"
           :disabled="isLoading"
         ></textarea>
+        <!-- 圆形发送 / 停止按钮（空内容时置灰禁用） -->
         <button
           @click="isLoading ? stopGenerating() : (editingMessageId ? sendEditedMessage() : sendMessage())"
-          :disabled="!isLoading && (!inputMessage.trim() && !pendingAttachment && !editingMessageImageUrl && !quoteMessage)"
-          :title="isLoading ? '停止生成' : ''"
+          :disabled="!isLoading && (!inputMessage.trim() && !pendingAttachments.length && !editingMessageImageUrl && !quoteMessage)"
+          :title="isLoading ? '停止生成' : (editingMessageId ? '重新发送' : '发送')"
           :class="[
-            'px-6 py-3 rounded-xl font-medium transition-all duration-200 flex-shrink-0 active:scale-95',
+            'w-9 h-9 rounded-full flex items-center justify-center flex-shrink-0 transition-all duration-200 active:scale-95',
             isLoading
-              ? 'bg-red-500/95 text-white hover:bg-red-600 shadow-md shadow-red-500/30'
-              : (!inputMessage.trim() && !pendingAttachment && !editingMessageImageUrl && !quoteMessage)
+              ? 'bg-critical text-white hover:opacity-90 shadow-md shadow-critical/30'
+              : (!inputMessage.trim() && !pendingAttachments.length && !editingMessageImageUrl && !quoteMessage)
                 ? 'bg-elevated text-muted cursor-not-allowed'
                 : editingMessageId
-                  ? 'bg-gradient-to-r from-medium to-high text-white hover:opacity-90 shadow-md hover:shadow-lg'
-                  : 'bg-gradient-to-r from-accent to-low text-white hover:opacity-90 shadow-md hover:shadow-lg'
+                  ? 'bg-gradient-to-r from-medium to-high text-white hover:opacity-90 shadow-md shadow-medium/25'
+                  : 'bg-gradient-to-r from-accent to-low text-white hover:opacity-90 shadow-md shadow-accent/25'
           ]"
         >
-          <template v-if="isLoading">
-            <span class="flex items-center gap-1.5">
-              <svg class="w-4 h-4" fill="currentColor" viewBox="0 0 24 24">
-                <rect x="5" y="5" width="5" height="14" rx="1"></rect>
-                <rect x="14" y="5" width="5" height="14" rx="1"></rect>
-              </svg>
-              停止
-            </span>
-          </template>
-          <span v-else-if="editingMessageId">重新发送</span>
-          <span v-else>发送</span>
+          <svg v-if="isLoading" class="w-4 h-4" fill="currentColor" viewBox="0 0 24 24">
+            <rect x="6" y="6" width="4" height="12" rx="1"></rect>
+            <rect x="14" y="6" width="4" height="12" rx="1"></rect>
+          </svg>
+          <svg v-else class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 19V5m-7 7l7-7 7 7"></path>
+          </svg>
         </button>
       </div>
-      <p class="text-xs text-disabled mt-2">按 Enter 键发送，Shift + Enter 换行 | 支持图片和文件上传</p>
+      <p class="text-xs text-disabled text-center mt-2.5">按 Enter 键发送，Shift + Enter 换行 | 支持图片和文件上传</p>
     </div>
 
-    <!-- 隐藏的文件输入 -->
+    <!-- 隐藏的文件输入（multiple：支持一次选择多个图片/文件） -->
     <input
       ref="fileInput"
       type="file"
+      multiple
       class="hidden"
       @change="handleFileUpload"
-    />
-    <input
-      ref="imageInput"
-      type="file"
-      class="hidden"
-      accept="image/*"
-      @change="handleImageUpload"
     />
 
     <!-- 撤回确认弹窗：先展示影响面（连带消息/涉及文件），确认后才执行，仿 agent 执行前告知 -->
@@ -1897,6 +2149,34 @@ onUnmounted(() => {
           class="max-w-full max-h-full object-contain rounded-xl shadow-2xl cursor-zoom-out"
           @click.stop="closeImagePreview"
         />
+      </div>
+    </Teleport>
+
+    <!-- 非图片文件点击预览：大图标 + 文件信息 -->
+    <Teleport to="body">
+      <div
+        v-if="previewAttachment"
+        class="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm p-6"
+        @click="closeAttachmentPreview"
+      >
+        <div
+          class="w-full max-w-sm bg-surface rounded-2xl border border-border-default shadow-2xl p-8 flex flex-col items-center animate-card-in"
+          @click.stop
+        >
+          <FileTypeIcon :type="previewAttachment.type" :name="previewAttachment.name" />
+          <p class="mt-4 text-sm text-primary font-medium text-center break-all">{{ previewAttachment.name }}</p>
+          <div class="mt-3 flex items-center gap-2 text-[11px] text-disabled">
+            <span>{{ previewAttachment.type || '未知类型' }}</span>
+            <span class="w-1 h-1 rounded-full bg-border-default inline-block"></span>
+            <span>{{ formatFileSize(previewAttachment.size) }}</span>
+          </div>
+          <button
+            @click="closeAttachmentPreview"
+            class="mt-6 px-6 py-2 rounded-lg bg-accent/10 text-accent border border-accent/20 text-sm font-medium hover:bg-accent/20 transition-colors"
+          >
+            关闭
+          </button>
+        </div>
       </div>
     </Teleport>
   </div> <!-- 主容器结束 -->

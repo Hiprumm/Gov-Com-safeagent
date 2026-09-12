@@ -21,7 +21,7 @@ import { useToast } from '@/composables/useToast'
 
 use([CanvasRenderer, LineChart, BarChart, GridComponent, TooltipComponent, LegendComponent])
 
-const { metrics, loading, error, fetchMetrics } = useOpsMetrics(30000)
+const { metrics, loading, error, fetchMetrics, uptimeSeconds } = useOpsMetrics(10000)
 const { success } = useToast()
 
 // 图表配色（与风险看板一致）
@@ -33,12 +33,14 @@ const GREEN = '#22c55e'
 const PURPLE = '#a855f7'
 const TEXT_DIM = '#94a3b8'
 
+// 服务运行时长：时:分:秒（超 1 天带「X 天」前缀，秒级实时跳动）
 function fmtDuration(sec: number): string {
   if (!sec) return '—'
-  if (sec < 60) return `${sec} 秒`
-  if (sec < 3600) return `${Math.floor(sec / 60)} 分钟`
-  if (sec < 86400) return `${Math.floor(sec / 3600)} 时 ${Math.floor((sec % 3600) / 60)} 分`
-  return `${Math.floor(sec / 86400)} 天 ${Math.floor((sec % 86400) / 3600)} 时`
+  const h = String(Math.floor(sec / 3600)).padStart(2, '0')
+  const m = String(Math.floor((sec % 3600) / 60)).padStart(2, '0')
+  const s = String(sec % 60).padStart(2, '0')
+  const d = Math.floor(sec / 86400)
+  return d > 0 ? `${d} 天 ${h}:${m}:${s}` : `${h}:${m}:${s}`
 }
 function fmtTs(ts: string): string {
   return ts ? ts.slice(11, 16) : ''
@@ -69,7 +71,7 @@ const kpiCards = computed(() => [
   { label: 'LLM 成功率', value: `${llmSuccessRate.value.toFixed(1)}%`, color: llmSuccessRate.value >= 95 ? 'safe' : 'medium', icon: ShieldCheck },
   { label: 'LLM 平均延迟', value: llm.value ? `${llm.value.avg_ms.toFixed(0)}ms` : '—', color: 'accent2', icon: Clock },
   { label: '容灾切换次数', value: llm.value?.switch ?? 0, color: llm.value?.switch ? 'medium' : 'safe', icon: RefreshCw },
-  { label: '服务运行时长', value: fmtDuration(metrics.value?.uptime_s || 0), color: 'safe', icon: Activity },
+  { label: '服务运行时长', value: fmtDuration(uptimeSeconds.value), color: 'safe', icon: Activity },
 ])
 
 // HTTP 请求趋势（近 24h 分钟级）
@@ -169,13 +171,14 @@ async function refresh() {
           <Activity class="w-5 h-5 text-accent" />
           运维监控 · 可观测性大盘
         </h2>
-        <p class="text-sm text-muted mt-0.5">请求量 · 检测拦截 · LLM 调用与容灾 · 服务可用性（30s 自动刷新）</p>
+        <p class="text-sm text-muted mt-0.5">请求量 · 检测拦截 · LLM 调用与容灾 · 服务可用性（实时自动刷新）</p>
         <div
           v-if="metrics"
           class="mt-2 inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full border border-border-default text-xs text-muted"
         >
+          <span class="w-1.5 h-1.5 rounded-full bg-safe animate-pulse"></span>
           <Cpu class="w-3.5 h-3.5" />
-          当前 Worker 视图（PID {{ metrics.worker_pid }}）· 服务已运行 {{ fmtDuration(metrics.uptime_s) }}
+          当前 Worker 视图（PID {{ metrics.worker_pid }}）· 服务已运行 {{ fmtDuration(uptimeSeconds) }}
         </div>
       </div>
       <div class="flex items-center gap-3">

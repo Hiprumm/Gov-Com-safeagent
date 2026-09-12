@@ -1,10 +1,11 @@
 /**
  * 运维监控 · 指标数据 composable
  *
- * 30s 轮询 /api/metrics（只读，登录 + system.view；熔断期间仍可查看）。
+ * 10s 轮询 /api/metrics（只读，登录 + system.view；熔断期间仍可查看）。
  * 后端为进程内计数：/api/metrics 返回 worker_pid，标注"当前 worker 视图"。
+ * 服务运行时长在客户端每秒跳动（以最近一次 uptime_s 为基线，无需额外请求）。
  */
-import { ref, onMounted, onUnmounted } from 'vue'
+import { ref, computed, onMounted, onUnmounted } from 'vue'
 import axios from 'axios'
 
 export interface MetricsHttpBucket {
@@ -66,12 +67,23 @@ export const PREFIX_LABELS: Record<string, string> = {
   other: '其他',
 }
 
-export function useOpsMetrics(intervalMs = 30000) {
+export function useOpsMetrics(intervalMs = 10000) {
   const metrics = ref<MetricsSnapshot | null>(null)
   const loading = ref(false)
   const error = ref('')
   const lastUpdated = ref(0)
+  // 服务运行时长实时跳动：以最近一次拉取的 uptime_s 为基线，客户端每秒累计
+  const uptimeBase = ref(0)
+  const uptimeRefTime = ref(0)
+  const nowTick = ref(0)
   let timer: ReturnType<typeof setInterval> | null = null
+  let tickTimer: ReturnType<typeof setInterval> | null = null
+
+  const uptimeSeconds = computed(() => {
+    void nowTick.value
+    if (!uptimeRefTime.value) return uptimeBase.value
+    return uptimeBase.value + Math.max(0, Math.floor((Date.now() - uptimeRefTime.value) / 1000))
+  })
 
   async function fetchMetrics(force = false): Promise<void> {
     if (!force && metrics.value && Date.now() - lastUpdated.value < 8000) return
@@ -79,6 +91,8 @@ export function useOpsMetrics(intervalMs = 30000) {
     try {
       const res = await axios.get('/ai/metrics')
       metrics.value = res.data as MetricsSnapshot
+      uptimeBase.value = res.data?.uptime_s ?? 0
+      uptimeRefTime.value = Date.now()
       lastUpdated.value = Date.now()
       error.value = ''
     } catch (e: any) {
@@ -92,10 +106,12 @@ export function useOpsMetrics(intervalMs = 30000) {
   onMounted(() => {
     fetchMetrics(true)
     timer = setInterval(() => fetchMetrics(true), intervalMs)
+    tickTimer = setInterval(() => { nowTick.value++ }, 1000)
   })
   onUnmounted(() => {
     if (timer) clearInterval(timer)
+    if (tickTimer) clearInterval(tickTimer)
   })
 
-  return { metrics, loading, error, lastUpdated, fetchMetrics }
+  return { metrics, loading, error, lastUpdated, fetchMetrics, uptimeSeconds }
 }

@@ -41,17 +41,17 @@ export default defineConfig({
   server: {
     proxy: {
       '/api': {
-        target: 'http://localhost:8083',
+        target: 'http://localhost:8086',
         changeOrigin: true,
       },
       '/ai': {
-        target: 'http://localhost:8083',
+        target: 'http://localhost:8086',
         changeOrigin: true,
         rewrite: (path) => path.replace(/^\/ai/, '/api'),
       },
       // WebSocket 代理 — 将 /ws/* 转发到后端，避免前端直连后端端口
       '/ws': {
-        target: 'ws://localhost:8083',
+        target: 'ws://localhost:8086',
         ws: true,
         changeOrigin: true,
       },

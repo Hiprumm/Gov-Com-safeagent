@@ -16,12 +16,21 @@ const props = defineProps<{
   steps: ThinkingStep[]
   /** 是否处于实时流式"思考中"（展示进度动画，禁止复制/保存） */
   streaming?: boolean
+  /** 思考时长（秒）：流式中为实时跳动值，完成态为最终思考时长 */
+  elapsed?: number
 }>()
 
 /** 默认折叠：思考内容不主动展示，用户点击头部才展开（避免干扰正文阅读） */
 const expanded = ref(false)
 
 const count = computed(() => props.steps.length)
+
+/** 思考时长展示（1 位小数秒） */
+const elapsedText = computed(() => {
+  const e = props.elapsed
+  if (e === undefined || e === null || Number.isNaN(e)) return ''
+  return `${e.toFixed(1)}s`
+})
 
 /** 阶段对应的强调色（复用语义色，禁止硬编码色值） */
 const phaseClass = (phase: string): string => {
@@ -101,8 +110,11 @@ function saveThinking(): void {
           <span class="w-1 h-1 bg-accent rounded-full animate-bounce" style="animation-delay:150ms"></span>
           <span class="w-1 h-1 bg-accent rounded-full animate-bounce" style="animation-delay:300ms"></span>
         </span>
+        <span v-if="elapsedText" class="ml-1 tabular-nums text-muted">已思考 {{ elapsedText }}</span>
       </span>
-      <span v-else class="text-xs text-disabled">共 {{ count }} 步</span>
+      <span v-else class="text-xs text-disabled">
+        共 {{ count }} 步<template v-if="elapsedText"> · 思考 {{ elapsedText }}</template>
+      </span>
 
       <!-- 复制 / 保存（非流式且已有步骤时可用） -->
       <span v-if="!streaming && count" class="ml-auto flex items-center gap-1">

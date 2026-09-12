@@ -80,9 +80,12 @@ class FileDetectionRequest(BaseModel):
 
 
 class FileUploadRequest(BaseModel):
-    file_data: str
-    file_type: str
-    filename: str
+    # 兼容单文件上传（历史调用：如编辑图片重传走 file_upload 单文件）
+    file_data: Optional[str] = None
+    file_type: Optional[str] = None
+    filename: Optional[str] = None
+    # 多文件上传：优先使用 files 列表（智能问答多附件）
+    files: Optional[List[FileDetectionRequest]] = None
     session_id: Optional[str] = None
     user_text: Optional[str] = None
 

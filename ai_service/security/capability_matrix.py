@@ -61,6 +61,8 @@ TOOL_CAPABILITIES: Dict[str, FrozenSet[str]] = {
     "draft_document":   frozenset({"search", "knowledge_query", "file_read"}),
     # 报表助手：同上，仅在会话内生成报表文本，不落盘不外发。
     "generate_report":  frozenset({"search", "knowledge_query", "file_read"}),
+    # 联网搜索：只读合规搜索 API（博查），结果过安全过滤，低风险默认可授。
+    "web_search":       frozenset({"web_search"}),
 }
 
 # ==================== 角色 → 默认能力集（最小权限） ====================
@@ -68,7 +70,7 @@ TOOL_CAPABILITIES: Dict[str, FrozenSet[str]] = {
 ROLE_DEFAULT_GRANTS: Dict[str, FrozenSet[str]] = {
     "admin":   frozenset({"*"}),
     "manager": frozenset({"file_read", "search", "knowledge_query", "db_read", "web_search"}),
-    "user":    frozenset({"file_read", "search", "knowledge_query", "db_read"}),
+    "user":    frozenset({"file_read", "search", "knowledge_query", "db_read", "web_search"}),
     "guest":   frozenset({"search", "knowledge_query"}),
 }
 

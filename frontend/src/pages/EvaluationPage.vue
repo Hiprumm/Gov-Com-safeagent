@@ -1,6 +1,8 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, onUnmounted } from 'vue'
 import axios from 'axios'
+import { useAuth } from '@/composables/useAuth'
+import { useEvaluation } from '@/composables/useEvaluation'
 
 // ---------- ECharts modular registration ----------
 import { use } from 'echarts/core'
@@ -47,7 +49,14 @@ const CARD_BG = '#1e293b'
 const PAGE_BG = '#0f172a'
 
 // ---------- Fetch data ----------
+// 权限：评测报告"查看人人可用"；"生成/重新生成"仅管理员（方案2：非管理员看不到按钮）
+const { currentUser, initAuth } = useAuth()
+const isAdmin = computed(() => currentUser.value?.role === 'admin')
+// 评测生成中状态（模块级共享：切换页面不中断，返回后自动恢复）
+const { generating, syncFromBackend, begin, finish, startPolling, stopPolling } = useEvaluation()
 onMounted(async () => {
+  // 直接访问/刷新本页时恢复登录身份（决定"生成报告"按钮是否可见）
+  if (!currentUser.value) await initAuth()
   // 本页为深色看板设计（图表配色固定）：进入时强制深色，离开时恢复用户偏好
   document.documentElement.classList.remove('light')
   document.documentElement.classList.add('dark')
@@ -59,10 +68,17 @@ onMounted(async () => {
     console.error('Evaluation report fetch error:', e)
   } finally {
     loading.value = false
+    // 恢复"生成中"展示：后端仍在生成（切换页面/刷新后重新进入）→ 自动恢复轮询
+    const stillRunning = await syncFromBackend()
+    if (stillRunning) {
+      startPolling(pullFreshReport)
+    }
   }
 })
 
 onUnmounted(() => {
+  // 切换页面：仅停止轮询（避免对已卸载组件回调），全局生成中状态保留
+  stopPolling()
   const saved = localStorage.getItem('theme')
   const t = saved === 'light' || saved === 'dark'
     ? saved
@@ -77,24 +93,31 @@ const classification = computed(() => report.value?.classification ?? null)
 const generatedAt = computed(() => report.value?.generated_at ?? '')
 
 // 生成/重新生成评测报告（后台异步，轮询状态完成后刷新）
-const generating = ref(false)
+const reportPolls = ref(0)
+const pullFreshReport = async (): Promise<boolean> => {
+  // 轮询到 running=false 时拉取最新报告；时间戳未刷新则继续等下一轮（返回 false）
+  reportPolls.value++
+  try {
+    const { data } = await axios.get('/api/evaluation/report')
+    if (data?.generated_at && data.generated_at === genOldAt.value && reportPolls.value < 480) return false
+    finish()
+    report.value = data
+    error.value = ''
+    return true
+  } catch {
+    return false
+  }
+}
+const genOldAt = ref('')
 const generateReport = async () => {
   if (generating.value) return
   try {
     const r = await axios.post('/api/evaluation/generate')
     if (!r.data?.success) { window.alert(r.data?.error || '生成失败'); return }
-    generating.value = true
-    const poll = setInterval(async () => {
-      try {
-        const { data: st } = await axios.get('/api/evaluation/status')
-        if (!st.running) {
-          clearInterval(poll)
-          generating.value = false
-          const { data } = await axios.get('/api/evaluation/report')
-          report.value = data
-        }
-      } catch { /* 轮询容错 */ }
-    }, 5000)
+    genOldAt.value = report.value?.generated_at ?? ''
+    reportPolls.value = 0
+    begin()
+    startPolling(pullFreshReport)
   } catch (e: any) {
     window.alert(e.response?.data?.error || e.response?.data?.detail || '生成失败')
   }
@@ -502,10 +525,15 @@ const printReport = () => {
         </div>
         <div :style="{ display: 'flex', alignItems: 'center', gap: '10px', flexWrap: 'wrap' }">
           <button
+            v-if="isAdmin"
             @click="generateReport"
             :disabled="generating"
-            :style="{ padding: '8px 14px', background: generating ? '#334155' : '#7c3aed', color: '#e9d5ff', borderRadius: '8px', fontSize: '14px', fontWeight: 500, border: '1px solid #8b5cf6', cursor: generating ? 'not-allowed' : 'pointer' }"
-          >{{ generating ? '生成中…' : '生成报告' }}</button>
+            class="eval-gen-btn"
+            :style="{ padding: '8px 14px', background: generating ? '#b45309' : '#7c3aed', color: generating ? '#fef3c7' : '#e9d5ff', borderRadius: '8px', fontSize: '14px', fontWeight: 600, border: generating ? '1px solid #f59e0b' : '1px solid #8b5cf6', cursor: generating ? 'wait' : 'pointer', display: 'inline-flex', alignItems: 'center', gap: '6px' }"
+          >
+            <span v-if="generating" class="eval-spin" :style="{ display: 'inline-block', width: '14px', height: '14px', border: '2px solid #fef3c7', borderTopColor: 'transparent', borderRadius: '50%' }"></span>
+            {{ generating ? '评测生成中…' : '生成报告' }}
+          </button>
           <button
             v-if="report"
             @click="downloadMarkdown"
@@ -526,6 +554,23 @@ const printReport = () => {
     </header>
 
     <main class="max-w-7xl mx-auto px-4 py-6">
+      <!-- ========== 评测生成中醒目横幅（全局状态：切换页面不中断，返回后自动恢复） ========== -->
+      <div
+        v-if="generating"
+        class="eval-progress"
+        :style="{ display: 'flex', alignItems: 'center', gap: '14px', background: 'linear-gradient(90deg, rgba(180,83,9,0.25), rgba(217,119,6,0.15))', border: '1px solid rgba(245,158,11,0.55)', borderRadius: '12px', padding: '14px 18px', marginBottom: '20px' }"
+      >
+        <div class="eval-spin" :style="{ width: '26px', height: '26px', border: '3px solid #f59e0b', borderTopColor: 'transparent', borderRadius: '50%', flexShrink: 0 }"></div>
+        <div :style="{ flex: 1 }">
+          <div :style="{ color: '#fbbf24', fontSize: '15px', fontWeight: 700, marginBottom: '2px' }">评测正在生成中…</div>
+          <div :style="{ color: '#d1d5db', fontSize: '13px' }">
+            系统正在对 <strong>{{ metrics?.total || '全部' }}</strong> 条样本逐条执行安全检测（含 LLM 语义分类），预计 1~3 分钟。
+            生成完成后本页将<strong>自动刷新</strong>最新报告；<strong>切换页面不会中断</strong>，返回后自动恢复进度。
+          </div>
+        </div>
+        <div :style="{ color: '#f59e0b', fontSize: '12px', fontWeight: 600, flexShrink: 0 }" class="eval-blink">进行中</div>
+      </div>
+
       <!-- ========== Loading / Error ========== -->
       <div v-if="loading" :style="{ display: 'flex', justifyContent: 'center', alignItems: 'center', minHeight: '400px' }">
         <div :style="{ color: TEXT_DIM, fontSize: '16px' }">
@@ -695,3 +740,28 @@ const printReport = () => {
     </footer>
   </div>
 </template>
+
+<style scoped>
+/* 评测生成中：旋转指示器 + 进行中闪烁 */
+@keyframes eval-spin-kf {
+  to { transform: rotate(360deg); }
+}
+.eval-spin {
+  animation: eval-spin-kf 0.9s linear infinite;
+}
+@keyframes eval-blink-kf {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.25; }
+}
+.eval-blink {
+  animation: eval-blink-kf 1.2s ease-in-out infinite;
+}
+/* 横幅轻微呼吸，强化"正在处理"感知 */
+@keyframes eval-progress-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(245, 158, 11, 0.35); }
+  50% { box-shadow: 0 0 18px 2px rgba(245, 158, 11, 0.25); }
+}
+.eval-progress {
+  animation: eval-progress-pulse 2s ease-in-out infinite;
+}
+</style>

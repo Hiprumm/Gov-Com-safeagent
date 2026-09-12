@@ -24,6 +24,13 @@ from security.output_filter import OutputFilter
 # 方向A-4：受限真执行——tool_execution 调用沙箱执行器（白名单路径 + 子进程超时）
 from tools.docker_executor import docker_executor
 
+# PaddleOCR 惰性单例：模型初始化/下载较重，跨请求复用（线程安全）
+_PADDLE_INSTANCE = None
+_PADDLE_LOCK = threading.Lock()
+# 模型缓存目录固定到项目侧（X 盘），避免写入用户目录（C 盘）
+_PADDLE_MODEL_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), '.paddleocr')
+
 
 class ConversationManager:
     def __init__(self):
@@ -119,47 +126,66 @@ class FileProcessor:
 
             text = ""
             detail = ""
-            # 1) 优先本地 Tesseract OCR（若已安装引擎）
+            img = None
+            # 1) 首选 PaddleOCR（中英文精度最高，含方向矫正）——先预处理再识别
             try:
-                import pytesseract
                 from PIL import Image
                 from io import BytesIO
 
-                # 设置Tesseract路径（Windows）
-                tesseract_paths = [
-                    r'C:\Program Files\Tesseract-OCR\tesseract.exe',
-                    r'C:\Program Files (x86)\Tesseract-OCR\tesseract.exe',
-                    r'D:\Program Files\Tesseract-OCR\tesseract.exe',
-                ]
-                for path in tesseract_paths:
-                    if os.path.exists(path):
-                        pytesseract.pytesseract.tesseract_cmd = path
-                        break
-
                 img = Image.open(BytesIO(decoded))
-                # 转换为RGB模式以提高兼容性
-                if img.mode != 'RGB':
-                    img = img.convert('RGB')
-
-                # 尝试识别中文和英文
-                # 检查中文语言包是否存在
-                tessdata_dir = os.path.dirname(pytesseract.pytesseract.tesseract_cmd)
-                chi_sim_path = os.path.join(tessdata_dir, 'tessdata', 'chi_sim.traineddata')
-
-                if os.path.exists(chi_sim_path):
-                    text = pytesseract.image_to_string(img, lang='chi_sim+eng')
-                else:
-                    # 中文语言包缺失，仅识别英文
-                    text = pytesseract.image_to_string(img)
+                text = self._paddle_ocr(self._preprocess_for_ocr(img))
+                text = self._clean_ocr_text(text)
+                if text:
+                    detail = ""
             except ImportError:
-                detail = "OCR本地模块(pytesseract/Pillow)未安装"
-            except pytesseract.pytesseract.TesseractNotFoundError:
-                detail = "Tesseract OCR引擎未安装"
+                detail = "PaddleOCR未安装"
             except Exception as e:  # noqa: BLE001
-                detail = f"本地OCR识别失败: {e}"
+                detail = f"PaddleOCR识别失败: {e}"
 
-            # 2) 本地未识别到文字/引擎缺失 → 回退 LLM 视觉识别
-            if not (text and text.strip()):
+            # 2) PaddleOCR 不可用 / 结果过少视为质量不达标 → 本地 Tesseract OCR
+            if not self._ocr_quality_ok(text, img):
+                try:
+                    import pytesseract
+                    from PIL import Image as _PILImage  # noqa: F401 - 复用下方 Image 导入
+                    from io import BytesIO
+
+                    # 设置Tesseract路径（Windows）
+                    tesseract_paths = [
+                        r'C:\Program Files\Tesseract-OCR\tesseract.exe',
+                        r'C:\Program Files (x86)\Tesseract-OCR\tesseract.exe',
+                        r'D:\Program Files\Tesseract-OCR\tesseract.exe',
+                    ]
+                    for path in tesseract_paths:
+                        if os.path.exists(path):
+                            pytesseract.pytesseract.tesseract_cmd = path
+                            break
+
+                    img = img or Image.open(BytesIO(decoded))
+                    # 预处理：放大过小图片 + 灰度 + 对比度增强
+                    pre = self._preprocess_for_ocr(img)
+
+                    # 尝试识别中文和英文
+                    # 检查中文语言包是否存在
+                    tessdata_dir = os.path.dirname(pytesseract.pytesseract.tesseract_cmd)
+                    chi_sim_path = os.path.join(tessdata_dir, 'tessdata', 'chi_sim.traineddata')
+
+                    if os.path.exists(chi_sim_path):
+                        text = pytesseract.image_to_string(pre, lang='chi_sim+eng')
+                    else:
+                        # 中文语言包缺失，仅识别英文
+                        text = pytesseract.image_to_string(pre)
+                    text = self._clean_ocr_text(text)
+                    if text:
+                        detail = ""
+                except ImportError:
+                    detail = "OCR本地模块(pytesseract/Pillow)未安装"
+                except pytesseract.pytesseract.TesseractNotFoundError:
+                    detail = "Tesseract OCR引擎未安装"
+                except Exception as e:  # noqa: BLE001
+                    detail = f"本地OCR识别失败: {e}"
+
+            # 3) 本地识别（PaddleOCR + Tesseract）仍未达标 → 回退 LLM 视觉识别
+            if not self._ocr_quality_ok(text, img):
                 try:
                     llm_text = self._vision_ocr(decoded, file_type)
                     if llm_text and llm_text.strip():
@@ -193,6 +219,136 @@ class FileProcessor:
                 "summary": "图片处理失败"
             }
 
+    # ---- OCR 精度优化辅助方法 ----
+    def _preprocess_for_ocr(self, img):
+        """OCR 前图像预处理：放大过小图片、灰度化、增强对比度，显著提升识别率。"""
+        from PIL import Image, ImageOps, ImageEnhance
+
+        img = img.convert("RGB")
+        w, h = img.size
+        min_side = min(w, h)
+        if min_side < 1200:  # Tesseract 对高分辨率文本识别更准，小图先放大（最多 3 倍）
+            scale = min(3.0, max(1.0, 1200 / min_side))
+            img = img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
+        gray = ImageOps.grayscale(img)
+        gray = ImageEnhance.Contrast(gray).enhance(2.0)
+        return ImageOps.autocontrast(gray)
+
+    @staticmethod
+    def _clean_ocr_text(text: str) -> str:
+        """整理 OCR 输出：去噪行、合并连续空行，避免噪声被当作正文。"""
+        if not text:
+            return ""
+        lines = []
+        prev_blank = False
+        for ln in text.splitlines():
+            ln = ln.strip()
+            if not ln:
+                if not prev_blank:
+                    lines.append("")
+                prev_blank = True
+            else:
+                prev_blank = False
+                lines.append(ln)
+        return "\n".join(lines).strip()
+
+    @staticmethod
+    def _strip_code_fence(text: str) -> str:
+        """去除 LLM 返回时可能包裹的 ``` 代码块围栏。"""
+        if text.startswith("```"):
+            text = text.split("\n", 1)[-1] if "\n" in text else text.lstrip("`")
+        if text.endswith("```"):
+            text = text.rsplit("```", 1)[0]
+        return text.strip()
+
+    def _ocr_quality_ok(self, text: str, img) -> bool:
+        """启发式质量门：本地 OCR 为空、或大图却几乎没识别出内容时判为不达标，
+        从而触发 LLM 视觉模型回退（提高整体识别精度）。"""
+        t = (text or "").strip()
+        if not t:
+            return False
+        if img is None:
+            return True
+        try:
+            w, h = img.size
+        except Exception:  # noqa: BLE001
+            return True
+        if max(w, h) >= 800 and len(t.replace(" ", "").replace("\n", "")) < 4:
+            return False
+        return True
+
+    def _paddle_ocr(self, img) -> str:
+        """PaddleOCR 文字识别（中英文精度显著优于 Tesseract，含方向矫正）。
+
+        惰性加载模型并跨请求复用（首次初始化/下载模型较慢，之后秒级）；
+        兼容 paddleocr 2.7 旧 API（ocr.ocr）与 3.x 新 API（ocr.predict）。
+        识别失败抛异常，由调用方兜底降级到 Tesseract / LLM 视觉。
+        """
+        import numpy as np  # noqa: F401 - paddleocr 强依赖 numpy
+        import paddleocr as _paddleocr_pkg
+        from paddleocr import PaddleOCR
+
+        global _PADDLE_INSTANCE
+        if _PADDLE_INSTANCE is None:
+            with _PADDLE_LOCK:
+                if _PADDLE_INSTANCE is None:
+                    _ver = tuple(int(x) for x in
+                                 _paddleocr_pkg.__version__.split('.')[:2])
+                    if _ver >= (3, 0):
+                        # paddleocr 3.x：关闭文档方向/矫正等重型子模型，仅保留文本行方向
+                        _PADDLE_INSTANCE = PaddleOCR(
+                            lang='ch',
+                            use_doc_orientation_classify=False,
+                            use_doc_unwarping=False,
+                            use_textline_orientation=True,
+                        )
+                    else:
+                        # paddleocr 2.x：含方向分类；模型显式落到项目目录（X 盘），
+                        # 避免默认写入用户目录 ~/.paddleocr（C 盘）
+                        _PADDLE_INSTANCE = PaddleOCR(
+                            lang='ch', use_angle_cls=True, show_log=False,
+                            det_model_dir=os.path.join(_PADDLE_MODEL_DIR, 'det'),
+                            rec_model_dir=os.path.join(_PADDLE_MODEL_DIR, 'rec'),
+                            cls_model_dir=os.path.join(_PADDLE_MODEL_DIR, 'cls'),
+                        )
+        ocr = _PADDLE_INSTANCE
+
+        arr = np.array(img)
+        if arr.ndim == 2:  # 灰度图补成三通道，PaddleX 3.x 要求 RGB
+            arr = np.stack([arr] * 3, axis=-1)
+        try:
+            result = ocr.predict(arr)  # paddleocr 3.x API
+        except AttributeError:
+            result = ocr.ocr(arr, cls=True)  # paddleocr 2.7 API
+        return "\n".join(self._paddle_text_lines(result))
+
+    @staticmethod
+    def _paddle_text_lines(result) -> List[str]:
+        """从 PaddleOCR 结果中提取文本行（兼容 2.7 旧格式与 3.x OCRResult）。"""
+        lines = []
+        pages = result if isinstance(result, (list, tuple)) else [result]
+        for page in pages:
+            if hasattr(page, 'json'):  # paddleocr 3.x OCRResult
+                j = page.json or {}
+                res = j.get('res', j) if isinstance(j, dict) else {}
+                found = []
+                for key in ('rec_texts', 'texts'):
+                    if isinstance(res.get(key), list):
+                        found = [t for t in res[key] if isinstance(t, str)]
+                        break
+                if not found:
+                    td = res.get('text_detection')
+                    if isinstance(td, dict):
+                        found = [t for t in td.get('texts', []) if isinstance(t, str)]
+                lines.extend(found)
+            elif isinstance(page, (list, tuple)):  # paddleocr 2.7 旧格式
+                for item in page:
+                    if (isinstance(item, (list, tuple)) and len(item) >= 2
+                            and isinstance(item[1], (list, tuple))
+                            and item[1] and isinstance(item[1][0], str)):
+                        lines.append(item[1][0])
+        return lines
+
     def _vision_ocr(self, file_bytes: bytes, file_type: str) -> str:
         """通过 LLM 视觉能力识别图片文字（Tesseract 缺失/失败时的回退路径）。
 
@@ -213,15 +369,27 @@ class FileProcessor:
         if not cfg.get("api_key"):
             return ""
 
-        # 构造 data URI（mime 从文件类型推断）
+        # 构造 data URI：超大图先本地压缩到 2048 内，避免接口二次缩放失真/超限
         mime = file_type if "/" in file_type else "image/png"
-        b64 = base64.b64encode(file_bytes).decode("ascii")
+        try:
+            from PIL import Image as PILImage
+            from io import BytesIO
+            im = PILImage.open(BytesIO(file_bytes))
+            im.thumbnail((2048, 2048), PILImage.LANCZOS)
+            buf = BytesIO()
+            im.convert("RGB").save(buf, format="JPEG", quality=92)
+            b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+            mime = "image/jpeg"
+        except Exception:  # noqa: BLE001 - 压缩失败直接用原图
+            b64 = base64.b64encode(file_bytes).decode("ascii")
         image_url = f"data:{mime};base64,{b64}"
 
         # 候选模型：先试当前配置模型，若其不支持视觉(400/报错)则回退到已知视觉模型
         configured = cfg.get("model") or "glm-4-flash"
         candidate_models = list(dict.fromkeys([configured, "glm-4v-flash"]))
-        prompt = "请识别并提取图片中的全部文字，只返回识别到的文字本身，不要加任何解释；若无文字请直接返回：无文字。"
+        prompt = ("请识别并提取图片中的全部文字，逐字准确转录，保留原有段落与换行结构；"
+                  "只返回识别到的文字本身，不要加任何解释、不要用代码块包裹；"
+                  "若图片中没有文字，请直接返回：无文字。")
 
         for model in candidate_models:
             payload = json.dumps({
@@ -233,7 +401,7 @@ class FileProcessor:
                         {"type": "image_url", "image_url": {"url": image_url}},
                     ],
                 }],
-                "max_tokens": 1024,
+                "max_tokens": 2048,
                 "stream": False,
             }).encode("utf-8")
 
@@ -250,7 +418,8 @@ class FileProcessor:
             except Exception:  # noqa: BLE001 - 换下一个候选模型
                 continue
             try:
-                return body["choices"][0]["message"]["content"] or ""
+                raw = body["choices"][0]["message"]["content"] or ""
+                return self._clean_ocr_text(self._strip_code_fence(raw))
             except Exception:  # noqa: BLE001
                 return ""
         return ""
@@ -542,18 +711,20 @@ class GovAgent:
                     ("system", """你是一个面向政企场景的安全智能体。请结合对话历史和之前的工具执行结果，分析用户输入，判断是否需要调用工具。
 
 规则：
-1. 仅在用户明确需要执行操作（如读取文件、写入、执行命令、导出数据、搜索知识库）时才调用工具
+1. 仅在用户明确需要执行操作（如读取文件、写入、执行命令、导出数据、搜索知识库、联网搜索）时才调用工具
 2. 对于普通问答、闲聊、问候等，不需要调用工具，直接回答
 3. 如果之前的工具执行结果已经足够回答用户问题，请返回空的 tool_calls 列表
 4. 每次只返回本轮需要执行的工具调用，后续步骤在下一轮迭代中决定
 5. 输出必须是合法JSON格式
+6. 当用户询问最新/实时/近期/热点/动态类外部信息（如最新新闻、近期政策、天气、行情、热点话题、行业动态）时，**必须调用 web_search 联网检索**；这类提问绝不能使用 read_file 或 search_knowledge 代替
 
 可用工具：
-- read_file: 读取文件内容，参数: file_path
+- read_file: 读取工作区内本地文件内容（仅用于读取本地文件，不得用于联网查资料），参数: file_path
 - write_file: 写入文件，参数: file_path, content
 - execute_command: 执行系统命令，参数: command
 - export_data: 导出数据，参数: format, query
-- search_knowledge: 搜索知识库，参数: query
+- search_knowledge: 搜索本地知识库（政务制度/流程类提问），参数: query
+- web_search: 联网搜索外部实时信息（当用户需要查询最新新闻、实时政策、天气、行情、热点话题、行业动态、最新进展等外部信息时使用，这是获取网上实时资讯的唯一工具），参数: query
 - draft_document: 起草公文/通知/请示/报告等（拟稿助手），参数: document_type(文种), subject(标题主题), outline(可选要点)
 - generate_report: 生成结构化报表（报表/汇总/台账/月报），参数: report_name(报表名), report_type(类型), columns(表头), rows(数据记录), note(口径说明)
 
@@ -785,25 +956,31 @@ class GovAgent:
 
         if self.llm_available:
             try:
-                chain = self.prompt_template | self.llm | self.parser
+                # 直接调用模型（支持 FailoverChatModel 主备容灾；不走 LCEL 管道，避免
+                # 非 Runnable 包装类与 prompt | llm 组合报错）
+                prompt_messages = self.prompt_template.format_messages(
+                    user_input=user_input,
+                    conversation_history=history_str,
+                    tool_results=tool_results_str,
+                )
                 # max_tokens 上限：决策只需结构化 JSON（tool_calls+reasoning，通常 <300 token），
                 # 防止模型"话痨"式长输出拉长思考期（保持质量前提下缩短时延）
-                result = chain.invoke({
-                    "user_input": user_input,
-                    "conversation_history": history_str,
-                    "tool_results": tool_results_str,
-                }, max_tokens=512)
+                llm_response = self.llm.invoke(prompt_messages, max_tokens=512)
+                raw_text = getattr(llm_response, "content", None)
+                if not isinstance(raw_text, str) or not raw_text.strip():
+                    raw_text = str(llm_response)
+                parsed = self.parser.parse(raw_text)
 
-                tool_calls = result.get("tool_calls", [])
+                tool_calls = parsed.get("tool_calls", [])
 
                 # 上传内容已内联在 user_input 中：对 uploaded_doc 来源过滤文件读取/检索类工具，
                 # 防止模型误调 read_file/search_knowledge 而报"文件不存在"。
                 if state.get("input_source") == "uploaded_doc":
                     tool_calls = [
                         c for c in tool_calls
-                        if c.get("name") not in ("read_file", "search_knowledge", "draft_document", "generate_report")
+                        if c.get("name") not in ("read_file", "search_knowledge", "draft_document", "generate_report", "web_search")
                     ]
-                reasoning = result.get("reasoning", "")
+                reasoning = parsed.get("reasoning", "")
 
                 # T4: 运行时监控——记录Think阶段
                 self.security_layer.runtime_monitor.set_user_input(session_id, user_input)
@@ -923,9 +1100,25 @@ class GovAgent:
                 "args": {"query": user_input}
             })
 
-        # 通用"查询/查找/读取"且非知识类提问 → 才走文件读取（避免与知识检索冲突）
-        if (any(keyword in user_input for keyword in ["查询", "查找", "搜索", "获取", "读取"])
-                and not is_kb_query):
+        # 联网搜索类提问（最新/实时/近期/热点/网上信息）→ 触发 web_search（真实联网，博查合规 API）
+        web_hint = re.search(
+            r"(最新|实时|近日|最近|近期|刚刚|今天|当前|当下|目前).{0,12}"
+            r"(新闻|政策|天气|行情|动态|消息|通报|价格|热点|进展|趋势|动向|资讯|情况|新闻资讯|热点新闻)|"
+            r"(热点|热闻|新鲜事|新消息|最新消息|最新进展|最新动态|最近动态|最近进展|有什么新|网上说的)|"
+            r"(网上|网络上|联网|上网|百度一下|搜一下|搜索一下|查一下|去查|搜一搜).{0,16}(看看|什么|吗|一下|结果|资料)|"
+            r"(查|搜).{0,10}(最新|实时|最近|近期|热点).{0,12}(新闻|政策|消息|动态|资讯)",
+            user_input,
+        )
+        if web_hint:
+            tool_calls.append({
+                "name": "web_search",
+                "args": {"query": user_input.strip()[:120]}
+            })
+
+        # 明确的"读取/查看本地文件"类提问 → 才走文件读取（避免把"搜索/查找/查询"误判为读文件，
+        # 这类关键词应优先命中知识库检索或联网搜索）
+        if (any(keyword in user_input for keyword in ["读取文件", "查看文件", "打开文件", "读一下", "看下文件", "文件内容", "看看文件"])
+                and not is_kb_query and not web_hint):
             tool_calls.append({
                 "name": "read_file",
                 # 方向A-4：改为白名单内相对路径（原绝对路径 /data/docs/gov_doc.txt 会被沙箱拦截）
@@ -960,7 +1153,7 @@ class GovAgent:
         for tool_call in tool_calls:
             tool_name = tool_call.get("name", "")
             
-            if tool_name in ["read_file", "search_knowledge", "draft_document", "generate_report"]:
+            if tool_name in ["read_file", "search_knowledge", "draft_document", "generate_report", "web_search"]:
                 selected_tools.append(tool_call)
             elif tool_name in ["write_file", "execute_command"]:
                 selected_tools.append(tool_call)
@@ -1210,21 +1403,19 @@ class GovAgent:
                         sink.put(("content", {"delta": str(t)}))
                     final_response = "".join(parts)
                     if not final_response:
-                        chain = self.response_template | self.llm
-                        llm_response = chain.invoke({
-                            "user_input": user_input,
-                            "tool_results": tool_results_str,
-                            "conversation_history": history_str
-                        }, max_tokens=2048)
-                        final_response = llm_response.content
+                        prompt_messages = self.response_template.format_messages(
+                            user_input=user_input,
+                            tool_results=tool_results_str,
+                            conversation_history=history_str,
+                        )
+                        final_response = self.llm.invoke(prompt_messages, max_tokens=2048).content
                 else:
-                    chain = self.response_template | self.llm
-                    llm_response = chain.invoke({
-                        "user_input": user_input,
-                        "tool_results": tool_results_str,
-                        "conversation_history": history_str
-                    }, max_tokens=2048)
-                    final_response = llm_response.content
+                    prompt_messages = self.response_template.format_messages(
+                        user_input=user_input,
+                        tool_results=tool_results_str,
+                        conversation_history=history_str,
+                    )
+                    final_response = self.llm.invoke(prompt_messages, max_tokens=2048).content
                 
                 # AIGC 标识应用：使用策略管理器中的配置
                 from security.policy_manager import get_policy_manager
@@ -1823,85 +2014,101 @@ class GovAgent:
 
         return self.run_with_history(session_id, user_input, input_source, user=user)
 
-    def process_file_message(self, session_id: str, file_data: str, file_type: str, filename: str,
-                             user_text: str = None,
+    def process_file_message(self, session_id: str, files, user_text: str = None,
                              user: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        processed = self.file_processor.process_file(file_data, file_type, filename)
-        
-        if processed["detection_required"] and processed["content"]:
-            detection_result = self.security_layer.input_detector.detect_single_input(
-                processed["content"],
-                source="uploaded_doc",
-                session_id=session_id,
-            )
-            
-            if detection_result.risk_level in [RiskLevel.HIGH, RiskLevel.CRITICAL]:
-                self.conversation_manager.add_message(session_id, "user", f"[文件上传] {filename}")
-                self.conversation_manager.add_message(session_id, "assistant", 
-                    f"文件 {filename} 包含安全风险内容，已被拦截！\n风险等级: {detection_result.risk_level.value}")
-                
-                return {
-                    "success": False,
-                    "message": f"文件内容检测到安全风险，已被拦截",
-                    "risk_level": detection_result.risk_level.value,
-                    "session_id": session_id,
-                    "conversation_history": self.conversation_manager.get_history(session_id),
-                }
-        
+        """多文件上传处理：逐个识别/提取 → 安全检测 → 合并内容进入主链。
+
+        files: List[Dict]，每项含 file_data / file_type / filename。
+        任一文件检测到高危/严重风险即拦截整个上传批次。
+        """
+        content_parts = []
+        for f in files:
+            processed = self.file_processor.process_file(f["file_data"], f["file_type"], f["filename"])
+            content = processed.get("content") or processed.get("text") or ""
+
+            if processed["detection_required"] and content:
+                detection_result = self.security_layer.input_detector.detect_single_input(
+                    content,
+                    source="uploaded_doc",
+                    session_id=session_id,
+                )
+
+                if detection_result.risk_level in [RiskLevel.HIGH, RiskLevel.CRITICAL]:
+                    self.conversation_manager.add_message(session_id, "user", f"[文件上传] {f['filename']}")
+                    self.conversation_manager.add_message(session_id, "assistant",
+                        f"文件 {f['filename']} 包含安全风险内容，已被拦截！\n风险等级: {detection_result.risk_level.value}")
+
+                    return {
+                        "success": False,
+                        "message": f"文件内容检测到安全风险，已被拦截",
+                        "risk_level": detection_result.risk_level.value,
+                        "session_id": session_id,
+                        "conversation_history": self.conversation_manager.get_history(session_id),
+                    }
+
+            if content:
+                content_parts.append(f"[{f['filename']}]\n{content}")
+
         # 上传内容已在此处完整提供（图片已自动 OCR 识别为文字），
         # 文件读取/检索类工具由 decision_making 中的 uploaded_doc 硬防护统一过滤。
-        content_body = processed.get("content") or processed.get("text") or ""
-        user_input = f"以下文字是用户上传内容识别出的结果，请直接基于这段文字分析并回答：\n{content_body[:2000]}"
+        content_body = "\n\n".join(content_parts) or ""
+        user_input = f"以下文字是用户上传内容识别出的结果，请直接基于这段文字分析并回答：\n{content_body[:4000]}"
         # 用户上传时一并输入的附言/提问：合并进输入，让模型结合图片/文件内容回答
         if user_text:
             user_input += f"\n\n用户针对该上传内容的补充提问/要求：\n{user_text}"
 
-        history_user = f"[文件上传] {filename}"
+        history_user = "[文件上传] " + "、".join(f["filename"] for f in files)
         if user_text:
             history_user += f"\n用户附言：{user_text}"
         self.conversation_manager.add_message(session_id, "user", history_user)
-        
+
         return self.run_with_history(session_id, user_input, "uploaded_doc", user=user)
 
-    def process_file_message_stream(self, session_id: str, file_data: str, file_type: str, filename: str,
-                                    user_text: str = None,
+    def process_file_message_stream(self, session_id: str, files, user_text: str = None,
                                     user: Optional[Dict[str, Any]] = None):
         """附件问答流式版：识别阶段先推送思考步骤，之后复用 run_stream 全量流式（思考步骤 + AI token 增量 + done）。
 
         与 process_file_message 保持相同的真实执行副作用（识别、检测、落库）。
+        files: List[Dict]，每项含 file_data / file_type / filename。
         """
         step_no = 0
         step_no += 1
         yield ("thinking", {"step": step_no, "phase": "uploaded_doc", "phase_label": "上传内容识别",
-                            "title": "正在识别上传文件内容", "detail": f"文件：{filename}", "node": "file_processing"})
+                            "title": "正在识别上传文件内容", "detail": f"文件数：{len(files)}", "node": "file_processing"})
 
-        processed = self.file_processor.process_file(file_data, file_type, filename)
+        content_parts = []
+        for f in files:
+            processed = self.file_processor.process_file(f["file_data"], f["file_type"], f["filename"])
+            content = processed.get("content") or processed.get("text") or ""
 
-        if processed["detection_required"] and processed["content"]:
-            detection_result = self.security_layer.input_detector.detect_single_input(
-                processed["content"],
-                source="uploaded_doc",
-                session_id=session_id,
-            )
-            if detection_result.risk_level in [RiskLevel.HIGH, RiskLevel.CRITICAL]:
-                self.conversation_manager.add_message(session_id, "user", f"[文件上传] {filename}")
-                self.conversation_manager.add_message(session_id, "assistant",
-                    f"文件 {filename} 包含安全风险内容，已被拦截！\n风险等级: {detection_result.risk_level.value}")
-                yield ("done", {
-                    "final_response": f"文件 {filename} 包含安全风险内容，已被拦截！\n风险等级: {detection_result.risk_level.value}",
-                    "risk_level": detection_result.risk_level.value,
-                    "session_id": session_id,
-                    "thinking_steps": [],
-                })
-                return
+            if processed["detection_required"] and content:
+                detection_result = self.security_layer.input_detector.detect_single_input(
+                    content,
+                    source="uploaded_doc",
+                    session_id=session_id,
+                )
+                if detection_result.risk_level in [RiskLevel.HIGH, RiskLevel.CRITICAL]:
+                    self.conversation_manager.add_message(session_id, "user", f"[文件上传] {f['filename']}")
+                    self.conversation_manager.add_message(session_id, "assistant",
+                        f"文件 {f['filename']} 包含安全风险内容，已被拦截！\n风险等级: {detection_result.risk_level.value}")
+                    yield ("done", {
+                        "final_response": f"文件 {f['filename']} 包含安全风险内容，已被拦截！\n风险等级: {detection_result.risk_level.value}",
+                        "risk_level": detection_result.risk_level.value,
+                        "session_id": session_id,
+                        "thinking_steps": [],
+                    })
+                    return
 
-        content_body = processed.get("content") or processed.get("text") or ""
-        user_input = f"以下文字是用户上传内容识别出的结果，请直接基于这段文字分析并回答：\n{content_body[:2000]}"
+            if content:
+                content_parts.append(f"[{f['filename']}]\n{content}")
+
+        content_body = "\n\n".join(content_parts) or ""
+        user_input = f"以下文字是用户上传内容识别出的结果，请直接基于这段文字分析并回答：\n{content_body[:4000]}"
         # 用户上传时一并输入的附言/提问：合并进输入，让模型结合图片/文件内容回答
         if user_text:
             user_input += f"\n\n用户针对该上传内容的补充提问/要求：\n{user_text}"
 
-        history_user = f"[文件上传] {filename}"
+        history_user = "[文件上传] " + "、".join(f["filename"] for f in files)
         if user_text:
             history_user += f"\n用户附言：{user_text}"
         self.conversation_manager.add_message(session_id, "user", history_user)

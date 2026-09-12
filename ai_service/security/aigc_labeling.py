@@ -144,8 +144,8 @@ def verify_implicit_marker(text: str) -> Dict[str, Any]:
 def get_aigc_config() -> Dict[str, Any]:
     """返回 AIGC 标识配置（用于前端展示与合规检查）
     
-    注：explicit_label_enabled 默认为 False，避免用户看到冗长的合规声明
-    如需启用，可在后台系统配置中调整
+    注：显式标识默认开启（回复中附加【AI生成内容】声明），与策略
+    aigc_explicit_label_enabled 保持一致；可在后台系统配置中关闭。
     """
     return {
         "provider": SERVICE_PROVIDER,
@@ -156,6 +156,6 @@ def get_aigc_config() -> Dict[str, Any]:
         "icp_beian": ICP_BEIAN,
         "algorithm_filing": ALGORITHM_FILING,
         "aigc_filing": AIGC_FILING,
-        "explicit_label_enabled": False,  # 改为False：不在回复中显示【AI生成内容】标签
+        "explicit_label_enabled": True,   # 回复中附加【AI生成内容】声明（与策略 aigc_explicit_label_enabled 保持一致）
         "implicit_marker_enabled": True,  # True：保留隐式元数据标记（用于溯源和合规）
     }

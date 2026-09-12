@@ -52,6 +52,14 @@ from routers.auth import _admin_guard, _login_guard, _assert_session_owner, _pw_
 router = APIRouter()
 
 
+def _request_files(request) -> List[Dict[str, str]]:
+    """从上传请求提取文件列表：优先 files 数组（多文件），兼容单文件旧字段。"""
+    if request.files:
+        return [{"file_data": f.file_data, "file_type": f.file_type, "filename": f.filename}
+                for f in request.files]
+    return [{"file_data": request.file_data, "file_type": request.file_type, "filename": request.filename}]
+
+
 @router.post("/api/agent/run")
 async def run_agent(req: Request, user_input: str, input_source: str = "user_input"):
     try:
@@ -192,7 +200,7 @@ async def file_stream(http_req: Request, request: FileUploadRequest):
             return
         try:
             for event_type, payload in gov_agent.process_file_message_stream(
-                    gen_session, request.file_data, request.file_type, request.filename,
+                    gen_session, _request_files(request),
                     user_text=request.user_text, user=identity or None):
                 yield _sse(event_type, payload)
         except Exception as e:
@@ -214,8 +222,10 @@ async def upload_file(http_req: Request, request: FileUploadRequest):
         session_id = request.session_id
         if not session_id:
             session_id = gov_agent.conversation_manager.create_session(user_id)
-        result = gov_agent.process_file_message(session_id, request.file_data, request.file_type,
-                                                request.filename, user_text=request.user_text,
+        else:
+            session_id = gov_agent.conversation_manager.ensure_session(session_id, user_id)
+        result = gov_agent.process_file_message(session_id, _request_files(request),
+                                                user_text=request.user_text,
                                                 user=identity or None)
         return result
     except Exception as e:

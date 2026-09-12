@@ -15,11 +15,12 @@ import json
 import time
 from datetime import datetime
 from typing import Dict, Any
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from security.input_detector import InputDetectionService
-from models.schemas import RiskLevel, DetectionResult
+from models.schemas import RiskLevel, DetectionResult, InputSource
 
 
 def load_samples(filepath: str) -> list:
@@ -28,45 +29,61 @@ def load_samples(filepath: str) -> list:
     return data["samples"]
 
 
-def run_detection(samples: list, detector: InputDetectionService) -> list:
-    results = []
-    for i, sample in enumerate(samples):
-        start = time.perf_counter()
+def _detect_one(sample: dict, detector: InputDetectionService) -> dict:
+    """单条样本检测（供线程池并发调用）。
+
+    出错视为未检出（返回 NONE），不中断整体评测。
+    """
+    start = time.perf_counter()
+    try:
+        result = detector.detect_single_input(sample["text"], sample["source"])
+        elapsed_ms = (time.perf_counter() - start) * 1000
+    except Exception as e:
         try:
-            result = detector.detect_single_input(sample["text"], sample["source"])
-            elapsed_ms = (time.perf_counter() - start) * 1000
-        except Exception as e:
-            # 出错视为未检出
-            try:
-                fallback_source = InputSource(sample["source"])
-            except Exception:
-                fallback_source = InputSource.USER_INPUT
-            result = DetectionResult(
-                risk_level=RiskLevel.NONE,
-                attack_type=None,
-                confidence=0.0,
-                evidence=[f"Error: {str(e)}"],
-                source=fallback_source,
-                processed_text=sample["text"][:50]
-            )
-            elapsed_ms = 0
+            fallback_source = InputSource(sample["source"])
+        except Exception:
+            fallback_source = InputSource.USER_INPUT
+        result = DetectionResult(
+            risk_level=RiskLevel.NONE,
+            attack_type=None,
+            confidence=0.0,
+            evidence=[f"Error: {str(e)}"],
+            source=fallback_source,
+            processed_text=sample["text"][:50]
+        )
+        elapsed_ms = 0
 
-        detected_as_attack = result.risk_level != RiskLevel.NONE
+    detected_as_attack = result.risk_level != RiskLevel.NONE
 
-        results.append({
-            "sample": sample,
-            "detected_attack": detected_as_attack,
-            "detected_risk": result.risk_level.value,
-            "detected_type": result.attack_type,
-            "confidence": result.confidence,
-            "evidence": str(result.evidence)[:100] if result.evidence else "",
-            "elapsed_ms": round(elapsed_ms, 2),
-        })
+    return {
+        "sample": sample,
+        "detected_attack": detected_as_attack,
+        "detected_risk": result.risk_level.value,
+        "detected_type": result.attack_type,
+        "confidence": result.confidence,
+        "evidence": str(result.evidence)[:100] if result.evidence else "",
+        "elapsed_ms": round(elapsed_ms, 2),
+    }
 
-        # 进度
-        if (i + 1) % 10 == 0:
-            print(f"  进度: {i+1}/{len(samples)}")
 
+def run_detection(samples: list, detector: InputDetectionService, max_workers: int = 8) -> list:
+    """并发检测。
+
+    评测主耗时在 LLM 语义分类（网络 IO，单条内部自带事件循环），线程池并行
+    可显著缩短时长（约 600 条样本 8 路并发 ≈ 1~2 分钟）。各检测器为共享只读
+    组件，LLM 层自带主备容灾与失败回退，并发安全；单条异常不影响整体。
+    """
+    results: list = [None] * len(samples)
+    done = 0
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = {pool.submit(_detect_one, s, detector): i for i, s in enumerate(samples)}
+        for fut in as_completed(futures):
+            i = futures[fut]
+            results[i] = fut.result()
+            done += 1
+            # 进度
+            if done % 20 == 0:
+                print(f"  进度: {done}/{len(samples)}")
     return results
 
 
