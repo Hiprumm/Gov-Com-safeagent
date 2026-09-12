@@ -32,6 +32,12 @@ const departments = ref<string[]>([])
 const stats = ref<any>(null)
 const loading = ref(false)
 
+// ---- 分页（一页一页展示，默认每页 10 条） ----
+const page = ref(1)
+const pageSize = ref(10)
+const total = ref(0)
+const totalPages = computed(() => Math.max(1, Math.ceil(total.value / pageSize.value)))
+
 // 编辑/新建抽屉态
 const editing = ref(false)
 const form = ref<Record<string, any>>({
@@ -44,13 +50,19 @@ const load = async () => {
   loading.value = true
   try {
     const [u, d, s] = await Promise.all([
-      axios.get('/api/admin/users'),
+      axios.get('/api/admin/users', { params: { page: page.value, page_size: pageSize.value } }),
       axios.get('/api/admin/departments'),
       axios.get('/api/admin/stats'),
     ])
     users.value = u.data?.users || []
+    total.value = u.data?.total ?? users.value.length
     departments.value = d.data?.departments || []
     stats.value = s.data?.stats || null
+    // 删除/停用后当前页可能为空（且并非无数据）→ 自动回退一页
+    if (users.value.length === 0 && page.value > 1 && total.value > 0) {
+      page.value -= 1
+      return load()
+    }
   } catch (e: any) {
     if (e.response?.status === 401 || e.response?.status === 403) {
       toast.error('无管理员权限')
@@ -61,6 +73,16 @@ const load = async () => {
   } finally {
     loading.value = false
   }
+}
+const goPage = (p: number) => {
+  if (p < 1 || p > totalPages.value || p === page.value) return
+  page.value = p
+  load()
+}
+const changePageSize = (n: number) => {
+  pageSize.value = n
+  page.value = 1
+  load()
 }
 onMounted(async () => {
   // 恢复登录态（深链接直达 /admin/users 时 currentUser 尚为空）
@@ -293,6 +315,19 @@ const statCards = computed(() => [
                 <tr v-if="!users.length && !loading"><td colspan="7" class="px-4 py-10 text-center text-muted">暂无账号，点击右上角「新建账号」创建</td></tr>
               </tbody>
             </table>
+          </div>
+          <!-- 分页条：一页一页展示，支持每页条数切换 -->
+          <div class="flex flex-col sm:flex-row items-center justify-between gap-2 px-4 py-3 border-t border-border-default text-xs text-muted">
+            <span>共 {{ total }} 个账号，第 {{ page }} / {{ totalPages }} 页</span>
+            <div class="flex items-center gap-2">
+              <select v-model.number="pageSize" @change="changePageSize(pageSize)" :disabled="loading" class="px-2 py-1.5 bg-canvas border border-border-default rounded-lg text-xs focus:outline-none focus:border-accent disabled:opacity-50">
+                <option :value="10">10 条/页</option>
+                <option :value="20">20 条/页</option>
+                <option :value="50">50 条/页</option>
+              </select>
+              <button @click="goPage(page - 1)" :disabled="page <= 1 || loading" class="px-2.5 py-1.5 rounded-lg border border-border-default bg-elevated text-secondary hover:text-accent hover:border-accent/40 transition-colors disabled:opacity-40 disabled:cursor-not-allowed">上一页</button>
+              <button @click="goPage(page + 1)" :disabled="page >= totalPages || loading" class="px-2.5 py-1.5 rounded-lg border border-border-default bg-elevated text-secondary hover:text-accent hover:border-accent/40 transition-colors disabled:opacity-40 disabled:cursor-not-allowed">下一页</button>
+            </div>
           </div>
         </div>
 

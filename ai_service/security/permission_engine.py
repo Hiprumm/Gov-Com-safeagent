@@ -28,12 +28,11 @@ ROLE_LEVELS: Dict[str, int] = {
 }
 
 # ------------------------------------------------------------------
-# 模块（与前端导航 Tab 名称保持一致）
+# 模块（与前端导航 Tab 名称保持一致；P1-2 导航收敛后已无独立 "ops" Tab）
 # ------------------------------------------------------------------
 MODULES: List[str] = [
     "chat", "dashboard", "runtime", "security", "redteam",
     "tools", "approval", "audit", "policy", "system", "governance",
-    "ops",
 ]
 
 # 模块 → 进入该模块所需的最小权限点
@@ -49,7 +48,6 @@ MODULE_PERMISSION: Dict[str, str] = {
     "policy": "policy.view",
     "system": "system.view",
     "governance": "system.maintain",
-    "ops": "system.view",
 }
 
 # ------------------------------------------------------------------

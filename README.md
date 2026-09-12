@@ -45,6 +45,8 @@
 | 部署 | Docker + Docker Compose + Nginx |
 | 实时通信 | WebSocket（替代 HTTP 轮询） |
 
+> **外部 Agent 接入**（网关 / SDK）属独立产品线，与本主系统的部署形态、端口不同，见 [docs/外部接入网关与SDK使用说明.md](docs/外部接入网关与SDK使用说明.md)。
+
 ---
 
 ## 2. 快速启动
@@ -386,19 +388,27 @@ Gov-Com-safeagent/
 │   └── package.json
 │
 ├── docker/
-│   └── tool-sandbox/                # 工具执行沙箱
+│   └── tool-sandbox/                # 工具执行沙箱镜像（docker_executor 调用）
 │       ├── Dockerfile               # Alpine 最小化镜像
 │       └── entrypoint.sh            # 工具路由脚本
 │
 ├── deploy/
-│   ├── docker-compose.yml           # Docker Compose 编排
+│   ├── docker-compose.yml           # Docker Compose 整体编排
 │   ├── Dockerfile                   # AI 服务镜像
 │   ├── nginx.conf                   # Nginx 配置
 │   ├── start.sh                     # Linux/Mac 启动脚本
 │   └── start_production.bat         # Windows 启动脚本
 │
+├── gateway/                         # 【独立产品线】Agent 前置安全网关（外部 Agent 接入）
+│   ├── main.py                      #   反向代理 + 三拦截点（默认端口 8081）
+│   └── interceptors.py
+├── gov-safeagent-sdk/               # 【独立产品线】Python SDK（LangChain/LlamaIndex/Dify 适配）
+│   └── gov_safeagent_sdk/
+│
 └── 技术方案报告.md                   # 技术方案文档
 ```
+
+> **产品线边界**：主后端为 **FastAPI（ai_service）**，网关与 SDK 是面向外部 Agent 接入的独立产品线，部署形态与端口不同，详见 [docs/外部接入网关与SDK使用说明.md](docs/外部接入网关与SDK使用说明.md)。`docker/tool-sandbox` 是工具执行沙箱镜像，`deploy/` 是整体编排，两者关系见 [部署与安全加固指南.md](部署与安全加固指南.md)。
 
 ---
 

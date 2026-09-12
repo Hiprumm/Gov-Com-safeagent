@@ -105,7 +105,7 @@ async function changePw() {
 </script>
 
 <template>
-  <div class="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/50 backdrop-blur-sm" @click.self="emit('close')">
+  <div class="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/50" @click.self="emit('close')">
     <div class="w-full max-w-lg bg-surface rounded-2xl border border-border-default shadow-2xl overflow-hidden animate-card-in">
       <div class="px-5 py-3.5 border-b border-border-default flex items-center justify-between">
         <h3 class="text-base font-bold text-primary flex items-center gap-2">

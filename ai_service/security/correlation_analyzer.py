@@ -1,15 +1,16 @@
 """
-多源输入关联分析器 (Correlation Analyzer)
+多源输入关联分析器（薄封装，P2-2 收敛后）
 ==========================================
 
-赛题方向1要求"多源输入关联分析"。
-本模块作为统一门面，整合 cross_source_correlator 和 session_risk_accumulator，
-并新增间接注入识别能力。
+P2-2 检测模块合并：跨来源关联的唯一实现为 `security.cross_source_correlator`，
+本模块收敛为薄封装，仅保留 cross_source_correlator 之外的补充能力：
+1. 间接注入识别（EchoLeak CVE-2025-32711 攻击链，regex 规则）
+2. 会话风险累积（委托 session_risk_accumulator）
+3. 风险因素汇总与处置建议生成
 
-核心能力：
-1. 跨输入源攻击关联——用户输入正常 + 知识库文档含恶意指令 → 识别间接注入
-2. 时间窗口累积风险评估——同一会话内多源输入的累积风险
-3. EchoLeak式间接注入检测——CVE-2025-32711 攻击链识别
+跨来源事件记录部分全部委托给 `get_cross_source_correlator()` 单例——
+与 `gov_agent_graph/security_layer.py` 入口指向同一实例、同一套模式与阈值，
+两处入口记录的事件共享同一状态（不再存在"旧包装 + 新实现"双轨）。
 """
 
 import sys
@@ -21,10 +22,7 @@ import time
 from typing import List, Dict, Any, Optional, Tuple
 from dataclasses import dataclass, field
 
-from security.cross_source_correlator import (
-    CrossSourceCorrelator, get_cross_source_correlator,
-    SourceEvent, CorrelatedThreat, CorrelationPattern
-)
+from security.cross_source_correlator import get_cross_source_correlator
 from security.session_risk_accumulator import (
     SessionRiskAccumulator, session_risk_accumulator,
     RiskEvent, SessionRiskProfile
@@ -49,7 +47,11 @@ class CorrelationResult:
 
 
 class CorrelationAnalyzer:
-    """多源输入关联分析器"""
+    """多源输入关联分析器（薄封装，P2-2）
+
+    跨来源关联部分委托给 cross_source_correlator 唯一实现（共享同一单例），
+    本类只补充：间接注入识别、会话风险累积、风险因素/建议生成。
+    """
 
     # 间接注入特征模式
     _INDIRECT_INJECTION_PATTERNS = [
@@ -68,6 +70,7 @@ class CorrelationAnalyzer:
     ]
 
     def __init__(self):
+        # P2-2：与 security_layer 入口共享同一 cross_source_correlator 单例
         self.correlator = get_cross_source_correlator()
         self.accumulator = session_risk_accumulator
 
@@ -196,7 +199,7 @@ class CorrelationAnalyzer:
     def _collect_risk_factors(
         self,
         profile: SessionRiskProfile,
-        threats: Optional[List[CorrelatedThreat]],
+        threats: Optional[List[Any]],
         indirect_detected: bool,
     ) -> List[str]:
         """收集风险因素"""

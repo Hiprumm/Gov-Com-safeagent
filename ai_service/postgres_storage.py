@@ -19,6 +19,8 @@ from threading import Lock
 from typing import Any, Dict, List, Optional
 from contextlib import contextmanager
 
+from storage_base import StorageBackend
+
 # psycopg 为可选依赖：缺失时不影响 SQLite 路径
 try:
     import psycopg
@@ -33,12 +35,6 @@ except Exception:  # pragma: no cover
 
 # 会话标题长度上限（缩略显示）
 AUTO_TITLE_MAX = 30
-
-
-def _auto_title(content: str) -> str:
-    """由消息内容生成缩略会话标题：压缩空白 + 截断 N 字。"""
-    text = " ".join(content.strip().split())
-    return text[:AUTO_TITLE_MAX]
 
 
 def _build_dsn() -> str:
@@ -210,8 +206,11 @@ _SCHEMA_STATEMENTS = [
 ]
 
 
-class PostgresStorage:
+class PostgresStorage(StorageBackend):
     """PostgreSQL 存储后端（与 storage.Storage 同一公开接口）。"""
+
+    # PostgreSQL SQL 占位符
+    _ph = "%s"
 
     def __init__(self, dsn: Optional[str] = None):
         if not PSYCOPG_AVAILABLE:
@@ -479,7 +478,7 @@ class PostgresStorage:
                 )
                 # 首次对话自动生成标题：用第一条用户消息内容缩略（已存在标题则不覆盖）
                 if role == "user":
-                    title = _auto_title(content)
+                    title = self._auto_title(content)
                     conn.execute(
                         "UPDATE sessions SET title = COALESCE(title, %s) WHERE session_id = %s AND title IS NULL",
                         (title, session_id),
@@ -848,30 +847,6 @@ class PostgresStorage:
                 "SELECT username, display_name, role, department, position, status, note, mfa_enabled, created_at, updated_at FROM sys_users ORDER BY role, username"
             ).fetchall()
         return [dict(r) for r in rows]
-
-    def get_user_mfa(self, username: str) -> Dict[str, Any]:
-        """返回用户的 MFA 信息（totp_secret 在库中为密文，此处透明解密）。"""
-        from security.secret_box import decrypt_secret
-        with self._get_conn() as conn:
-            row = conn.execute(
-                "SELECT totp_secret, mfa_enabled FROM sys_users WHERE username = %s", (username,)
-            ).fetchone()
-        if not row:
-            return {"totp_secret": "", "mfa_enabled": False}
-        return {"totp_secret": decrypt_secret(row["totp_secret"] or ""),
-                "mfa_enabled": bool(row["mfa_enabled"])}
-
-    def set_user_mfa(self, username: str, secret: str, enabled: bool) -> bool:
-        """设置用户的 TOTP 密钥与启用状态（入库前加密）"""
-        from security.secret_box import encrypt_secret
-        with self._lock:
-            with self._get_conn() as conn:
-                cur = conn.execute(
-                    "UPDATE sys_users SET totp_secret = %s, mfa_enabled = %s, updated_at = %s WHERE username = %s",
-                    (encrypt_secret(secret or ""), bool(enabled),
-                     datetime.now().isoformat(), username),
-                )
-                return cur.rowcount > 0
 
     def update_user_profile(self, username: str, display_name: str = None, role: str = None,
                             department: str = None, position: str = None,

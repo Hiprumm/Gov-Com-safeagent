@@ -16,9 +16,8 @@ import SecurityPanel from '@/components/security/SecurityPanel.vue'
 import ApprovalPanel from '@/components/approval/ApprovalPanel.vue'
 import AuditPanel from '@/components/audit/AuditPanel.vue'
 import ToolPanel from '@/components/tools/ToolPanel.vue'
-import SystemStatusPanel from '@/components/system/SystemStatusPanel.vue'
 import GovernancePanel from '@/components/governance/GovernancePanel.vue'
-import OpsMetricsPanel from '@/components/ops/OpsMetricsPanel.vue'
+import SystemOpsPanel from '@/components/system/SystemOpsPanel.vue'
 import NotificationBell from '@/components/notify/NotificationBell.vue'
 import GuideBanner from '@/components/onboarding/GuideBanner.vue'
 import AccountSecurityModal from '@/components/account/AccountSecurityModal.vue'
@@ -45,7 +44,6 @@ const tabIconMap: Record<string, any> = {
   system: Server,
   audit: FileText,
   governance: Landmark,
-  ops: BarChart3,
 }
 const kpiIconMap: Record<string, any> = {
   block: ShieldX,
@@ -72,8 +70,7 @@ const tabs = [
   { name: 'approval', label: '审批中心', sub: '人工审批 · 令牌授予', icon: 'approval', group: '安全运营' },
   { name: 'audit', label: '审计追溯', sub: '过程可审计·责任可追溯', icon: 'audit', group: '合规审计' },
   { name: 'policy', label: '策略配置', sub: '阈值/开关 · 热生效', icon: 'policy', group: '系统配置' },
-  { name: 'system', label: '系统状态', sub: '自检 · 数据维护', icon: 'system', group: '系统配置' },
-  { name: 'ops', label: '运维监控', sub: '性能 · 可用性', icon: 'ops', group: '系统配置' },
+  { name: 'system', label: '系统与运维', sub: '自检 · 维护 · 性能可用性', icon: 'system', group: '系统配置' },
   { name: 'governance', label: '治理中心', sub: '应急 · 生态 · 合规', icon: 'governance', group: '合规治理' },
 ]
 
@@ -148,10 +145,9 @@ const panelMap: Record<string, any> = {
   approval: ApprovalPanel,
   tools: ToolPanel,
   policy: PolicyPanel,
-  system: SystemStatusPanel,
+  system: SystemOpsPanel,
   audit: AuditPanel,
   governance: GovernancePanel,
-  ops: OpsMetricsPanel,
 }
 
 // 入场动画交替类名：类名变化才会重新触发 animation（见 style.css animate-card-in-b）
@@ -290,8 +286,8 @@ onUnmounted(() => {
           <Moon v-else class="w-5 h-5 text-secondary" />
         </button>
 
-        <!-- 通知中心 -->
-        <NotificationBell />
+        <!-- 通知中心（P1-2 按角色收敛：低权限业务角色 user 不展示） -->
+        <NotificationBell v-if="currentUser?.role !== 'user'" />
 
         <!-- 后台管理（仅系统管理员） -->
         <button
@@ -396,8 +392,8 @@ onUnmounted(() => {
       </div>
     </div>
 
-    <!-- ========== 首次使用引导横幅 ========== -->
-    <GuideBanner v-if="showGuide" @close="dismissGuide" @goto="guideGoto" />
+    <!-- ========== 首次使用引导横幅（P1-2：低权限业务角色 user 不展示） ========== -->
+    <GuideBanner v-if="showGuide && currentUser?.role !== 'user'" @close="dismissGuide" @goto="guideGoto" />
 
     <!-- 账号安全（MFA / 改密） -->
     <AccountSecurityModal v-if="showAccountSecurity" @close="showAccountSecurity = false" />

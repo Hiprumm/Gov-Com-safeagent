@@ -35,6 +35,18 @@ class CorrelationPattern(Enum):
     PRIVILEGE_ESCALATION_CHAIN = "privilege_escalation_chain"
 
 
+# P2-2 统一配置项与阈值：全系统输入源词汇表以 models.schemas.InputSource 的取值为准。
+# input_detector（经 correlation_analyzer 薄封装）与 security_layer 两个入口记录的事件
+# 统一在此归一化，避免"uploaded_doc vs file_upload"等历史别名导致预定义模式永不命中。
+SOURCE_ALIASES: Dict[str, str] = {
+    "file_upload": "uploaded_doc",
+    "web_content": "web_scrape",
+    "file": "uploaded_doc",
+    "web": "web_scrape",
+    "document": "uploaded_doc",
+}
+
+
 @dataclass
 class SourceEvent:
     """单个输入源的检测事件"""
@@ -66,10 +78,11 @@ class CrossSourceCorrelator:
     """跨来源关联分析引擎"""
 
     # 攻击模式定义：(源1, 源2, ...) → 关联阈值 → 模式
+    # P2-2：源名统一为 InputSource 词汇表（uploaded_doc / web_scrape），与两个入口一致。
     PATTERN_DEFINITIONS = {
         CorrelationPattern.DOCUMENT_POISON_THEN_INJECTION: {
-            "sources": {"file_upload", "user_input"},
-            "source_sequence": ["file_upload", "user_input"],
+            "sources": {"uploaded_doc", "user_input"},
+            "source_sequence": ["uploaded_doc", "user_input"],
             "max_time_window_seconds": 300,     # 5分钟内
             "min_combined_confidence": 0.6,
             "description": "先上传含恶意指令的文件，再通过对话触发注入",
@@ -82,8 +95,8 @@ class CrossSourceCorrelator:
             "description": "污染历史记忆后诱导数据导出",
         },
         CorrelationPattern.FILE_UPLOAD_THEN_COMMAND: {
-            "sources": {"file_upload", "user_input"},
-            "source_sequence": ["file_upload", "user_input"],
+            "sources": {"uploaded_doc", "user_input"},
+            "source_sequence": ["uploaded_doc", "user_input"],
             "max_time_window_seconds": 300,
             "min_combined_confidence": 0.65,
             "description": "上传文件后尝试执行系统命令",
@@ -96,7 +109,7 @@ class CrossSourceCorrelator:
             "description": "污染知识库检索结果后尝试越狱",
         },
         CorrelationPattern.MULTI_SOURCE_COORDINATED_INJECTION: {
-            "sources": {"user_input", "file_upload", "knowledge_retrieval"},
+            "sources": {"user_input", "uploaded_doc", "knowledge_retrieval"},
             "source_sequence": None,  # 不要求特定顺序，只要3个源都有事件
             "max_time_window_seconds": 900,   # 15分钟
             "min_combined_confidence": 0.5,
@@ -142,6 +155,10 @@ class CrossSourceCorrelator:
         Returns:
             如果检测到新的关联威胁，返回威胁列表；否则返回 None
         """
+        # P2-2：源名统一归一化，保证两个入口（input_detector / security_layer）记录的事件
+        # 命中同一套预定义模式与阈值。
+        source = SOURCE_ALIASES.get(source, source)
+
         event = SourceEvent(
             session_id=session_id,
             source=source,
@@ -319,10 +336,13 @@ class CrossSourceCorrelator:
         for i, event in enumerate(sorted_events):
             source_name = {
                 "user_input": "用户输入",
+                "uploaded_doc": "文件上传",
                 "file_upload": "文件上传",
                 "knowledge_retrieval": "知识检索",
                 "agent_memory": "历史记忆",
                 "web_content": "网页内容",
+                "web_scrape": "网页内容",
+                "plugin_output": "插件输出",
             }.get(event.source, event.source)
 
             step = f"第{i+1}步 [{source_name}]"

@@ -47,6 +47,8 @@ class MetricsCollector:
         self._llm_timeout = 0
         self._llm_switch = 0
         self._llm_latencies: deque = deque(maxlen=MAX_LATENCY_SAMPLES)
+        # P2-1 检测分流统计：普通短文本（三件套） vs 深度检测（含投毒/记忆/关联深扫）
+        self._routing: Dict[str, int] = {"plain": 0, "deep": 0}
 
     # --------------------------------------------------------------
     # 打点
@@ -113,6 +115,12 @@ class MetricsCollector:
             else:
                 b["llm"]["fail"] += 1
 
+    def record_routing(self, bucket: str):
+        """P2-1 检测分流打点（bucket: plain=普通短文本三件套 / deep=含深扫）"""
+        bucket = bucket if bucket in ("plain", "deep") else "deep"
+        with self._lock:
+            self._routing[bucket] = self._routing.get(bucket, 0) + 1
+
     # --------------------------------------------------------------
     # 快照
     # --------------------------------------------------------------
@@ -125,6 +133,7 @@ class MetricsCollector:
             llm_fail = self._llm_fail
             llm_timeout = self._llm_timeout
             llm_switch = self._llm_switch
+            routing = dict(self._routing)
 
         avg_ms = round(sum(latencies) / len(latencies), 1) if latencies else 0
         p95_ms = round(latencies[int(len(latencies) * 0.95)], 1) if latencies else 0
@@ -185,6 +194,10 @@ class MetricsCollector:
                 "avg_ms": avg_ms,
                 "p95_ms": p95_ms,
                 "trend": llm_trend,
+            },
+            "routing": {
+                "plain": routing.get("plain", 0),
+                "deep": routing.get("deep", 0),
             },
         }
 

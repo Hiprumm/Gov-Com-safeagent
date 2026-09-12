@@ -30,7 +30,7 @@ const roleLabel = (r?: string) =>
 const MODULE_NAMES: Record<string, string> = {
   chat: '智能问答', dashboard: '态势看板', runtime: '运行时防护', security: '安全检测',
   redteam: '红蓝对抗', tools: '安全工具', approval: '审批中心', audit: '审计分析',
-  policy: '安全策略', system: '系统管理', governance: '治理中心', ops: '运维监控',
+  policy: '安全策略', system: '系统管理', governance: '治理中心',
 }
 const DATA_SCOPE_NAMES: Record<string, string> = { all: '全平台', dept: '本部门', self: '仅本人' }
 
@@ -134,7 +134,7 @@ onMounted(() => {
 
 <template>
   <div
-    class="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/50 backdrop-blur-sm"
+    class="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/50"
     @click.self="emit('close')"
   >
     <div class="w-full max-w-md bg-surface rounded-2xl border border-border-default shadow-2xl overflow-hidden animate-card-in">

@@ -35,11 +35,5 @@ frontend/node_modules/
 # 知识库索引缓存（由 rag_engine 首次启动自动重建，生成产物不入库）
 ai_service/knowledge/cache/
 
-# 本地临时诊断脚本 / 调试产物（不入库）
-ai_service/_diag.py
-ai_service/_diag2.py
-ai_service/_mw_test.py
-ai_service/fix_aigc_config.py
-ai_service/restart_backend.py
-ai_service/test_aigc_fix.py
+# 本地产物 / 调试残留
 frontend/netstat_output.txt

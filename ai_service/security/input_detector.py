@@ -261,6 +261,80 @@ class InputDetectionService:
             return RiskLevel.LOW
         else:
             return RiskLevel.NONE
+
+    # ------------------------------------------------------------------
+    # P2-1 检测分流：按输入特征决定是否启用投毒/记忆/关联深扫
+    # 普通短文本（无 URL/附件/敏感关键词、非高风险会话）只走
+    # 「规则 + 轻量 AI + LLM 分类」三件套；其余输入保守保留全部深扫。
+    # 红线保证：四类关键攻击（prompt_injection/jailbreak/combined_attack/
+    # data_exfiltration）的检出依赖的三件套层不做任何削减。
+    # ------------------------------------------------------------------
+    _SENSITIVE_KW_RE = re.compile(
+        r"(?:忽略|绕过|无视|禁用|关闭|禁用|导出|发送|上传|下载|执行|运行|命令|"
+        r"系统提示词|记住|永久|密码|密钥|token|secret|凭证|admin|root|删除|"
+        r"drop|rm|shutdown|sql|drop\s+table|reveal|bypass|ignore)",
+        re.IGNORECASE,
+    )
+    _URL_RE = re.compile(r"https?://|wss?://|ftp://", re.IGNORECASE)
+    _ATTACH_RE = re.compile(
+        r"(?:附件|上传文件|文档名|\.(?:docx?|pdf|txt|xlsx?|csv|md))", re.IGNORECASE
+    )
+
+    def _extract_input_features(
+        self, text: str, source: str, source_url: str, filename: str, session_id: str
+    ) -> dict:
+        """轻量输入特征提取（O(n) 级廉价检查，供 P2-1 分流决策）"""
+        has_url = bool(self._URL_RE.search(text)) or bool(source_url)
+        has_attachment = (
+            bool(filename)
+            or source in ("uploaded_doc", "web_scrape")
+            or bool(self._ATTACH_RE.search(text))
+        )
+        has_sensitive_kw = bool(self._SENSITIVE_KW_RE.search(text))
+        # 多轮高风险会话：本会话已存在风险事件（关联累积引擎为进程内单例）
+        session_risky = False
+        try:
+            from security.session_risk_accumulator import session_risk_accumulator
+            prof = session_risk_accumulator.get_profile(session_id or "default")
+            session_risky = (
+                prof.event_count > 0
+                and prof.overall_risk_level != RiskLevel.NONE
+            )
+        except Exception:
+            pass
+        return {
+            "text_len": len(text),
+            "has_url": has_url,
+            "has_attachment": has_attachment,
+            "has_sensitive_kw": has_sensitive_kw,
+            "session_risky": session_risky,
+        }
+
+    def _route_detection(
+        self, text: str, source: str, source_url: str, filename: str, session_id: str
+    ) -> dict:
+        """P2-1 检测分流：返回各深扫层是否启用，并打点分流统计。"""
+        f = self._extract_input_features(text, source, source_url, filename, session_id)
+        plain_short = (
+            f["text_len"] <= 80
+            and not f["has_url"]
+            and not f["has_attachment"]
+            and not f["has_sensitive_kw"]
+            and source == "user_input"
+            and not f["session_risky"]
+        )
+        route = {
+            "plain_short": plain_short,
+            "enable_vector": not plain_short,
+            "enable_memory": not plain_short,
+            "enable_correlation": not plain_short,
+        }
+        try:
+            from metrics_collector import get_metrics_collector
+            get_metrics_collector().record_routing("plain" if plain_short else "deep")
+        except Exception:
+            pass
+        return route
     
     def detect_single_input(
         self,
@@ -277,10 +351,14 @@ class InputDetectionService:
         # ======== 第0.5层：高级Unicode解码（基带64/转义序列/同形字/去空格） ========
         decoded_text, decode_ops = advanced_decode(normalized_text)
 
+        # ======== P2-1 检测分流：按输入特征决定深扫层启用 ========
+        route = self._route_detection(decoded_text, source, source_url, filename, session_id)
+
         rule_risk, rule_attack, rule_conf, rule_evidence = self.rule_engine.detect_by_rules(decoded_text)
         ai_risk, ai_attack, ai_conf, ai_evidence = self.ai_detector.analyze_text(decoded_text)
-        # 向量检测器：uploaded_doc/web_scrape源不是知识库内容，跳过知识库相似度检测避免误报
-        if source in ("uploaded_doc", "web_scrape"):
+        # 向量检测器：uploaded_doc/web_scrape源不是知识库内容，跳过知识库相似度检测避免误报；
+        # P2-1：普通短文本（plain_short）同样跳过投毒相似度深扫（三件套已覆盖四类关键攻击）
+        if not route["enable_vector"] or source in ("uploaded_doc", "web_scrape"):
             vector_risk, vector_attack, vector_conf, vector_evidence = RiskLevel.NONE, None, 0.0, []
         else:
             vector_risk, vector_attack, vector_conf, vector_evidence = self.vector_detector.detect_poisoning(decoded_text)
@@ -405,8 +483,12 @@ class InputDetectionService:
                     all_evidence.append("LLM-语义分类: 不可用，无深度语义检测")
 
         # ======== 第六层：记忆安全检测（OWASP ASI06） ========
-        memory_check = self.memory_guard.check_before_write(decoded_text)
-        if memory_check.is_poisoned:
+        # P2-1：普通短文本（plain_short）跳过记忆深扫；多轮/高风险/复杂输入保留
+        if route["enable_memory"]:
+            memory_check = self.memory_guard.check_before_write(decoded_text)
+        else:
+            memory_check = None
+        if memory_check and memory_check.is_poisoned:
             mem_conf = memory_check.confidence
             # 安全审查上下文降权（渗透测试/漏洞复现中讨论"绕过审批"不应判为攻击）
             if is_review_ctx:
@@ -458,9 +540,13 @@ class InputDetectionService:
                     final_attack_type = doc_attack
 
         # ======== 第十层：多源输入关联分析（所有源，EchoLeak CVE-2025-32711 间接注入检测） ========
-        corr_risk, corr_attack, corr_conf, corr_evidence = self._analyze_correlation(
-            session_id, decoded_text, source, max_risk, final_attack_type, max_confidence
-        )
+        # P2-1：普通短文本（plain_short）跳过跨来源关联深扫；多轮高风险会话/复杂输入保留
+        if route["enable_correlation"]:
+            corr_risk, corr_attack, corr_conf, corr_evidence = self._analyze_correlation(
+                session_id, decoded_text, source, max_risk, final_attack_type, max_confidence
+            )
+        else:
+            corr_risk, corr_attack, corr_conf, corr_evidence = RiskLevel.NONE, None, 0.0, []
         if corr_evidence:
             all_evidence.extend(corr_evidence)
             risk_levels.append(corr_risk)

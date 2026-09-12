@@ -547,6 +547,24 @@ class OptimizationLoop:
             "keyword_counts": [r["keyword_count"] for r in runs],
         }
 
+    def get_counts(self) -> Dict[str, int]:
+        """各表总条数（供只读汇总端点使用）"""
+        with self._get_conn() as conn:
+            versions = conn.execute(
+                "SELECT COUNT(*) FROM opt_versions").fetchone()[0]
+            attack_samples = conn.execute(
+                "SELECT COUNT(*) FROM opt_attack_samples").fetchone()[0]
+            threat_iocs = conn.execute(
+                "SELECT COUNT(*) FROM opt_threat_iocs").fetchone()[0]
+            regression_runs = conn.execute(
+                "SELECT COUNT(*) FROM opt_regression_runs").fetchone()[0]
+        return {
+            "versions": versions,
+            "attack_samples": attack_samples,
+            "threat_iocs": threat_iocs,
+            "regression_runs": regression_runs,
+        }
+
     # ------------------------------------------------------------------
     # 持久化恢复：服务重启后恢复已应用的调优关键词
     # ------------------------------------------------------------------

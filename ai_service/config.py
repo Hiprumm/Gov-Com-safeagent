@@ -70,6 +70,11 @@ class Settings(BaseSettings):
     MAX_CONTEXT_LENGTH: int = 8192
     MAX_INPUT_LENGTH: int = 4096
 
+    # ======== 优化闭环(收敛为默认只读) ========
+    # 检测调优闭环的写端点(反馈标注/自动调优/版本应用/样例扩充等)无前端消费，
+    # 默认关闭，仅保留只读端点；需要时置 ENABLE_OPTIMIZATION_WRITE=true 开启。
+    ENABLE_OPTIMIZATION_WRITE: bool = False
+
     # ======== 基础设施(预留) ========
     MILVUS_HOST: str = "localhost"
     MILVUS_PORT: int = 19530

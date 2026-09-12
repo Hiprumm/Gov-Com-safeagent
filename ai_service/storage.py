@@ -11,19 +11,15 @@ from typing import Dict, Any, List, Optional
 from threading import Lock
 from contextlib import contextmanager
 
+from storage_base import StorageBackend
+
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "safeagent.db")
 
 # 会话标题长度上限（缩略显示）
 AUTO_TITLE_MAX = 30
 
 
-def _auto_title(content: str) -> str:
-    """由消息内容生成缩略会话标题：压缩空白 + 截断 N 字，去掉文件上传等结构化前缀噪声。"""
-    text = " ".join(content.strip().split())
-    return text[:AUTO_TITLE_MAX]
-
-
-class Storage:
+class Storage(StorageBackend):
     """统一持久化存储，基于 SQLite"""
 
     def __init__(self, db_path: str = DB_PATH):
@@ -489,7 +485,7 @@ class Storage:
                 )
                 # 首次对话自动生成标题：用第一条用户消息内容缩略（已存在标题则不覆盖）
                 if role == "user":
-                    title = _auto_title(content)
+                    title = self._auto_title(content)
                     conn.execute(
                         "UPDATE sessions SET title = COALESCE(title, ?) WHERE session_id = ? AND title IS NULL",
                         (title, session_id)
@@ -868,33 +864,6 @@ class Storage:
                 "SELECT username, display_name, role, department, position, status, note, mfa_enabled, created_at, updated_at FROM sys_users ORDER BY role, username"
             ).fetchall()
         return [dict(r) for r in rows]
-
-    def get_user_mfa(self, username: str) -> Dict[str, Any]:
-        """返回用户的 MFA 信息：{totp_secret, mfa_enabled}
-
-        totp_secret 在库中为密文（security.secret_box），此处透明解密为明文返回。
-        """
-        from security.secret_box import decrypt_secret
-        with self._get_conn() as conn:
-            row = conn.execute(
-                "SELECT totp_secret, mfa_enabled FROM sys_users WHERE username = ?", (username,)
-            ).fetchone()
-        if not row:
-            return {"totp_secret": "", "mfa_enabled": False}
-        return {"totp_secret": decrypt_secret(row["totp_secret"] or ""),
-                "mfa_enabled": bool(row["mfa_enabled"])}
-
-    def set_user_mfa(self, username: str, secret: str, enabled: bool) -> bool:
-        """设置用户的 TOTP 密钥与启用状态（入库前加密）"""
-        from security.secret_box import encrypt_secret
-        with self._lock:
-            with self._get_conn() as conn:
-                cur = conn.execute(
-                    "UPDATE sys_users SET totp_secret = ?, mfa_enabled = ?, updated_at = ? WHERE username = ?",
-                    (encrypt_secret(secret or ""), 1 if enabled else 0,
-                     datetime.now().isoformat(), username),
-                )
-                return cur.rowcount > 0
 
     def update_user_profile(self, username: str, display_name: str = None, role: str = None,
                             department: str = None, position: str = None,
