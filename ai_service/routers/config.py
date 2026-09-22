@@ -307,45 +307,9 @@ async def test_web_search_config(request: Request):
     }
 
 
-# ==================== 可观测性大盘（S1：运维指标只读端点） ====================
-
-
-
-@router.get("/api/notifications")
-async def list_notifications(request: Request, limit: int = 50):
-    """站内通知列表（需登录，顶栏铃铛对全员可见）。"""
-    if not _login_guard(request):
-        raise HTTPException(status_code=401, detail="未登录")
-    from storage import get_storage
-    storage = get_storage()
-    limit = max(1, min(limit, 200))
-    return {
-        "list": storage.list_notifications(limit=limit),
-        "unread": storage.count_unread_notifications(),
-    }
-
-
-@router.post("/api/notifications/read")
-async def notifications_mark_read(request: Request, payload: dict):
-    """标记通知已读（需登录）。"""
-    if not _login_guard(request):
-        raise HTTPException(status_code=401, detail="未登录")
-    from storage import get_storage
-    storage = get_storage()
-    nid = payload.get("id")
-    storage.mark_notifications_read(int(nid) if nid is not None else None)
-    return {"success": True, "unread": storage.count_unread_notifications()}
-
-
-@router.post("/api/notifications/clear")
-async def notifications_clear(request: Request):
-    """清空通知（需登录）。"""
-    if not _login_guard(request):
-        raise HTTPException(status_code=401, detail="未登录")
-    from storage import get_storage
-    get_storage().clear_notifications()
-    return {"success": True}
-
+# ==================== 通知渠道配置（webhook / 通道） ====================
+# Phase 6：站内通知 list/read/clear 已迁 Spring Boot biz（cn.safeagent.biz.notification），
+# 本文件保留外部通知渠道配置（webhook / lark / smtp 通道）。
 
 @router.get("/api/notifications/webhook")
 async def get_webhook_config(request: Request):

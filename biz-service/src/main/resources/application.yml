@@ -1,0 +1,32 @@
+server:
+  port: 8300
+  servlet:
+    context-path: /
+
+spring:
+  application:
+    name: biz-service
+  jackson:
+    serialization:
+      write-dates-as-timestamps: false
+
+app:
+  db:
+    # 与 FastAPI AI 服务共享的 SQLite 文件（绝对路径）
+    # 对应 ai_service/storage.py 中 DB_PATH = <ai_service>/data/safeagent.db
+    path: x:/ZuoYe/揭榜挂帅26/Gov-Com-safeagent/ai_service/data/safeagent.db
+  jwt:
+    # 与 Python auth.py 一致：优先读取共享的持久化签名密钥，便于两服务令牌互认
+    secret-file: x:/ZuoYe/揭榜挂帅26/Gov-Com-safeagent/ai_service/data/jwt_secret.key
+    ttl-seconds: 28800      # 8 小时，与 AUTH_TOKEN_TTL_SECONDS 默认一致
+    max-login-fails: 5
+    login-lock-seconds: 300
+
+springdoc:
+  swagger-ui:
+    path: /swagger-ui.html
+
+logging:
+  level:
+    root: INFO
+    cn.safeagent.biz: INFO

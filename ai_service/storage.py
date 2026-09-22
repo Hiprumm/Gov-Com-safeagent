@@ -204,6 +204,13 @@ class Storage(StorageBackend):
                 );
                 CREATE INDEX IF NOT EXISTS idx_rate_key_time ON rate_limit_hits(key, hit_time);
 
+                CREATE TABLE IF NOT EXISTS tool_management (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    key TEXT UNIQUE,
+                    value TEXT,
+                    updated_at TEXT
+                );
+
                 CREATE INDEX IF NOT EXISTS idx_api_calls_client ON api_call_logs(client_id);
                 CREATE INDEX IF NOT EXISTS idx_pipl_user ON pipl_records(username);
                 CREATE INDEX IF NOT EXISTS idx_pipl_created ON pipl_records(created_at DESC);
@@ -548,6 +555,18 @@ class Storage(StorageBackend):
         with self._lock:
             with self._get_conn() as conn:
                 conn.execute("DELETE FROM notifications")
+
+    # ==================== 工具管控开关（表 tool_management，归属 Spring 写，AI 只读） ====================
+
+    def get_tool_management_enabled(self) -> bool:
+        """读取工具管控总开关，缺省为开启（true）。由 Spring /api/security/tool_management 写入。"""
+        with self._get_conn() as conn:
+            row = conn.execute(
+                "SELECT value FROM tool_management WHERE key = 'enabled'"
+            ).fetchone()
+        if row is None:
+            return True
+        return str(row[0]).lower() == "true"
 
     # ==================== 应急联动控制（全局熔断 / 账号封锁 / IP 封锁） ====================
 

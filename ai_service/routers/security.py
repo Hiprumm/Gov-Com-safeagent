@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """安全检测 / 工具管控 / 审批 / 运行时 / 优化闭环 / 场景 / 回放 / 评测 路由模块 —— P1-1 按业务域拆分（原 main.py 同域路由收敛）
 
 - URL 与行为与原 main.py 完全一致，仅注册载体由 app 改为 router，由 main.py include_router 装配；
@@ -440,75 +440,9 @@ async def check_url_access(request: Request):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# ==================== 审批查询 API（需审批查看权限） ====================
-# 安全修正：原 legacy 的 /approval/create、/approval/approve、/approval/reject 已移除。
-# 它们把 approver_id / approver_role 直接取自调用方参数且完全不做鉴权，
-# 可被匿名请求伪造成 super_admin 批准任意审批单（越权绕过，实测已复现）。
-# 审批单由安全层/智能体内部产生；批准与驳回统一走带令牌校验的 /approve/{id}、/reject/{id}。
-
-def _approval_view_guard(request: Request):
-    """返回具备审批查看权限的身份（admin/operator/auditor/manager），否则 None。"""
-    identity = current_identity(request.headers.get("X-Auth-Token"))
-    if identity and permission_engine.has_permission(identity.get("role"), "approval.view"):
-        return identity
-    return None
-
-
-@router.get("/api/security/approval/pending")
-async def get_pending_approvals(request: Request):
-    """获取所有待审批的请求（需审批查看权限）
-
-    注意：本路由必须注册在 /api/security/approval/{request_id} 之前，
-    否则 "pending" 会被当作 request_id 匹配（历史缺陷：前端审批面板
-    一直显示"暂无待审批请求"即由此导致）。
-    """
-    if not _approval_view_guard(request):
-        raise HTTPException(status_code=403, detail="无权限：需要审批查看权限")
-    try:
-        pending = approval_engine.list_pending()
-        pending_dicts = [r.dict() for r in pending]
-        return {
-            "pending": pending_dicts,
-            "count": len(pending_dicts),
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@router.get("/api/security/approval/history")
-async def get_approval_history(request: Request, limit: int = 50):
-    """获取最近的审批记录（全部状态），供审批中心"已处理"列表使用（需审批查看权限）
-
-    同 pending：静态段路由必须注册在 /{request_id} 参数路由之前。
-    """
-    if not _approval_view_guard(request):
-        raise HTTPException(status_code=403, detail="无权限：需要审批查看权限")
-    try:
-        from storage import get_storage
-        limit = max(1, min(limit, 200))
-        records = get_storage().list_recent_approvals(limit=limit)
-        # 状态统计
-        stats: dict = {}
-        for r in records:
-            stats[r.get("status", "unknown")] = stats.get(r.get("status", "unknown"), 0) + 1
-        return {"records": records, "count": len(records), "stats": stats}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@router.get("/api/security/approval/{request_id}", response_model=ApprovalRequest)
-async def get_approval(request: Request, request_id: str):
-    if not _approval_view_guard(request):
-        raise HTTPException(status_code=403, detail="无权限：需要审批查看权限")
-    try:
-        result = approval_engine.get_request(request_id)
-        if not result:
-            raise HTTPException(status_code=404, detail="审批请求不存在")
-        return result
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+# ==================== 审批查询 API ====================
+# Phase 4：审批管理端点已迁 Spring Boot( biz ApprovalController，表 approval_requests )。
+# AI 仅保留 gov_agent 进程内创建/读取（create_request/check_approval）。
 
 
 @router.post("/api/security/plugin_scan")
@@ -596,20 +530,16 @@ def _get_plugin_recommendations(vulnerabilities) -> list:
 
 
 # ======== 工具管控模块（MCP/Skill生态安全检测） ========
-tool_management_enabled = True
+# Phase 4：工具管控总开关已迁 Spring Boot( biz ToolController，共享表 tool_management )，
+# AI 侧仅读开关状态（storage.get_tool_management_enabled）。
 
-
-@router.get("/api/security/tool_management/status")
-async def get_tool_management_status():
-    return {"enabled": tool_management_enabled}
-
-
-@router.post("/api/security/tool_management/toggle")
-async def toggle_tool_management(request: Request):
-    global tool_management_enabled
-    body = await request.json() if request.headers.get("content-type", "").startswith("application/json") else {}
-    tool_management_enabled = body.get("enabled", not tool_management_enabled)
-    return {"enabled": tool_management_enabled}
+# 模块内惰性获取工具管控总开关（读共享库，true=开启）
+def _tool_module_enabled() -> bool:
+    try:
+        from storage import get_storage
+        return get_storage().get_tool_management_enabled()
+    except Exception:
+        return True
 
 
 @router.post("/api/security/mcp_scan")
@@ -618,7 +548,7 @@ async def scan_mcp_tool(request: Request):
     descriptor = body.get("descriptor", {})
     tool_id = body.get("tool_id", "unknown")
 
-    if not tool_management_enabled:
+    if not _tool_module_enabled():
         return {
             "module_enabled": False,
             "blocked": False,
@@ -664,7 +594,7 @@ async def scan_skill_package(request: Request):
     scripts = body.get("scripts", [])
     skill_name = body.get("skill_name", "unknown")
 
-    if not tool_management_enabled:
+    if not _tool_module_enabled():
         return {
             "module_enabled": False,
             "blocked": False,
@@ -707,7 +637,7 @@ async def scan_tool_combinations(request: Request):
     body = await request.json()
     tools = body.get("tools", [])
 
-    if not tool_management_enabled:
+    if not _tool_module_enabled():
         return {
             "module_enabled": False,
             "message": "工具管控模块未开启，跳过组合风险检测",
@@ -946,160 +876,6 @@ async def calculate_evaluation_metrics(request: dict):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-
-
-
-
-@router.post("/api/security/approval/approve/{request_id}")
-async def approve_request(request: Request, request_id: str, approver_comment: str = ""):
-    """审批通过指定的请求
-
-    异步审批流（B-2/B-5 联动）：批准时立即授予会话能力令牌 + 解锁会话工具，
-    用户重试原请求时自动放行，无需重复审批。
-    审计到人：操作人取当前登录账号；未登录按本地管理面板处理（访客演示模式）。
-    """
-    try:
-        # 注意参数顺序：approve_request(request_id, approver_id, approver_role, comments)
-        # 历史缺陷曾把 "admin" 传成 approver_id 而 approver_role 为空 → 角色层级不足
-        # 静默拒绝（DB 状态不更新但端点仍返回成功）
-        identity = current_identity(request.headers.get("X-Auth-Token"))
-        approver_id = identity.get("username") or ""
-        role = identity.get("role")
-        # 统一权限引擎判定审批能力（安全优先：未认证 / 无审批权限一律拒绝）
-        approver_role = permission_engine.approver_role_for(role, authenticated=bool(identity))
-        if not approver_role:
-            return {
-                "success": False,
-                "message": "当前账号无审批权限（需系统管理员 / 安全运维 / 部门负责人）",
-            }
-        result = approval_engine.approve_request(
-            request_id,
-            approver_id=approver_id,
-            approver_role=approver_role,
-            comments=approver_comment,
-        )
-        if result.status not in ("approved", "auto_approved"):
-            return {
-                "success": False,
-                "message": f"审批未通过: {result.status}"
-                           + (f"（{result.comments}）" if result.comments else ""),
-            }
-
-        # B-2/B-5：从审批单提取会话与工具信息 → 授予能力 + 会话级解锁
-        grant_info = {"session_id": None, "tool_name": None}
-        try:
-            record = approval_engine.get_request(request_id)
-            if record is not None:
-                details = dict(record.action_details or {})
-                # 守卫类审批单：tool_name 在 action_details 顶层；工具类在 _tool_name
-                sid = details.get("_session_id")
-                tname = details.get("_tool_name") or details.get("tool_name")
-                # action_type 形如 tool_call_export_data / guard_export_data
-                if not tname and record.action_type:
-                    for prefix in ("tool_call_", "guard_"):
-                        if record.action_type.startswith(prefix):
-                            tname = record.action_type[len(prefix):]
-                            break
-                if sid and tname:
-                    gov_agent.security_layer.capability_tokens.grant_for_tool(sid, tname)
-                    gov_agent.security_layer.record_session_unlock(sid, tname)
-                    grant_info = {"session_id": sid, "tool_name": tname}
-                    # 联动清理：同一请求可能产生两张审批单（tool_risk + guard 各一张），
-                    # 批准其一即解锁会话，另一张若继续 pending 会成为垃圾数据 → 一并标记
-                    try:
-                        for p in approval_engine.list_pending():
-                            pdet = dict(p.action_details or {})
-                            psid = pdet.get("_session_id")
-                            ptool = pdet.get("_tool_name") or pdet.get("tool_name")
-                            if psid == sid and ptool == tname and p.request_id != request_id:
-                                approval_engine.approve_request(
-                                    p.request_id, "system", "super_admin",
-                                    "关联审批单已批准（同会话同工具联动）"
-                                )
-                    except Exception:
-                        pass
-        except Exception as grant_err:
-            # 授予失败不阻断审批本身，仅记录（重试路径会在 check_approval 兜底授予）
-            audit_logger.create_log(
-                user_id=approver_id, user_role=approver_role, agent_id="security_panel",
-                action_type="approval_grant_warning",
-                action_details={"request_id": request_id, "error": str(grant_err)},
-                risk_level=RiskLevel.LOW,
-                is_blocked=False,
-            )
-
-        audit_logger.create_log(
-            user_id=approver_id, user_role=approver_role, agent_id="security_panel",
-            action_type="approval_approved",
-            action_details={"request_id": request_id, "comment": approver_comment, **grant_info},
-            risk_level=RiskLevel.NONE,
-            is_blocked=False,
-        )
-        # WebSocket 推送：审批通过
-        import asyncio
-        asyncio.create_task(push_approval_update(
-            request_id=request_id, action="approved",
-            detail={"comment": approver_comment, **grant_info}
-        ))
-        return {
-            "success": True,
-            "message": f"请求 {request_id} 已审批通过",
-            **grant_info,
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@router.post("/api/security/approval/reject/{request_id}")
-async def reject_request(request: Request, request_id: str, reason: str = ""):
-    """驳回指定的请求（记录当前登录操作人，审计到人）"""
-    try:
-        identity = current_identity(request.headers.get("X-Auth-Token"))
-        approver_id = identity.get("username") or ""
-        role = identity.get("role")
-        # 统一权限引擎判定审批能力（安全优先：未认证 / 无审批权限一律拒绝）
-        approver_role = permission_engine.approver_role_for(role, authenticated=bool(identity))
-        if not approver_role:
-            return {
-                "success": False,
-                "message": "当前账号无审批权限（需系统管理员 / 安全运维 / 部门负责人）",
-            }
-        rejected = approval_engine.reject_request(request_id, approver_id, reason)
-        if rejected.status not in ("rejected", "approved", "auto_approved"):
-            return {
-                "success": False,
-                "message": f"审批请求 {request_id} 不存在或已处理"
-            }
-        audit_logger.create_log(
-            user_id=approver_id, user_role=approver_role, agent_id="security_panel",
-            action_type="approval_rejected",
-            action_details={"request_id": request_id, "reason": reason},
-            risk_level=RiskLevel.NONE,
-            is_blocked=False,
-        )
-        # WebSocket 推送：审批驳回
-        import asyncio
-        asyncio.create_task(push_approval_update(
-            request_id=request_id, action="rejected",
-            detail={"reason": reason}
-        ))
-        return {"success": True, "message": f"请求 {request_id} 已驳回"}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@router.get("/api/security/approval/status/{request_id}")
-async def check_approval_status(request_id: str):
-    """查询特定审批请求的状态"""
-    try:
-        req = approval_engine.get_request(request_id)
-        if not req:
-            raise HTTPException(status_code=404, detail="审批请求不存在")
-        return req.dict()
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
 
 
 # ==================== 知识库投毒检测 API ====================

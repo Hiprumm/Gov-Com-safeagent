@@ -86,92 +86,7 @@ async def audit_source_ip_middleware(request: Request, call_next):
     set_source_ip(request.client.host if request.client else "")
     return await call_next(request)
 
-# ======== 基本 API Key 鉴权 (公网预览用) ========
-_SKIP_AUTH_PATHS = {"/", "/api/health", "/docs", "/openapi.json", "/redoc"}
-
-if settings.AUTH_ENABLED and settings.AUTH_API_KEY:
-    @app.middleware("http")
-    async def api_key_auth_middleware(request: Request, call_next):
-        if request.url.path in _SKIP_AUTH_PATHS or request.url.path.startswith("/docs"):
-            return await call_next(request)
-        if request.headers.get("X-API-Key") != settings.AUTH_API_KEY:
-            return JSONResponse(
-                status_code=401,
-                content={"detail": "Unauthorized: Missing or invalid X-API-Key header"}
-            )
-        return await call_next(request)
-
-# ======== 简单限流 (滑动窗口)，计数落库保证多 worker 配额一致 ========
-
-if settings.RATE_LIMIT_ENABLED:
-    @app.middleware("http")
-    async def rate_limit_middleware(request: Request, call_next):
-        client_ip = request.client.host if request.client else "unknown"
-        # 登录态按用户名限流更精确；匿名按 IP
-        identity = None
-        try:
-            identity = current_identity(request.headers.get("X-Auth-Token"))
-        except Exception:  # noqa: BLE001
-            identity = None
-        key = (identity or {}).get("username") or f"ip:{client_ip}"
-        from storage import get_storage
-        rl = get_storage()
-        if rl.rate_limit_check(key, settings.RATE_LIMIT_REQUESTS, settings.RATE_LIMIT_WINDOW):
-            return JSONResponse(status_code=429, content={"detail": "Too Many Requests"})
-        return await call_next(request)
-
-# ======== 请求体大小限制 ========
-_MAX_BODY = settings.MAX_REQUEST_SIZE_MB * 1024 * 1024
-
-@app.middleware("http")
-async def request_size_limit_middleware(request: Request, call_next):
-    if request.headers.get("content-length"):
-        content_length = int(request.headers["content-length"])
-        if content_length > _MAX_BODY:
-            return JSONResponse(
-                status_code=413,
-                content={"detail": f"Request body too large. Max {settings.MAX_REQUEST_SIZE_MB}MB"}
-            )
-    return await call_next(request)
-
-# ======== 应急联动：IP 封锁（全局中间件，IP 维度的第一道闸） ========
-# 事故处置真实场景：全局熔断要"停止执行、但不能瞎眼"——
-#   - IP 封锁：敌对源，任何请求（含只读研判）一律拦截；
-#   - 全局熔断：阻断一切"执行/改数据"动作；但放行只读研判接口（审计/合规/台账/看板/运行时/会话史），
-#     便于应急处置期间持续查看态势与取证。这些只读接口仍受登录+角色 ACL 双重约束。
-_READONLY_INTROSPECT_GET_PREFIXES = (
-    "/api/audit/", "/api/compliance/", "/api/dashboard/", "/api/runtime/",
-    "/api/pipl/", "/api/ecosystem/", "/api/notify/", "/api/notifications",
-    "/api/policy/", "/api/agent/sessions", "/api/agent/history",
-    "/api/agent/recall_preview", "/api/security/tool_management/status",
-    "/api/metrics",
-    "/api/auth/",
-)
-
-
-@app.middleware("http")
-async def emergency_ip_middleware(request: Request, call_next):
-    path = request.url.path
-    if path.startswith(("/api/emergency", "/openapi.json", "/docs", "/api/health")):
-        return await call_next(request)
-    try:
-        from governance import get_emergency_center
-        ec = get_emergency_center()
-        client_ip = request.client.host if request.client else ""
-        # 1) IP 封锁：源 IP 被应急封锁 → 一律拦截（含只读）——实时读库，多 worker 一致
-        if client_ip and ec.is_ip_blocked(client_ip):
-            return JSONResponse(status_code=403,
-                                content={"detail": f"IP {client_ip} 已被应急封锁，禁止访问", "code": "EMERGENCY_BLOCKED"})
-        # 2) 全局熔断：仅拦截执行/改数据动作；GET 只读研判接口放行（仍需角色权限）——实时读库
-        if ec.global_circuit_active():
-            is_readonly = (request.method.upper() == "GET"
-                           and path.startswith(_READONLY_INTROSPECT_GET_PREFIXES))
-            if not is_readonly:
-                return JSONResponse(status_code=403,
-                                    content={"detail": "系统已全局熔断，暂停所有智能体执行", "code": "EMERGENCY_BLOCKED"})
-    except Exception:
-        pass
-    return await call_next(request)
+# ======== Phase 6：鉴权/限流/IP封锁/熔断/请求体限制已迁移至网关 gateway-lite，AI 侧仅保留来源IP审计注入 ========
 
 # 共享单例（P1-1 收敛至 app_deps.py：main 与 routers/* 共用同一实例）
 from app_deps import (
@@ -185,103 +100,7 @@ from app_deps import (
 from routers.auth import _admin_guard
 
 
-
-# ==================== 统一鉴权中间件（生产化） ====================
-# 设计动机：此前靠"每个端点手写 guard"，新增端点极易漏（审计复查实测仍有 11 个改数据端点可被匿名调用）。
-# 改为声明式集中管控：把「方法 + 路径前缀 → 所需权限」登记到一张表，新增端点只加一行，杜绝漏写。
-# 取值：
-#   - "<perm>"        需登录且具备该权限点（权限点来自 permission_engine，单一事实来源）
-#   - "login"         任何已登录账号
-#   - "integration"   服务间调用：登录令牌 或 已配置的 X-API-Key（供 SDK / 网关）
-_PROTECTED_ROUTES: List[tuple] = [
-    # ---- 安全策略与安全控制（改这些等于改防线本身）----
-    ("GET", "/api/security/policy", "policy.view"),
-    ("PUT", "/api/security/policy", "policy.manage"),
-    ("POST", "/api/security/tool_management/toggle", "tools.manage"),
-    ("POST", "/api/security/runtime/terminate", "runtime.terminate"),
-    ("POST", "/api/security/operation_guard/clear", "system.maintain"),
-    ("POST", "/api/security/session_risk/clear", "system.maintain"),
-    ("POST", "/api/security/cross_source/clear", "system.maintain"),
-    ("POST", "/api/kb/rebuild", "system.maintain"),
-    ("POST", "/api/kb/upload", "system.maintain"),
-    ("POST", "/api/kb/delete_document", "system.maintain"),
-    # ---- 治理中心（应急联动 / 开放生态 / PIPL / 合规报告）----
-    ("POST", "/api/emergency/", "system.maintain"),
-    ("POST", "/api/ecosystem/", "system.maintain"),
-    ("POST", "/api/pipl/", "system.maintain"),
-    ("GET", "/api/emergency/status", "system.view"),
-    ("GET", "/api/ecosystem/", "system.view"),
-    ("GET", "/api/pipl/", "system.view"),
-    ("GET", "/api/compliance/", "audit.view"),
-    # ---- 可观测性大盘（只读运维指标）----
-    ("GET", "/api/metrics", "system.view"),
-    # ---- 安全检测 / 工具管控 / 扫描（安全运维职责，业务用户不可用）----
-    ("POST", "/api/security/detect_input", "security.detect"),
-    ("POST", "/api/security/detect_single", "security.detect"),
-    ("POST", "/api/security/detect_file", "security.detect"),
-    ("POST", "/api/security/plugin_scan", "security.scan"),
-    ("POST", "/api/security/mcp_scan", "security.scan"),
-    ("POST", "/api/security/skill_scan", "security.scan"),
-    ("GET", "/api/security/tool_management/status", "tools.view"),
-    # ---- 检测调优 / 对抗评测 / 回放（安全分析类）----
-    ("POST", "/api/optimization/", "security.scan"),
-    ("POST", "/api/security/bypass_test", "security.scan"),
-    ("POST", "/api/security/bypass_batch_test", "security.scan"),
-    ("POST", "/api/security/pssu/assess", "security.scan"),
-    ("POST", "/api/scenarios/", "security.scan"),
-    ("POST", "/api/replay/", "security.scan"),
-    # ---- 会话管理（用户操作；含查询：会话/历史按登录用户隔离）----
-    ("GET", "/api/agent/sessions", "login"),
-    ("GET", "/api/agent/history", "login"),
-    ("POST", "/api/agent/new_session", "login"),
-    ("POST", "/api/agent/clear_session", "login"),
-    ("POST", "/api/agent/delete_session", "login"),
-    ("POST", "/api/agent/rename_session", "login"),
-    ("POST", "/api/agent/recall_messages", "login"),
-    ("POST", "/api/agent/delete_message", "login"),
-    ("GET", "/api/agent/recall_preview", "login"),
-    # ---- 审计链校验 / 合规报告（登录可访问，匿名拒绝）----
-    ("GET", "/api/audit/logs/verify", "login"),
-    ("GET", "/api/audit/logs/verify-graded", "login"),
-    ("GET", "/api/compliance/report", "login"),
-    # ---- 智能体执行入口（会真实执行工具）→ 登录 或 服务间 API Key ----
-    ("POST", "/api/agent/chat", "integration"),
-    ("POST", "/api/agent/chat/stream", "integration"),
-    ("POST", "/api/agent/run", "integration"),
-    ("POST", "/api/agent/file_upload", "integration"),
-]
-
-
-@app.middleware("http")
-async def unified_authorization_middleware(request: Request, call_next):
-    """统一鉴权：按 _PROTECTED_ROUTES 表校验（未登记的路径不干预）。"""
-    path = request.url.path
-    method = request.method.upper()
-    need: Optional[str] = None
-    for m, prefix, perm in _PROTECTED_ROUTES:
-        if m == method and path.startswith(prefix):
-            need = perm
-            break
-    if need is None:
-        return await call_next(request)
-
-    # 服务间调用：已配置 API Key 且请求头匹配
-    if (need == "integration" and settings.AUTH_API_KEY
-            and request.headers.get("X-API-Key") == settings.AUTH_API_KEY):
-        return await call_next(request)
-
-    identity = current_identity(request.headers.get("X-Auth-Token"))
-    if not identity:
-        return JSONResponse(status_code=401, content={"detail": "未登录或登录已失效"})
-    if need in ("login", "integration"):
-        return await call_next(request)
-    if not permission_engine.has_permission(identity.get("role"), need):
-        return JSONResponse(
-            status_code=403,
-            content={"detail": f"无权限：需要 {need} 权限（当前角色 {identity.get('role')}）"},
-        )
-    return await call_next(request)
-
+# ======== Phase 6：统一鉴权已迁移至网关 gateway-lite（_PROTECTED_ROUTES）AI 侧不再重复鉴权 ========
 
 # ======== 可观测性：HTTP 请求指标采集（进程内，多 worker 各自计数） ========
 @app.middleware("http")
@@ -402,6 +221,12 @@ def _parse_log_ts(ts):
     return None
 
 
+# 看板总览结果缓存（按登录身份分组，短 TTL）：避免每次全量拉取+逐行 ABAC 聚合，
+# 降低冷启动/瞬时压力下偶发 500 的超时风险。
+_DASHBOARD_CACHE: Dict[str, Dict[str, Any]] = {}
+_DASHBOARD_CACHE_TTL_SECONDS = 6
+
+
 @app.get("/api/dashboard/overview")
 async def dashboard_overview(request: Request):
     """风险看板总览：一次聚合返回 KPI 卡片、攻击类型分布、7 日趋势、最近风险事件
@@ -424,6 +249,12 @@ async def dashboard_overview(request: Request):
         # ---- 解析当前登录身份，交由统一权限引擎决定数据收敛范围（RBAC+ABAC） ----
         identity = current_identity(request.headers.get("X-Auth-Token")) if request else {}
         username = identity.get("username", "")
+
+        # ---- 短 TTL 缓存：命中直接返回，避免反复全量聚合触发偶发超时/500 ----
+        _cache_key = username or "__anon__"
+        _cached = _DASHBOARD_CACHE.get(_cache_key)
+        if _cached and (datetime.now().timestamp() - _cached["ts"] < _DASHBOARD_CACHE_TTL_SECONDS):
+            return _cached["data"]
         role = identity.get("role", "")
         dept = identity.get("department", "")
         display_name = identity.get("display_name", "")
@@ -467,7 +298,10 @@ async def dashboard_overview(request: Request):
         risk_order = ("medium", "high", "critical")
 
         for d in log_dicts:
-            ts = _parse_log_ts(d.get("timestamp"))
+            try:
+                ts = _parse_log_ts(d.get("timestamp"))
+            except Exception:
+                ts = None
             risk_level = d.get("risk_level", "none")
             if hasattr(risk_level, "value"):
                 risk_level = risk_level.value
@@ -528,7 +362,7 @@ async def dashboard_overview(request: Request):
         # scope 元信息：供前端标注“全平台 / 本部门 / 仅本人”视角（引擎统一生成）
         scope_meta = permission_engine.scope_meta(identity)
 
-        return {
+        result = {
             "success": True,
             "scope": scope_meta,
             "kpi": {
@@ -542,6 +376,8 @@ async def dashboard_overview(request: Request):
             "trend_7d": list(trend_map.values()),
             "recent_events": recent_events,
         }
+        _DASHBOARD_CACHE[_cache_key] = {"ts": datetime.now().timestamp(), "data": result}
+        return result
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

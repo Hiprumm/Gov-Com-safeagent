@@ -1,0 +1,25 @@
+#!/bin/sh
+# Biz-Service Maven Wrapper 启动脚本（Unix/Linux/macOS，Windows 用 mvnw.cmd）
+# 首次运行自动下载 Maven 到 ~/.m2/wrapper/dists。
+set -e
+APP_HOME="$(cd "$(dirname "$0")" && pwd)"
+PROPS="$APP_HOME/.mvn/wrapper/maven-wrapper.properties"
+[ -f "$PROPS" ] || { echo "[ERROR] 未找到 $PROPS" >&2; exit 1; }
+
+DIST_URL=$(grep -i '^distributionUrl' "$PROPS" | head -n1 | cut -d= -f2-)
+[ -n "$DIST_URL" ] || { echo "[ERROR] 缺少 distributionUrl" >&2; exit 1; }
+DIST_FOLDER=$(basename "$DIST_URL" .zip)
+DISTS_DIR="${HOME}/.m2/wrapper/dists"
+DIST_HOME="$DISTS_DIR/$DIST_FOLDER"
+export MAVEN_OPTS="${MAVEN_OPTS:-}"
+
+if [ ! -f "$DIST_HOME/bin/mvn" ]; then
+  echo "[WRAPPER] 下载 Maven 发行版: $DIST_FOLDER"
+  mkdir -p "$DISTS_DIR"
+  ZIP="$TMPDIR/${DIST_FOLDER}.zip"
+  curl -fSL -o "$ZIP" "$DIST_URL"
+  (cd "$DISTS_DIR" && unzip -oq "$ZIP")
+  rm -f "$ZIP"
+fi
+
+exec "$DIST_HOME/bin/mvn" "$@"

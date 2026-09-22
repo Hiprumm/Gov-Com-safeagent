@@ -106,90 +106,12 @@ async def compliance_refusal_rate(request: dict):
 
 
 
-def _operator(req: Request) -> str:
-    return (current_identity(req.headers.get("X-Auth-Token")) or {}).get("username") or "system"
-
-
-@router.get("/api/emergency/status")
-def emergency_status():
-    from governance import get_emergency_center
-    return {"success": True, **get_emergency_center().status()}
-
-
-@router.post("/api/emergency/engage")
-async def emergency_engage(req: Request, payload: dict):
-    from governance import get_emergency_center
-    return get_emergency_center().engage(str(payload.get("reason", "")), _operator(req))
-
-
-@router.post("/api/emergency/disengage")
-async def emergency_disengage(req: Request):
-    from governance import get_emergency_center
-    return get_emergency_center().disengage(_operator(req))
-
-
-@router.post("/api/emergency/block_user")
-async def emergency_block_user(req: Request, payload: dict):
-    from governance import get_emergency_center
-    return get_emergency_center().block_user(str(payload.get("username", "")).strip(),
-                                             str(payload.get("reason", "")), _operator(req))
-
-
-@router.post("/api/emergency/unblock_user")
-async def emergency_unblock_user(req: Request, payload: dict):
-    from governance import get_emergency_center
-    return get_emergency_center().unblock_user(str(payload.get("username", "")).strip(), _operator(req))
-
-
-@router.post("/api/emergency/block_ip")
-async def emergency_block_ip(req: Request, payload: dict):
-    from governance import get_emergency_center
-    return get_emergency_center().block_ip(str(payload.get("ip", "")).strip(),
-                                           str(payload.get("reason", "")), _operator(req))
-
-
-@router.post("/api/emergency/unblock_ip")
-async def emergency_unblock_ip(req: Request, payload: dict):
-    from governance import get_emergency_center
-    return get_emergency_center().unblock_ip(str(payload.get("ip", "")).strip(), _operator(req))
-
-
-# ---- 开放生态管理（管理端）----
-@router.get("/api/ecosystem/clients")
-def ecosystem_clients():
-    from governance import get_openapi_manager
-    m = get_openapi_manager()
-    return {"success": True, "clients": m.list_clients(), **m.stats()}
-
-
-@router.post("/api/ecosystem/create")
-async def ecosystem_create(req: Request, payload: dict):
-    from governance import get_openapi_manager
-    return get_openapi_manager().create(
-        str(payload.get("name", "")).strip(), int(payload.get("rate_limit", 60)),
-        int(payload.get("quota", 0)), str(payload.get("description", "")), _operator(req))
-
-
-@router.post("/api/ecosystem/toggle")
-async def ecosystem_toggle(req: Request, payload: dict):
-    from governance import get_openapi_manager
-    return get_openapi_manager().toggle(str(payload.get("client_id", "")).strip(),
-                                        bool(payload.get("enabled")))
-
-
-@router.post("/api/ecosystem/delete")
-async def ecosystem_delete(req: Request, payload: dict):
-    from governance import get_openapi_manager
-    return get_openapi_manager().delete(str(payload.get("client_id", "")).strip())
-
-
-@router.get("/api/ecosystem/logs")
-def ecosystem_logs(limit: int = 100):
-    from governance import get_openapi_manager
-    return {"success": True, "logs": get_openapi_manager().log_calls(limit)}
-
-
 # ---- 开放生态：受保护示例接口（演示 Token 鉴权 + 限流配额 + 调用留痕）----
+# ============================================================================
+# Phase 6：应急联动(emergency)/开放生态(clients|create|toggle|delete|logs)/
+# PIPL合规台账 管理端点已迁 Spring Boot biz（cn.safeagent.biz.governance），
+# 本文件保留：合规评测、开放问答(open/chat)、合规对标报告。
+# ============================================================================
 @router.post("/api/open/chat")
 async def open_chat(req: Request, payload: dict):
     from governance import get_openapi_manager, get_emergency_center
@@ -212,54 +134,6 @@ async def open_chat(req: Request, payload: dict):
         return {"success": False, "error": "缺少 question 参数"}
     return {"success": True, "client": {"client_id": client["client_id"], "name": client["name"]},
             "echo": f"已收到调用方「{client['name']}」的提问：{question}"}
-
-
-# ---- PIPL 合规台账 ----
-@router.get("/api/pipl/records")
-def pipl_records():
-    from governance import get_pipl_ledger
-    mgr = get_pipl_ledger()
-    return {"success": True, "records": mgr.records(), **mgr.stats()}
-
-
-@router.post("/api/pipl/update")
-async def pipl_update(req: Request, payload: dict):
-    from governance import get_pipl_ledger
-    ok = get_pipl_ledger().update(
-        int(payload.get("id", 0)), str(payload.get("legal_basis", "")),
-        str(payload.get("assessment", "pending")), _operator(req))
-    return ok if ok else {"success": False, "error": "更新失败"}
-
-
-@router.post("/api/pipl/scan")
-async def pipl_scan(req: Request, payload: dict):
-    from governance import get_pipl_ledger
-    return get_pipl_ledger().scan_and_register(
-        str(payload.get("text", "")), str(payload.get("session_id", "")),
-        _operator(req), source=str(payload.get("source", "manual")))
-
-
-@router.get("/api/pipl/export")
-async def pipl_export(req: Request, fmt: str = "csv"):
-    """导出合规台账（CSV/JSON，仅含脱敏值），并审计留痕到真实操作人。"""
-    if fmt not in ("csv", "json"):
-        raise HTTPException(status_code=400, detail="fmt 仅支持 csv/json")
-    actor = _operator(req)
-    actor = actor or (current_identity(req.headers.get("X-Auth-Token")) or {}).get("username", "")
-    from governance import get_pipl_ledger
-    from audit.audit_logger import AuditLogger
-    result = get_pipl_ledger().export(fmt=fmt)
-    # 审计联动：台账导出属敏感操作，须记录谁在何时导出了多少条
-    try:
-        AuditLogger().create_log(
-            user_id=actor or "unknown", user_role="admin", agent_id="pipl",
-            action_type="pipl_export", action_details={"fmt": fmt, "count": result["count"]},
-            risk_level="medium", is_blocked=False,
-        )
-    except Exception as e:  # noqa: BLE001
-        pass
-    return result
-
 
 
 # ---- 合规对标报告 ----
