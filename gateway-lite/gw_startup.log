@@ -1,0 +1,17 @@
+﻿python.exe : INFO:     Started server process [189464]
+At line:15 char:3198
++ ... teway-lite; & "D:\LianAnSmartPatrol\ai_service\.venv\Scripts\python.e ...
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (INFO:     Start...rocess [189464]:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://0.0.0.0:8090 (Press CTRL+C to quit)
+[AUTH] 使用已持久化的签名密钥 data/jwt_secret.key（建议在 .env 配置 AUTH_JWT_SECRET 以便多实例共享）
+INFO:     127.0.0.1:58090 - "GET /api/health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:58103 - "POST /api/agent/chat/stream?user_input=%E4%BD%A0%E5%A5%BD&session_id=gw_1790131739 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:58108 - "POST /api/agent/chat/stream?user_input=1%2B1%E7%AD%89%E4%BA%8E%E5%87%A0%EF%BC%9F&session_id=gw_1790131741 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:58109 - "POST /api/agent/chat/stream?user_input=SQL%E6%B3%A8%E5%85%A5%E6%9C%89%E5%93%AA%E4%BA%9B%E5%B8%B8%E8%A7%81%E7%B1%BB%E5%9E%8B%EF%BC%9F&session_id=gw_1790131743 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:58112 - "GET /api/security/policy HTTP/1.1" 200 OK
+INFO:     127.0.0.1:58113 - "POST /api/agent/chat?user_input=%E4%BD%A0%E5%A5%BD&session_id=gw_sync_1790131748 HTTP/1.1" 200 OK

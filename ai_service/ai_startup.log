@@ -1,0 +1,18 @@
+﻿python.exe : INFO:     Started server process [196652]
+At line:15 char:3007
++ ... ai_service; & "D:\LianAnSmartPatrol\ai_service\.venv\Scripts\python.e ...
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (INFO:     Start...rocess [196652]:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://0.0.0.0:8080 (Press CTRL+C to quit)
+[AUTH] 使用已持久化的签名密钥 data/jwt_secret.key（建议在 .env 配置 AUTH_JWT_SECRET 以便多实例共享）
+[INFO] LLM 对话主链已启用（可在 系统状态-模型接入 中热更新）
+[STARTUP] 审计 WORM 保护：update_blocked=True, delete_blocked=True
+[STARTUP] 安全策略 v0 已加载，LLM分类层=开，清理过期日志 0 条
+[STARTUP][WARN] 以下账号仍在使用默认口令 admin123，生产环境请立即修改或停用：admin, operator, auditor, user
+[SECRET][WARN] 未安装 cryptography，敏感字段将明文存储（建议 pip install cryptography）
+[STARTUP][WARN] 敏感字段加密不可用（缺少 cryptography 或密钥），MFA TOTP 密钥将明文入库。
+INFO:     127.0.0.1:56580 - "GET /api/health HTTP/1.1" 200 OK

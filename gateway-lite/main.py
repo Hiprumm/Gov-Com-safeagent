@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import time
 from pathlib import Path
 
 import httpx
@@ -350,6 +351,63 @@ async def proxy(path: str, request: Request):
     body = await request.body()
     upstream_path = f"/{path}" + (f"?{request.url.query}" if request.url.query else "")
 
+    # 先用 HEAD 或快速 GET 判断上游是否是 SSE——不对，直接试 request，如果失败再走 stream
+    # 更干净的方式：client.stream() 先看响应头，再决定用哪种处理
+    # 但 client.stream() 需要 async with 上下文，且 Response 只能在上下文内存活
+    # 所以我们需要：对于已知流式路径（/agent/chat/stream 等），直接走 stream；
+    # 对于普通路径，走 request() + 正常 Response
+    _STREAM_HINTS = ("/stream", "/sse")
+    _path_lower = upstream_path.lower()
+    _looks_stream = any(h in _path_lower for h in _STREAM_HINTS) or \
+                    "agent/chat" in _path_lower and "stream" in _path_lower
+
+    if _looks_stream:
+        # === SSE / 流式 ===
+        # httpx.AsyncClient.request() 会预读整个 body → SSE 场景下后续 aiter_raw() 报 StreamConsumed
+        # 必须用 client.stream()。但 stream() 返回的上下文管理器在 async with 退出时会关闭连接，
+        # 而 StreamingResponse.gen() 是在返回后才被迭代的，所以必须手动管理 enter/exit：
+        #   1. __aenter__ → 拿到 status_code + headers（立即可用，无需读 body）
+        #   2. 定义 gen() 引用这个 res，在 gen() 的 finally 里 __aexit__
+        # 这样连接只在 gen() 被消费期间存活，SSE 流完全透传
+        try:
+            _cm = client.stream(
+                request.method, upstream_path,
+                headers=headers, content=body,
+                follow_redirects=False,
+            )
+            _res = await _cm.__aenter__()
+        except httpx.HTTPError as e:
+            return JSONResponse(status_code=502,
+                                content={"error": "upstream_unreachable",
+                                         "detail": f"{type(e).__name__}: {getattr(e, 'request', None) and e.request.url or e}",
+                                         "upstream": "biz" if _route_to_biz(f"/{path}") else "ai"})
+
+        _upstream_status = _res.status_code
+        _upstream_content_type = _res.headers.get("content-type", "")
+        _upstream_headers = {k: v for k, v in _res.headers.items()
+                             if k.lower() not in ("content-length", "transfer-encoding", "content-encoding")}
+
+        async def gen():
+            try:
+                async for chunk in _res.aiter_raw():
+                    yield chunk
+            except httpx.HTTPError as e:
+                err_payload = json.dumps(
+                    {"error": "upstream_unreachable",
+                     "detail": f"{type(e).__name__}: {str(e)[:200]}"},
+                    ensure_ascii=False)
+                yield f"event: error\ndata: {err_payload}\n\n".encode("utf-8")
+            finally:
+                await _cm.__aexit__(None, None, None)
+
+        return StreamingResponse(
+            gen(),
+            status_code=_upstream_status,
+            headers=_upstream_headers,
+            media_type=_upstream_content_type or "text/event-stream",
+        )
+
+    # 普通请求：用 client.request()（会预读 body，方便直接构造 Response）
     try:
         res = await client.request(
             request.method, upstream_path,
@@ -361,18 +419,6 @@ async def proxy(path: str, request: Request):
                             content={"error": "upstream_unreachable",
                                      "detail": f"{type(e).__name__}: {getattr(e, 'request', None) and e.request.url or e}",
                                      "upstream": "biz" if _route_to_biz(f"/{path}") else "ai"})
-
-    # SSE / 流式：逐块转发
-    if res.headers.get("content-type", "").startswith("text/event-stream"):
-        async def gen():
-            async for chunk in res.aiter_raw():
-                yield chunk
-        return StreamingResponse(
-            gen(),
-            status_code=res.status_code,
-            headers={k: v for k, v in res.headers.items()
-                     if k.lower() not in ("content-length", "transfer-encoding", "content-encoding")},
-        )
 
     out_headers = {k: v for k, v in res.headers.items()
                    if k.lower() not in ("content-length", "transfer-encoding", "content-encoding")}

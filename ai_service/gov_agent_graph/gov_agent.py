@@ -933,7 +933,81 @@ class GovAgent:
             "current_step": "risk_assessment_completed",
         }
     
+    # 工具关键词——命中这些词才可能需要调用工具（文件操作/联网/搜索/执行/导出/生成文档）
+    _TOOL_KEYWORDS = frozenset([
+        "文件", "读取", "写", "保存", "下载", "上传", "路径", "内容",
+        "执行", "运行", "命令", "shell", "cmd", "powershell",
+        "搜索", "查询", "查找", "联网", "最新", "实时", "新闻", "动态", "天气", "行情", "热点", "近期",
+        "知识库", "制度", "流程",
+        "导出", "生成", "报表", "汇总", "台账",
+        "公文", "请示", "报告", "通知", "稿",
+    ])
+
+    # 安全问答关键词——命中这些词说明是知识问答（不需要工具），快速跳过决策
+    _KNOWLEDGE_KEYWORDS = frozenset([
+        "是什么", "什么是", "有哪些", "哪些", "分类", "类型", "种类",
+        "定义", "解释", "介绍", "简述", "说明", "如何", "怎么", "怎样",
+        "为什么", "原因", "原理", "区别", "对比",
+        "标准", "规范", "合规", "等保", "密评",
+    ])
+
+    def _fast_decision(self, state: AgentState) -> Optional[Dict[str, Any]]:
+        """快路径：安全问答（risk=NONE + 无工具关键词）跳过 LLM 决策调用，
+        直接返回空 tool_calls → 路由到 response_generation。
+        对简单问题节省 ~800-2700ms 的 LLM 决策开销。"""
+        risk_val = state.get("risk_level")
+        risk_str = risk_val.value if hasattr(risk_val, "value") else str(risk_val or "")
+        user_input = (state.get("user_input") or "").strip()
+
+        # 仅首轮迭代走快路径；后续 ReAct 迭代必须走 LLM 判断是否继续
+        if state.get("react_iteration", 0) > 0:
+            return None
+
+        # 安全检测层已判定 risk≥LOW：安全相关输入继续走 LLM 决策（可能需要工具调用安全扫描等）
+        if risk_str not in ("none", "NONE"):
+            return None
+
+        # 来源是文件上传/知识库检索：走正常路径（可能需要工具关联）
+        if state.get("input_source") in ("uploaded_doc", "knowledge_retrieval"):
+            return None
+
+        # 检测是否含工具关键词——命中则需要 LLM 判断具体工具
+        input_lower = user_input.lower()
+        if any(kw in input_lower for kw in self._TOOL_KEYWORDS):
+            return None
+
+        # 命中知识问答关键词或短文本（≤40字符）：直接判定为"普通问答"
+        has_kw = any(kw in user_input for kw in self._KNOWLEDGE_KEYWORDS)
+        is_short = len(user_input) <= 40
+        if not (has_kw or is_short):
+            return None
+
+        # 通过快路径：空 tool_calls，直接进入 response_generation
+        return {
+            **state,
+            "tool_calls": [],
+            "llm_response": "安全问答，直接回答（fast-path）",
+            "should_continue_react": False,
+            "current_step": "decision_making_completed",
+            "_fast_path": True,
+        }
+
     def decision_making(self, state: AgentState) -> AgentState:
+        # --- 快路径：安全问答跳过 LLM 决策 ---
+        fast = self._fast_decision(state)
+        if fast is not None:
+            # 运行时监控留痕（与 LLM 路径一致）
+            session_id = state.get("session_id", "default")
+            self.security_layer.runtime_monitor.set_user_input(session_id, state["user_input"])
+            self.security_layer.runtime_monitor.record_think(
+                session_id=session_id,
+                reasoning="安全问答，直接回答（快速路径）",
+                proposed_tool_calls=[],
+            )
+            runtime_trace = self._get_runtime_trace(session_id)
+            fast["runtime_trace"] = runtime_trace
+            return fast
+
         user_input = state["user_input"]
         conversation_history = state.get("conversation_history", [])
         session_id = state.get("session_id", "default")
@@ -1452,7 +1526,8 @@ class GovAgent:
             except Exception as e:
                 print(f"[WARN] LLM response generation failed: {e}, falling back to rule-based response")
         
-        final_response = self._fallback_response(user_input, tool_results)
+        final_response = self._fallback_response(user_input, tool_results,
+                                                 llm_configured=self.llm_available)
         
         # AIGC 标识应用：使用策略管理器中的配置
         from security.policy_manager import get_policy_manager
@@ -1530,8 +1605,15 @@ class GovAgent:
             "output_filter_result": audit_summary,
         }
 
-    def _fallback_response(self, user_input: str, tool_results: List[Dict[str, Any]]) -> str:
-        """当LLM不可用时，使用规则模板生成有意义的回复"""
+    def _fallback_response(self, user_input: str, tool_results: List[Dict[str, Any]],
+                           llm_configured: bool = False) -> str:
+        """当LLM不可用时（未配置 或 调用失败），使用规则模板生成有意义的回复
+
+        Args:
+            user_input: 用户输入
+            tool_results: 工具执行结果
+            llm_configured: True=LLM已配置但调用失败（降级）；False=LLM根本未配置
+        """
         input_lower = user_input.strip().lower()
         
         # 问候类
@@ -1600,18 +1682,28 @@ class GovAgent:
             response_parts = ["已处理您的请求，工具执行结果如下："]
             for result in tool_results:
                 response_parts.append(f"- {result.get('tool_name', '工具')}: {result.get('result', '完成')}")
-            response_parts.append("\n注意：当前运行在演示模式（LLM未配置），上述为规则引擎响应。")
+            if llm_configured:
+                response_parts.append("\n注意：AI 模型服务暂不可用（连接超时或密钥失效），已使用规则引擎降级回复。请检查模型接入配置。")
+            else:
+                response_parts.append("\n注意：当前运行在演示模式（LLM未配置），上述为规则引擎响应。")
             return "\n".join(response_parts)
         
         # 默认回复
+        if llm_configured:
+            hint = (
+                "AI 模型服务暂不可用（可能原因：API Key 失效/过期、网络不通、额度耗尽），"
+                "已降级为规则引擎回复。请在「系统与运维 → 模型接入配置」中检查并修复。"
+            )
+        else:
+            hint = "由于当前LLM未配置，我无法生成更详细的自然语言回复。如需完整的智能问答能力，请配置 API Key。"
         return (
             f"关于「{user_input[:30]}{'...' if len(user_input) > 30 else ''}」，以下是相关信息：\n\n"
             f"本平台已对您的输入完成了多层安全检测（规则引擎+AI检测+向量投毒检测），未发现安全风险。\n\n"
-            f"由于当前LLM未配置，我无法生成更详细的自然语言回复。如需完整的智能问答能力，请配置智谱AI API Key。\n\n"
+            f"{hint}\n\n"
             f"您可以：\n"
             f"1. 在「安全检测」标签页体验安全扫描功能\n"
             f"2. 在「插件扫描」标签页测试供应链安全检测\n"
-            f"3. 在 ai_service 目录下创建 .env 文件配置 ZHIPU_API_KEY 启用LLM"
+            f"3. 在「系统与运维 → 模型接入配置」中接入大模型"
         )
     
     def block_response(self, state: AgentState) -> AgentState:
