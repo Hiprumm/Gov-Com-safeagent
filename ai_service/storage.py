@@ -7,7 +7,7 @@ import json
 import os
 import time
 from datetime import datetime, timedelta
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple
 from threading import Lock
 from contextlib import contextmanager
 
@@ -97,7 +97,10 @@ class Storage(StorageBackend):
                     title TEXT,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
-                    message_count INTEGER DEFAULT 0
+                    message_count INTEGER DEFAULT 0,
+                    terminated INTEGER DEFAULT 0,
+                    terminated_reason TEXT,
+                    terminated_at TEXT
                 );
 
                 CREATE TABLE IF NOT EXISTS conversation_history (
@@ -252,6 +255,17 @@ class Storage(StorageBackend):
                 cols = {r["name"] for r in conn.execute("PRAGMA table_info(conversation_history)").fetchall()}
                 if "metadata" not in cols:
                     conn.execute("ALTER TABLE conversation_history ADD COLUMN metadata TEXT")
+            except Exception:
+                pass
+            # 迁移：sessions 补充终止状态列（运行时一键终止后忽略后续消息，幂等）
+            try:
+                cols = {r["name"] for r in conn.execute("PRAGMA table_info(sessions)").fetchall()}
+                if "terminated" not in cols:
+                    conn.execute("ALTER TABLE sessions ADD COLUMN terminated INTEGER DEFAULT 0")
+                if "terminated_reason" not in cols:
+                    conn.execute("ALTER TABLE sessions ADD COLUMN terminated_reason TEXT")
+                if "terminated_at" not in cols:
+                    conn.execute("ALTER TABLE sessions ADD COLUMN terminated_at TEXT")
             except Exception:
                 pass
 
@@ -511,12 +525,12 @@ class Storage(StorageBackend):
         with self._get_conn() as conn:
             if user_id:
                 rows = conn.execute(
-                    "SELECT session_id, title, created_at, updated_at, message_count FROM sessions WHERE message_count > 0 AND user_id = ? ORDER BY updated_at DESC",
+                    "SELECT session_id, title, created_at, updated_at, message_count, terminated FROM sessions WHERE message_count > 0 AND user_id = ? ORDER BY updated_at DESC",
                     (user_id,)
                 ).fetchall()
             else:
                 rows = conn.execute(
-                    "SELECT session_id, title, created_at, updated_at, message_count FROM sessions WHERE message_count > 0 ORDER BY updated_at DESC"
+                    "SELECT session_id, title, created_at, updated_at, message_count, terminated FROM sessions WHERE message_count > 0 ORDER BY updated_at DESC"
                 ).fetchall()
         return [dict(r) for r in rows]
 
@@ -744,7 +758,7 @@ class Storage(StorageBackend):
     def get_session(self, session_id: str) -> Optional[Dict[str, Any]]:
         with self._get_conn() as conn:
             row = conn.execute(
-                "SELECT session_id, user_id, title, created_at, updated_at, message_count FROM sessions WHERE session_id = ?",
+                "SELECT session_id, user_id, title, created_at, updated_at, message_count, terminated, terminated_reason, terminated_at FROM sessions WHERE session_id = ?",
                 (session_id,)
             ).fetchone()
         return dict(row) if row else None
@@ -757,6 +771,26 @@ class Storage(StorageBackend):
                     "UPDATE sessions SET updated_at = ?, message_count = 0 WHERE session_id = ?",
                     (datetime.now().isoformat(), session_id)
                 )
+
+    def set_session_terminated(self, session_id: str, reason: str = "") -> None:
+        """持久化标记会话为已终止（跨 worker/重启仍生效）。"""
+        with self._lock:
+            with self._get_conn() as conn:
+                conn.execute(
+                    "UPDATE sessions SET terminated = 1, terminated_reason = ?, terminated_at = ? WHERE session_id = ?",
+                    (reason, datetime.now().isoformat(), session_id),
+                )
+
+    def is_session_terminated(self, session_id: str) -> Tuple[bool, str]:
+        """查询会话是否已终止，返回 (是否终止, 终止原因)。"""
+        with self._get_conn() as conn:
+            row = conn.execute(
+                "SELECT terminated, terminated_reason FROM sessions WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+        if row and row["terminated"]:
+            return True, row["terminated_reason"] or ""
+        return False, ""
 
     def truncate_messages_from(self, session_id: str, message_id: int):
         """删除指定ID及之后的所有消息（用于撤回/编辑）"""

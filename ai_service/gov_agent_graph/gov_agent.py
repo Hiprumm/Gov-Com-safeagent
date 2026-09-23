@@ -1964,8 +1964,47 @@ class GovAgent:
             return None
         return None
 
+    def _check_terminated(self, session_id: str) -> Optional[Dict[str, Any]]:
+        """会话已终止则返回统一终止字典（供各入口在 add_message 之前阻断并跳过消息记账），否则返回 None。
+
+        优先持久化（跨 worker/重启仍生效），兜底内存监控状态，两者满足其一即判定终止。
+        """
+        if not session_id:
+            return None
+        term, reason = False, ""
+        try:
+            term, reason = self.conversation_manager.storage.is_session_terminated(session_id)
+        except Exception:  # noqa: BLE001
+            pass
+        if not term:
+            try:
+                term = self.security_layer.runtime_monitor.is_terminated(session_id)
+                if term and not reason:
+                    reason = self.security_layer.runtime_monitor.get_session_summary(
+                        session_id).get("termination_reason", "")
+            except Exception:  # noqa: BLE001
+                pass
+        if term:
+            return {
+                "success": True,
+                "terminated": True,
+                "session_id": session_id,
+                "reason": reason or "该会话已被终止",
+                "message": "该会话已被终止，无法继续对话",
+            }
+        return None
+
     def run_with_history(self, session_id: str, user_input: str, input_source: str = "user_input",
                          user: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        blocked = self._check_terminated(session_id)
+        if blocked:
+            return {
+                **blocked,
+                "final_response": blocked["message"],
+                "risk_level": RiskLevel.NONE.value,
+                "can_proceed": False,
+                "conversation_history": self.conversation_manager.get_history(session_id),
+            }
         conversation_history = self.conversation_manager.get_history(session_id)
         initial_state = self._prepare_initial_state(session_id, user_input, input_source, user, conversation_history)
 
@@ -2007,8 +2046,13 @@ class GovAgent:
           ("content", {"delta": ...})   AI 回答逐 token 增量（LLM 支持流式时）
           ("done", result)      收尾（含完整 final_response）
           ("error", {"message": ...})  失败兜底
+          ("terminated", {...}) 会话已被终止（不落库、不计消息）
         不改变任何节点的真实执行/审计/审批副作用。
         """
+        blocked = self._check_terminated(session_id)
+        if blocked:
+            yield ("terminated", blocked)
+            return
         conversation_history = self.conversation_manager.get_history(session_id)
 
         def _to_jsonable(v: Any):
@@ -2113,6 +2157,9 @@ class GovAgent:
         files: List[Dict]，每项含 file_data / file_type / filename。
         任一文件检测到高危/严重风险即拦截整个上传批次。
         """
+        blocked = self._check_terminated(session_id)
+        if blocked:
+            return {**blocked, "final_response": blocked["message"], "risk_level": RiskLevel.NONE.value}
         content_parts = []
         for f in files:
             processed = self.file_processor.process_file(f["file_data"], f["file_type"], f["filename"])
@@ -2163,6 +2210,10 @@ class GovAgent:
         与 process_file_message 保持相同的真实执行副作用（识别、检测、落库）。
         files: List[Dict]，每项含 file_data / file_type / filename。
         """
+        blocked = self._check_terminated(session_id)
+        if blocked:
+            yield ("terminated", blocked)
+            return
         step_no = 0
         step_no += 1
         yield ("thinking", {"step": step_no, "phase": "uploaded_doc", "phase_label": "上传内容识别",
@@ -2211,10 +2262,17 @@ class GovAgent:
     
     def get_conversation_history(self, session_id: str) -> Dict[str, Any]:
         history = self.conversation_manager.get_history(session_id)
+        term, reason = False, ""
+        try:
+            term, reason = self.conversation_manager.storage.is_session_terminated(session_id)
+        except Exception:  # noqa: BLE001
+            pass
         return {
             "session_id": session_id,
             "messages": history,
-            "count": len(history)
+            "count": len(history),
+            "terminated": term,
+            "termination_reason": reason,
         }
     
     def create_new_session(self, user_id: str = None) -> Dict[str, Any]:

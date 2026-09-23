@@ -1132,12 +1132,28 @@ class RuntimeMonitor:
             termination_id = f"TERM-{session_id}-{int(time.time())}-{uuid.uuid4().hex[:8]}"
             full_reason = f"[{termination_id}] {reason}"
             self._terminated[session_id] = full_reason
+            # 持久化到 SQLite（跨 worker/重启仍生效）；失败不影响内存拦截
+            # 注意：持久化存纯 reason（不含 [TERM-...] 前缀），前端终止横幅/历史展示只显示理由，
+            # TERM 凭证 id 保留在内存与审计日志中用于追溯。
+            try:
+                from storage import get_storage
+                get_storage().set_session_terminated(session_id, reason)
+            except Exception:
+                pass
             return termination_id
 
     def is_terminated(self, session_id: str) -> bool:
-        """检查会话是否已被终止"""
+        """检查会话是否已被终止（优先持久化状态，兜底内存字典）"""
         with self._lock:
-            return session_id in self._terminated
+            if session_id in self._terminated:
+                return True
+            try:
+                from storage import get_storage
+                if get_storage().is_session_terminated(session_id)[0]:
+                    return True
+            except Exception:
+                pass
+            return False
 
     # ------------------------------------------------------------------
     # 9-11. 查询与清理

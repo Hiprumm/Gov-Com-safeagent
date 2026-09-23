@@ -42,6 +42,10 @@ interface SessionItem {
   created_at: string
   updated_at: string
   message_count: number
+  /** 会话是否已被管理员终止（运行时一键终止） */
+  terminated?: boolean
+  /** 会话终止原因 */
+  termination_reason?: string
 }
 
 const messages = ref<Message[]>([
@@ -66,6 +70,12 @@ function autoResizeTextarea() {
 }
 watch(inputMessage, () => nextTick(autoResizeTextarea))
 const isLoading = ref(false)
+/** 当前会话是否已被管理员终止（运行时一键终止）：禁用输入/上传并展示终止横幅 */
+const isSessionTerminated = ref(false)
+/** 会话终止原因（来自后端 terminated_reason） */
+const terminationReason = ref('')
+/** 输入区是否禁用：加载中或会话已被终止 */
+const inputDisabled = computed(() => isLoading.value || isSessionTerminated.value)
 /**
  * 按会话隔离的输入框草稿：切换会话时还原各自的未发送内容。
  * keys: session_id -> 输入框文本
@@ -133,6 +143,8 @@ const sessions = ref<SessionItem[]>([])
 const isLoadingSessions = ref(false)
 // ---- 会话列表侧边栏收拉：状态记忆（localStorage）+ 平滑过渡（逻辑在 useSessionSidebar，便于单测） ----
 const { expanded: showSessionSidebar, toggle: toggleSessionSidebar, close: closeSessionSidebar } = useSessionSidebar(() => { loadSessions() })
+// 侧边栏任意方式展开（含默认已展开/收起再展开/组件建立时时）立即刷新会话记录，无需等待轮询
+watch(showSessionSidebar, (exp) => { if (exp) loadSessions() }, { immediate: true })
 const editingMessageId = ref<number | null>(null)
 /** 悬停中的消息 ID：仅用于控制消息操作选项的显示（hover 时显示，移开后隐藏） */
 const hoveredMessageId = ref<number | null>(null)
@@ -166,6 +178,8 @@ interface ApprovalTrack {
 const approvalTracks = ref<ApprovalTrack[]>([])
 const { connect: wsConnect, onEvent: wsOnEvent, subscribe: wsSubscribe, connectionStatus: wsStatus } = useWebSocket()
 let approvalPollTimer: ReturnType<typeof setInterval> | null = null
+/** 历史会话列表 + 当前会话终止状态 轮询定时器 */
+let sessionsPollTimer: ReturnType<typeof setInterval> | null = null
 
 function persistCurrentSessionId() {
   if (sessionId.value) {
@@ -354,9 +368,11 @@ const createNewSession = async () => {
   try {
     const response = await axios.post('/ai/agent/new_session')
     sessionId.value = response.data.session_id
-    // 新会话：清空输入框草稿与待发送附件
+    // 新会话：清空输入框草稿与待发送附件，并重置终止状态
     inputMessage.value = ''
     pendingAttachments.value = []
+    isSessionTerminated.value = false
+    terminationReason.value = ''
     messages.value = [
       {
         id: messageIdCounter.value++,
@@ -421,6 +437,11 @@ async function trySyncHistoryIds(): Promise<void> {
     if (histMsgs.length > 0) {
       messages.value = histMsgs.map(mapHistoryMessage)
       messageIdCounter.value = histMsgs.length + 1
+    }
+    // 同步会话终止状态（刷新历史时也刷新终止态，使管理员终止后前端能感知）
+    if (sessionId.value) {
+      isSessionTerminated.value = !!histResp.data.terminated
+      terminationReason.value = histResp.data.termination_reason || ''
     }
   } catch (e) {
     console.warn('Failed to sync history IDs:', e)
@@ -541,6 +562,11 @@ async function streamAnswer(
               }
               committed = null
             }
+          } else if (event === 'terminated') {
+            // 会话已被管理员终止：标记禁用并正常收尾（不回填错误/失败气泡，不计消息）
+            outcome = true
+            isSessionTerminated.value = true
+            terminationReason.value = (data && data.reason) || (data && data.message) || '该会话已被终止'
           } else if (event === 'error') {
             throw new Error(data.message || '处理失败')
           }
@@ -607,6 +633,11 @@ const sendMessage = async () => {
   const text = inputMessage.value.trim()
   const attachments = pendingAttachments.value
   const quote = quoteMessage.value
+  // 会话已被管理员终止：拒绝发送（双重保护，输入控件层面也已禁用）
+  if (isSessionTerminated.value) {
+    toast.warning(terminationReason.value || '该会话已被终止，无法继续对话')
+    return
+  }
   if ((!text && !attachments.length && !quote) || isLoading.value) return
 
   isLoading.value = true
@@ -742,6 +773,13 @@ const handleFileUpload = (event: Event) => {
   const fileList = target.files
 
   if (!fileList || !fileList.length || isLoading.value) {
+    target.value = ''
+    return
+  }
+
+  // 会话已被管理员终止：禁止上传文件/图片
+  if (isSessionTerminated.value) {
+    toast.warning(terminationReason.value || '该会话已被终止，无法继续对话')
     target.value = ''
     return
   }
@@ -1155,11 +1193,25 @@ const sendEditedMessage = async () => {
   editingMessageId.value = null
 }
 
-const loadSessions = async () => {
+async function loadSessions() {
   isLoadingSessions.value = true
   try {
     const response = await axios.get('/ai/agent/sessions')
     sessions.value = response.data.sessions || []
+    // 从最新列表同步当前会话的终止状态：管理员在管控台终止后无需刷新即可实时展示横幅并禁用输入
+    const cur = sessionId.value
+    if (cur) {
+      const mine = sessions.value.find((s: any) => s.session_id === cur)
+      if (mine) {
+        if (mine.terminated) {
+          isSessionTerminated.value = true
+          if (!terminationReason.value) terminationReason.value = mine.termination_reason || '该会话已被终止'
+        } else {
+          isSessionTerminated.value = false
+          terminationReason.value = ''
+        }
+      }
+    }
   } catch (error) {
     console.error('Failed to load sessions:', error)
   } finally {
@@ -1193,6 +1245,9 @@ const switchSession = async (sessionItem: SessionItem) => {
     
     const history = response.data.messages || []
     sessionId.value = sessionItem.session_id
+    // 同步会话终止状态：终止后禁用输入/上传并展示终止横幅
+    isSessionTerminated.value = !!response.data.terminated
+    terminationReason.value = response.data.termination_reason || ''
     messageIdCounter.value = history.length + 1
     
     messages.value = history.map((msg: any, index: number) => {
@@ -1267,6 +1322,8 @@ const deleteSession = async (sessionItem: SessionItem) => {
     if (sessionId.value === sessionItem.session_id) {
       sessionId.value = null
       clearTrackStorageOf(sessionItem.session_id)
+      isSessionTerminated.value = false
+      terminationReason.value = ''
       messages.value = [{
         id: 1,
         content: '您好！我是面向政企场景的大模型智能体安全平台。\n\n发送消息即可开始体验安全检测流程，您的每条输入都会经过多层安全引擎扫描。',
@@ -1307,6 +1364,9 @@ onMounted(async () => {
           imageUrl: msg.imageUrl
         }))
         messageIdCounter.value = history.length + 1
+        // 恢复终止状态：管理员已终止的会话在刷新后仍保持禁用
+        isSessionTerminated.value = !!histResp.data.terminated
+        terminationReason.value = histResp.data.termination_reason || ''
       } else {
         // 保存的会话已被删除 → 清空并回到默认欢迎页
         sessionId.value = null
@@ -1318,6 +1378,10 @@ onMounted(async () => {
   wsConnect()
   // 轮询兜底：即使 WebSocket 未连通，跟踪卡状态也会自动收敛（仅在有跟踪项时发请求）
   approvalPollTimer = setInterval(() => { refreshApprovalStatuses() }, 8000)
+  // 实时刷新历史会话列表 + 同步当前会话终止状态（管理员终止后横幅实时出现、列表实时更新）
+  sessionsPollTimer = setInterval(() => {
+    if (showSessionSidebar.value || sessionId.value) loadSessions()
+  }, 15000)
 })
 
 onUnmounted(() => {
@@ -1325,6 +1389,10 @@ onUnmounted(() => {
   if (approvalPollTimer) {
     clearInterval(approvalPollTimer)
     approvalPollTimer = null
+  }
+  if (sessionsPollTimer) {
+    clearInterval(sessionsPollTimer)
+    sessionsPollTimer = null
   }
 })
 
@@ -1943,6 +2011,20 @@ onUnmounted(() => {
         </button>
       </div>
 
+      <!-- 会话终止横幅：管理员已终止该会话，输入与上传被禁用 -->
+      <div
+        v-if="isSessionTerminated"
+        class="max-w-3xl mx-auto mb-3 px-4 py-3 rounded-xl border border-critical/40 bg-critical/10 flex items-center gap-2.5"
+      >
+        <svg class="w-5 h-5 shrink-0 text-critical" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v4m0 4h.01M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"></path>
+        </svg>
+        <div class="min-w-0">
+          <p class="text-sm font-medium text-critical">该会话已被终止，无法继续对话</p>
+          <p v-if="terminationReason" class="text-xs text-critical/70 truncate">{{ terminationReason }}</p>
+        </div>
+      </div>
+
       <!-- 悬浮胶囊输入框（水平居中 · 超圆角 · 浅毛玻璃 · 聚焦品牌色辉光） -->
       <div
         class="max-w-3xl mx-auto flex items-end gap-1.5 rounded-[26px] border border-border-default bg-surface/70 backdrop-blur-xl px-2.5 py-2 shadow-lg shadow-black/5 transition-all duration-300 focus-within:border-accent/50 focus-within:ring-4 focus-within:ring-accent/15 focus-within:shadow-lg focus-within:shadow-accent/20"
@@ -1950,9 +2032,9 @@ onUnmounted(() => {
         <!-- 圆形附件按钮 -->
         <button
           @click="fileInput?.click()"
-          :disabled="isLoading"
+          :disabled="inputDisabled"
           class="w-9 h-9 rounded-full flex items-center justify-center flex-shrink-0 text-muted hover:text-accent hover:bg-accent/10 transition-all active:scale-95 disabled:opacity-50"
-          title="上传图片或文件"
+          :title="isSessionTerminated ? '会话已被终止，无法上传' : '上传图片或文件'"
         >
           <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
             <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4"></path>
@@ -1964,25 +2046,27 @@ onUnmounted(() => {
           v-model="inputMessage"
           @keydown.enter.exact.prevent="editingMessageId ? sendEditedMessage() : sendMessage()"
           @input="autoResizeTextarea"
-          :placeholder="editingMessageImageUrl ? '图片将重新上传进行分析...' : (editingMessageId ? '修改您的问题后重新发送...' : '给 SafeAgent 发送消息…')"
+          :placeholder="isSessionTerminated ? (terminationReason || '该会话已被终止，无法继续对话') : (editingMessageImageUrl ? '图片将重新上传进行分析...' : (editingMessageId ? '修改您的问题后重新发送...' : '给 SafeAgent 发送消息…'))"
           class="flex-1 bg-transparent text-primary placeholder:text-disabled text-sm sm:text-base leading-relaxed resize-none outline-none py-1.5 px-1 max-h-[200px]"
           rows="1"
-          :disabled="isLoading"
+          :disabled="inputDisabled"
         ></textarea>
         <!-- 圆形发送 / 停止按钮（空内容时置灰禁用） -->
         <button
           @click="isLoading ? stopGenerating() : (editingMessageId ? sendEditedMessage() : sendMessage())"
-          :disabled="!isLoading && (!inputMessage.trim() && !pendingAttachments.length && !editingMessageImageUrl && !quoteMessage)"
-          :title="isLoading ? '停止生成' : (editingMessageId ? '重新发送' : '发送')"
+          :disabled="isSessionTerminated || (!isLoading && (!inputMessage.trim() && !pendingAttachments.length && !editingMessageImageUrl && !quoteMessage))"
+          :title="isLoading ? '停止生成' : (isSessionTerminated ? '会话已被终止，无法发送' : (editingMessageId ? '重新发送' : '发送'))"
           :class="[
             'w-9 h-9 rounded-full flex items-center justify-center flex-shrink-0 transition-all duration-200 active:scale-95',
-            isLoading
-              ? 'bg-critical text-white hover:opacity-90 shadow-md shadow-critical/30'
-              : (!inputMessage.trim() && !pendingAttachments.length && !editingMessageImageUrl && !quoteMessage)
-                ? 'bg-elevated text-muted cursor-not-allowed'
-                : editingMessageId
-                  ? 'bg-gradient-to-r from-medium to-high text-white hover:opacity-90 shadow-md shadow-medium/25'
-                  : 'bg-gradient-to-r from-accent to-low text-white hover:opacity-90 shadow-md shadow-accent/25'
+            isSessionTerminated
+              ? 'bg-elevated text-muted cursor-not-allowed'
+              : isLoading
+                ? 'bg-critical text-white hover:opacity-90 shadow-md shadow-critical/30'
+                : (!inputMessage.trim() && !pendingAttachments.length && !editingMessageImageUrl && !quoteMessage)
+                  ? 'bg-elevated text-muted cursor-not-allowed'
+                  : editingMessageId
+                    ? 'bg-gradient-to-r from-medium to-high text-white hover:opacity-90 shadow-md shadow-medium/25'
+                    : 'bg-gradient-to-r from-accent to-low text-white hover:opacity-90 shadow-md shadow-accent/25'
           ]"
         >
           <svg v-if="isLoading" class="w-4 h-4" fill="currentColor" viewBox="0 0 24 24">

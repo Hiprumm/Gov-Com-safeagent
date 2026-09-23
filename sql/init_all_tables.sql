@@ -202,7 +202,7 @@ CREATE TABLE sessions (
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     message_count INTEGER DEFAULT 0
-                , user_id TEXT);
+                , user_id TEXT, terminated INTEGER DEFAULT 0, terminated_reason TEXT, terminated_at TEXT);
 
 -- [table] sys_departments
 CREATE TABLE sys_departments (
