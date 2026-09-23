@@ -114,6 +114,34 @@ public class UserRepository {
                         .addValue("salt", salt).addValue("now", LocalDateTime.now().format(TS)));
     }
 
+    /** 当前账号会话版本号（令牌吊销用）；无记录返回 0 */
+    public int getTokenVersion(String username) {
+        try {
+            Integer v = named.queryForObject(
+                    "SELECT token_version FROM sys_users WHERE username = :u",
+                    new MapSqlParameterSource("u", username), Integer.class);
+            return v == null ? 0 : v;
+        } catch (Exception e) {
+            return 0;
+        }
+    }
+
+    /** 会话版本号自增：使已签发令牌立即失效（改密/重置口令时调用） */
+    public int incrementTokenVersion(String username) {
+        return named.update(
+                "UPDATE sys_users SET token_version = token_version + 1, updated_at = :now WHERE username = :username",
+                new MapSqlParameterSource("username", username).addValue("now", LocalDateTime.now().format(TS)));
+    }
+
+    /** 存量库启动迁移：为 sys_users 补充 token_version 列（幂等，重复执行安全） */
+    public void ensureTokenVersionColumn() {
+        try {
+            jdbc.execute("ALTER TABLE sys_users ADD COLUMN token_version INTEGER NOT NULL DEFAULT 0");
+        } catch (Exception e) {
+            // 列已存在（重复执行 / 新装自带）则忽略
+        }
+    }
+
     // ==================== 组织 / 部门 ====================
 
     public List<String> listDepartments() {

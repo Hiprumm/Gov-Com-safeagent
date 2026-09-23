@@ -12,9 +12,11 @@ public class AppProperties {
 
     private final Db db = new Db();
     private final Jwt jwt = new Jwt();
+    private final Security security = new Security();
 
     public Db getDb() { return db; }
     public Jwt getJwt() { return jwt; }
+    public Security getSecurity() { return security; }
 
     public static class Db {
         private String path;
@@ -36,5 +38,12 @@ public class AppProperties {
         public void setMaxLoginFails(int maxLoginFails) { this.maxLoginFails = maxLoginFails; }
         public int getLoginLockSeconds() { return loginLockSeconds; }
         public void setLoginLockSeconds(int loginLockSeconds) { this.loginLockSeconds = loginLockSeconds; }
+    }
+
+    /** 登录口令 RSA 传输加密密钥 */
+    public static class Security {
+        private String loginRsaFile = "";
+        public String getLoginRsaFile() { return loginRsaFile; }
+        public void setLoginRsaFile(String loginRsaFile) { this.loginRsaFile = loginRsaFile; }
     }
 }

@@ -3,6 +3,7 @@ package cn.safeagent.biz.auth;
 import cn.safeagent.biz.common.exception.BizException;
 import cn.safeagent.biz.common.security.AuthContext;
 import cn.safeagent.biz.common.security.JwtService;
+import cn.safeagent.biz.common.util.LoginCipher;
 import cn.safeagent.biz.common.util.Totp;
 import jakarta.servlet.http.HttpServletRequest;
 import org.springframework.web.bind.annotation.*;
@@ -22,18 +23,42 @@ public class AuthController {
     private final AuthService auth;
     private final JwtService jwt;
     private final UserRepository users;
+    private final LoginCipher cipher;
 
-    public AuthController(AuthService auth, JwtService jwt, UserRepository users) {
+    public AuthController(AuthService auth, JwtService jwt, UserRepository users, LoginCipher cipher) {
         this.auth = auth;
         this.jwt = jwt;
         this.users = users;
+        this.cipher = cipher;
+    }
+
+    /** 登录口令传输加密公钥下发（公开，无需登录）。前端据此用 RSA-OAEP 加密口令后提交 */
+    @GetMapping("/pubkey")
+    public Map<String, Object> pubkey() {
+        Map<String, Object> out = new LinkedHashMap<>();
+        out.put("success", true);
+        out.put("kid", cipher.getKid());
+        out.put("public_pem", cipher.getPublicPem());
+        return out;
     }
 
     @PostMapping("/login")
-    public Map<String, Object> login(@RequestBody(required = false) Map<String, Object> body) {
+    public Map<String, Object> login(HttpServletRequest req, @RequestBody(required = false) Map<String, Object> body) {
         String username = body == null ? "" : String.valueOf(body.getOrDefault("username", "")).trim();
-        String password = body == null ? "" : String.valueOf(body.getOrDefault("password", ""));
-        Map<String, Object> r = auth.login(username, password);
+        // 优先解密前端 RSA 加密口令；未提供则退回明文字段（兼容测试脚本/工具明文调用）
+        String password = null;
+        String enc = body == null ? "" : String.valueOf(body.getOrDefault("enc_password", ""));
+        String kid = body == null ? "" : String.valueOf(body.getOrDefault("kid", ""));
+        if (enc != null && !enc.isBlank()) {
+            password = cipher.decrypt(enc, kid);
+            if (password == null) {
+                throw BizException.badRequest("口令密文无效或已过期，请刷新页面重试");
+            }
+        } else {
+            password = body == null ? "" : String.valueOf(body.getOrDefault("password", ""));
+        }
+        String devFp = JwtService.deviceFingerprint(req.getHeader("User-Agent"));
+        Map<String, Object> r = auth.login(username, password, devFp);
         if (Boolean.FALSE.equals(r.get("ok"))) {
             String reason = String.valueOf(r.get("reason"));
             if ("locked".equals(reason)) {
@@ -59,7 +84,7 @@ public class AuthController {
     }
 
     @PostMapping("/mfa/verify")
-    public Map<String, Object> mfaVerify(@RequestBody(required = false) Map<String, Object> body) {
+    public Map<String, Object> mfaVerify(HttpServletRequest req, @RequestBody(required = false) Map<String, Object> body) {
         String ticket = body == null ? "" : String.valueOf(body.getOrDefault("ticket", ""));
         String code = body == null ? "" : String.valueOf(body.getOrDefault("code", ""));
         String username = auth.resolveMfaTicket(ticket);
@@ -75,7 +100,8 @@ public class AuthController {
         Map<String, Object> row = users.getUser(username);
         Map<String, Object> out = new LinkedHashMap<>();
         out.put("success", true);
-        out.put("token", jwt.createToken(username));
+        out.put("token", jwt.createAccessToken(username,
+                JwtService.deviceFingerprint(req.getHeader("User-Agent")), users.getTokenVersion(username)));
         out.put("user", toUserView(username, row));
         return out;
     }
@@ -182,6 +208,7 @@ public class AuthController {
         if (reason != null) throw BizException.badRequest(reason);
         String[] hs = cn.safeagent.biz.common.util.PasswordHasher.hashNewSalt(newPw);
         users.updatePassword(username, hs[0], hs[1]);
+        users.incrementTokenVersion(username); // 改密后旧令牌立即失效
         Map<String, Object> out = new LinkedHashMap<>();
         out.put("success", true);
         out.put("message", "口令已更新，请使用新口令登录");

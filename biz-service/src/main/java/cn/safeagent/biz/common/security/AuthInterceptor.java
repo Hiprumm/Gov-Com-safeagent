@@ -49,6 +49,29 @@ public class AuthInterceptor implements HandlerInterceptor {
             req.setAttribute(ATTR_ERROR, "登录已失效，请重新登录");
             return true;
         }
+        // 设备指纹：令牌含 dev 且与当前请求 UA 不一致 → 视为跨设备复用，拒绝（缺失 dev 放行，兼容 Python 签发令牌）
+        if (payload.containsKey("dev")) {
+            String claimed = String.valueOf(payload.get("dev"));
+            String actual = JwtService.deviceFingerprint(req.getHeader("User-Agent"));
+            if (!claimed.equals(actual)) {
+                req.setAttribute(ATTR_ERROR, "登录已失效，请重新登录");
+                return true;
+            }
+        }
+        // 会话版本：令牌含 tv 且与库中当前版本不一致 → 令牌已吊销，拒绝（改密/重置口令即时失效）
+        if (payload.containsKey("tv")) {
+            int claimedTv;
+            try {
+                claimedTv = payload.get("tv") instanceof Number n ? n.intValue()
+                        : Integer.parseInt(String.valueOf(payload.get("tv")));
+            } catch (Exception e) {
+                claimedTv = -1;
+            }
+            if (claimedTv >= 0 && claimedTv != userRepository.getTokenVersion(username)) {
+                req.setAttribute(ATTR_ERROR, "登录已失效，请重新登录");
+                return true;
+            }
+        }
         // 实时读库：账号被禁用/删除则即刻失效
         Map<String, Object> user = userRepository.findIdentity(username);
         if (user == null || !"active".equals(user.get("status"))) {

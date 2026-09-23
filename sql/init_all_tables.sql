@@ -224,7 +224,8 @@ CREATE TABLE sys_users (
                     note TEXT DEFAULT '',
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
-                , totp_secret TEXT DEFAULT '', mfa_enabled INTEGER DEFAULT 0);
+                , totp_secret TEXT DEFAULT '', mfa_enabled INTEGER DEFAULT 0,
+                token_version INTEGER NOT NULL DEFAULT 0);
 
 -- [table] tool_management
 CREATE TABLE tool_management (id INTEGER PRIMARY KEY AUTOINCREMENT,key TEXT UNIQUE,value TEXT,updated_at TEXT);

@@ -83,10 +83,66 @@ async function navigateTo(path: string) {
   }
 }
 
+// ======== 登录口令 RSA-OAEP 传输加密（防明文裸露于传输链路） ========
+const PUBKEY_CACHE_KEY = 'safeagent_login_rsa_pubkey'
+
+interface PubKey { kid: string; public_pem: string }
+
+function pemToArrayBuffer(pem: string): ArrayBuffer {
+  const b64 = pem.replace(/-----BEGIN PUBLIC KEY-----/, '').replace(/-----END PUBLIC KEY-----/, '').replace(/\s+/g, '')
+  const bin = atob(b64)
+  const bytes = new Uint8Array(bin.length)
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i)
+  return bytes.buffer
+}
+
+/** 取登录公钥：sessionStorage 缓存（按 kid），缺失时向后端获取 */
+async function fetchPubKey(): Promise<PubKey | null> {
+  try {
+    const cachedRaw = sessionStorage.getItem(PUBKEY_CACHE_KEY)
+    if (cachedRaw) {
+      const cached = JSON.parse(cachedRaw) as PubKey
+      if (cached && cached.public_pem) return cached
+    }
+    const res = await axios.get('/api/auth/pubkey', { timeout: 8000 })
+    const pk: PubKey = { kid: res.data.kid, public_pem: res.data.public_pem }
+    try { sessionStorage.setItem(PUBKEY_CACHE_KEY, JSON.stringify(pk)) } catch { /* ignore */ }
+    return pk
+  } catch {
+    return null
+  }
+}
+
+/** 用 WebCrypto 对口令做 RSA-OAEP(SHA-256) 加密；环境不支持或公钥获取失败返回 null（退回明文） */
+async function encryptPassword(pubkey: PubKey, password: string): Promise<string | null> {
+  try {
+    if (!('crypto' in window) || !window.crypto?.subtle) return null
+    const key = await window.crypto.subtle.importKey(
+      'spki', pemToArrayBuffer(pubkey.public_pem),
+      { name: 'RSA-OAEP', hash: 'SHA-256' }, false, ['encrypt'])
+    const data = new TextEncoder().encode(password)
+    const enc = await window.crypto.subtle.encrypt({ name: 'RSA-OAEP' }, key, data)
+    let bin = ''
+    new Uint8Array(enc).forEach((b) => (bin += String.fromCharCode(b)))
+    return btoa(bin)
+  } catch {
+    return null
+  }
+}
+
 /** 登录成功后跳转 redirect（默认首页）；若账号启用 MFA 则进入二步验证（返回 false 并置 mfaPending） */
 async function login(username: string, password: string, redirect = '/'): Promise<boolean> {
   try {
-    const res = await axios.post('/ai/auth/login', { username, password })
+    const pubkey = await fetchPubKey()
+    let body: Record<string, unknown> = { username }
+    const enc = pubkey ? await encryptPassword(pubkey, password) : null
+    if (pubkey && enc) {
+      body = { username, enc_password: enc, kid: pubkey.kid }
+    } else {
+      // 公钥不可用（后端未启用/环境不支持）时退回明文，保证登录可用
+      body = { username, password }
+    }
+    const res = await axios.post('/api/auth/login', body)
     // 二步验证：密码通过但需输入 TOTP
     if (res.data?.mfa_required) {
       mfaPending.value = { ticket: res.data.mfa_ticket, username: res.data.username || username }

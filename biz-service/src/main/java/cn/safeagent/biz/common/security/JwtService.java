@@ -87,6 +87,23 @@ public class JwtService {
 
     /** 签发带 scope / 独立 TTL 的令牌（MFA 票据等） */
     public String createToken(String username, String scope, int ttlSeconds) {
+        return createToken(username, scope, ttlSeconds, null, null);
+    }
+
+    /**
+     * 签发访问令牌，绑定设备指纹(dev)与会话版本(tv)。
+     * - deviceFp 非空时写入 dev claim（=请求 User-Agent 的 SHA-256 指纹）；
+     * - tokenVersion 非空时写入 tv claim（=该账号当前 token_version）。
+     * dev/tv 均为追加 claims，Python `_decode_jwt` 只读 sub/exp/jti/scope，互认不受影响；
+     * biz 校验侧对缺失这些 claim 的令牌（Python 签发）放行。
+     */
+    public String createAccessToken(String username, String deviceFp, Integer tokenVersion) {
+        return createToken(username, "access", ttlSeconds, deviceFp, tokenVersion);
+    }
+
+    /** 签发带 scope / 独立 TTL / 设备指纹 / 会话版本的令牌 */
+    public String createToken(String username, String scope, int ttlSeconds,
+                              String deviceFp, Integer tokenVersion) {
         long now = Instant.now().getEpochSecond();
         String jti = HexFormatHex(random16());
         Map<String, Object> header = new LinkedHashMap<>();
@@ -98,12 +115,29 @@ public class JwtService {
         payload.put("exp", now + ttlSeconds);
         payload.put("jti", jti);
         payload.put("scope", scope);
+        if (deviceFp != null && !deviceFp.isBlank()) {
+            payload.put("dev", deviceFp);
+        }
+        if (tokenVersion != null) {
+            payload.put("tv", tokenVersion);
+        }
 
         String headSeg = b64url(serialize(header));
         String paySeg = b64url(serialize(payload));
         String signingInput = headSeg + "." + paySeg;
         String sig = b64url(hmac(signingInput));
         return signingInput + "." + sig;
+    }
+
+    /** 设备指纹：User-Agent 的 SHA-256 十六进制（用于令牌跨浏览器/设备绑定） */
+    public static String deviceFingerprint(String userAgent) {
+        String ua = userAgent == null ? "" : userAgent;
+        try {
+            MessageDigest md = MessageDigest.getInstance("SHA-256");
+            return java.util.HexFormat.of().formatHex(md.digest(ua.getBytes(StandardCharsets.UTF_8)));
+        } catch (Exception e) {
+            return "";
+        }
     }
 
     /** 校验签名/算法/有效期；合法返回 payload（含 scope, sub, jti），否则 null */

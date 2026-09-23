@@ -6,6 +6,7 @@ import org.slf4j.LoggerFactory;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
+import org.springframework.web.servlet.resource.NoResourceFoundException;
 
 import java.util.LinkedHashMap;
 import java.util.Map;
@@ -23,6 +24,15 @@ public class GlobalExceptionHandler {
         body.put("success", false);
         body.put("error", ex.getMessage());
         return ResponseEntity.status(ex.getStatus() > 0 ? ex.getStatus() : 500).body(body);
+    }
+
+    /** 未映射路径：返回 404 而非落到兜底 500（历史曾把不存在端点误判为服务内部错误） */
+    @ExceptionHandler(org.springframework.web.servlet.resource.NoResourceFoundException.class)
+    public ResponseEntity<Map<String, Object>> handleNoResource(NoResourceFoundException ex) {
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("success", false);
+        body.put("error", "未找到资源");
+        return ResponseEntity.status(404).body(body);
     }
 
     @ExceptionHandler(Exception.class)

@@ -118,6 +118,7 @@ public class AdminController {
         if (!users.userExists(username)) return err("账号 " + username + " 不存在");
         String[] hs = PasswordHasher.hashNewSalt(password);
         users.updatePassword(username, hs[0], hs[1]);
+        users.incrementTokenVersion(username); // 重置口令后该账号既有令牌立即失效
         return ok("已重置账号 " + username + " 的密码");
     }
 

@@ -40,6 +40,7 @@ public class AuthService {
         this.jwt = jwt;
         this.maxLoginFails = props.getJwt().getMaxLoginFails() > 0 ? props.getJwt().getMaxLoginFails() : 5;
         this.lockSeconds = props.getJwt().getLoginLockSeconds() > 0 ? props.getJwt().getLoginLockSeconds() : 300L;
+        users.ensureTokenVersionColumn(); // 存量库迁移：补充 token_version 列（幂等）
         seedIfEmpty();
     }
 
@@ -55,6 +56,11 @@ public class AuthService {
 
     /** 登录：返回 {ok, reason, locked, remain, mfa_enabled}；口令正确且未启用 MFA 时签发 token */
     public Map<String, Object> login(String username, String password) {
+        return login(username, password, null);
+    }
+
+    /** 登录（支持绑定设备指纹于所签发令牌）：返回 {ok, reason, locked, remain, mfa_enabled} */
+    public Map<String, Object> login(String username, String password, String deviceFp) {
         username = username == null ? "" : username.trim();
         if (username.isEmpty() || password == null || password.isEmpty()) {
             return Map.of("ok", false, "reason", "empty", "locked", false, "remain", 0);
@@ -83,7 +89,8 @@ public class AuthService {
         r.put("remain", 0);
         r.put("mfa_enabled", mfa);
         if (!mfa) {
-            r.put("token", jwt.createToken(username));
+            // 绑定设备指纹 + 当前会话版本，供令牌吊销与跨设备防护
+            r.put("token", jwt.createAccessToken(username, deviceFp, users.getTokenVersion(username)));
         }
         return r;
     }
