@@ -1,5 +1,7 @@
 package cn.safeagent.biz.governance;
 
+import cn.safeagent.biz.common.config.AppProperties;
+import cn.safeagent.biz.common.config.JdbcConfig;
 import cn.safeagent.biz.common.util.Rows;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.core.namedparam.MapSqlParameterSource;
@@ -24,10 +26,12 @@ public class GovernanceRepository {
 
     private final JdbcTemplate jdbc;
     private final NamedParameterJdbcTemplate named;
+    private final AppProperties props;
 
-    public GovernanceRepository(JdbcTemplate jdbc, NamedParameterJdbcTemplate named) {
+    public GovernanceRepository(JdbcTemplate jdbc, NamedParameterJdbcTemplate named, AppProperties props) {
         this.jdbc = jdbc;
         this.named = named;
+        this.props = props;
     }
 
     private String now() {
@@ -75,14 +79,28 @@ public class GovernanceRepository {
 
     public void upsertApiClient(String clientId, String name, String tokenHash, int enabled,
                                 int rateLimit, int quota, String createdBy, String description) {
-        named.update(
-                "INSERT OR REPLACE INTO api_clients " +
-                        "(client_id, name, token_hash, enabled, rate_limit, quota, used, created_by, description, created_at) " +
-                        "VALUES (:cid, :name, :hash, :enabled, :rate, :quota, " +
-                        "COALESCE((SELECT used FROM api_clients WHERE client_id = :cid), 0), :by, :desc, :now)",
-                new MapSqlParameterSource("cid", clientId).addValue("name", name).addValue("hash", tokenHash)
-                        .addValue("enabled", enabled).addValue("rate", rateLimit).addValue("quota", quota)
-                        .addValue("by", createdBy).addValue("desc", description).addValue("now", now()));
+        MapSqlParameterSource params = new MapSqlParameterSource("cid", clientId).addValue("name", name).addValue("hash", tokenHash)
+                .addValue("enabled", enabled).addValue("rate", rateLimit).addValue("quota", quota)
+                .addValue("by", createdBy).addValue("desc", description).addValue("now", now());
+        if (JdbcConfig.isPostgres(props)) {
+            // PG 无 INSERT OR REPLACE：改写 upsert。used 不列即保持原值、created_at 重置为 now，
+            // 与 SQLite 版 COALESCE(旧 used) + OR REPLACE 的最终效果一致
+            named.update(
+                    "INSERT INTO api_clients " +
+                            "(client_id, name, token_hash, enabled, rate_limit, quota, used, created_by, description, created_at) " +
+                            "VALUES (:cid, :name, :hash, :enabled, :rate, :quota, 0, :by, :desc, :now) " +
+                            "ON CONFLICT(client_id) DO UPDATE SET name = excluded.name, token_hash = excluded.token_hash, " +
+                            "enabled = excluded.enabled, rate_limit = excluded.rate_limit, quota = excluded.quota, " +
+                            "created_by = excluded.created_by, description = excluded.description, created_at = excluded.created_at",
+                    params);
+        } else {
+            named.update(
+                    "INSERT OR REPLACE INTO api_clients " +
+                            "(client_id, name, token_hash, enabled, rate_limit, quota, used, created_by, description, created_at) " +
+                            "VALUES (:cid, :name, :hash, :enabled, :rate, :quota, " +
+                            "COALESCE((SELECT used FROM api_clients WHERE client_id = :cid), 0), :by, :desc, :now)",
+                    params);
+        }
     }
 
     public List<Map<String, Object>> listApiClients() {

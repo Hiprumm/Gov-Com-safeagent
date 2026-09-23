@@ -163,7 +163,7 @@ class RuleEngine:
             r"(?:取消|放开|解除)[\u4e00-\u9fa5]{0,6}(?:限购|限售|准入限制|管控措施)",
             r"请[\u4e00-\u9fa5]{0,4}(?:确认|核实|回复)[\u4e00-\u9fa5]{0,2}(?:此|该|上述|以上)?信息",
         ]
-        
+
         self.high_risk_keywords = [
             "rm -rf", "del /s", "格式化", "删除所有", "系统崩溃",
             "管理员权限", "root权限", "超级用户", "数据库密码",
@@ -172,7 +172,7 @@ class RuleEngine:
             "木马程序", "病毒", "恶意软件", "后门",
             "删库", "跑路", "数据销毁", "覆盖写入",
         ]
-        
+
         self.medium_risk_keywords = [
             "文件路径", "目录遍历", "读取文件", "下载文件",
             "执行命令", "运行脚本", "系统命令", "shell命令",
@@ -183,6 +183,162 @@ class RuleEngine:
         # T6 持续优化：动态关键词（由人工标注调优/威胁情报导入动态扩充）
         self.dynamic_high_keywords: List[str] = []
         self.dynamic_medium_keywords: List[str] = []
+
+        # P0-5 规则版本化热更新：内置规则作为兜底与 v1 种子源；
+        # 运行时 attack_patterns 优先取 rule_definitions 表最新版本。
+        self._builtin_patterns = {at: list(ps) for at, ps in self.attack_patterns.items()}
+        self._rule_weights: Dict[str, float] = {}
+        self.rules_version = 0
+        self._load_rules(initial=True)
+
+    # ------------------------------------------------------------------
+    # 规则版本化热更新（P0-5：rule_definitions 表加载 / reload / rollback）
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _default_weight(attack_type: AttackType) -> float:
+        """内置置信度权重分层（与历史行为一致，作为 rule_definitions.weight 缺省）"""
+        if attack_type in (AttackType.COMMAND_EXECUTION, AttackType.SQL_INJECTION, AttackType.XSS):
+            return 0.4
+        if attack_type in (AttackType.PATH_TRAVERSAL, AttackType.CRLF_INJECTION, AttackType.JSON_INJECTION):
+            return 0.35
+        return 0.25
+
+    def _compile_rules(self, rows: List[Dict]) -> Tuple[Dict, Dict]:
+        """将 rule_definitions 行编译为 attack_patterns；跳过未知分类/无效正则/停用规则"""
+        patterns: Dict[AttackType, List[str]] = {}
+        weights: Dict[str, float] = {}
+        skipped = 0
+        for r in rows or []:
+            if not r.get("enabled"):
+                continue
+            cat = str(r.get("category", "")).strip()
+            try:
+                at = AttackType(cat)
+            except ValueError:
+                skipped += 1
+                continue
+            pat = str(r.get("pattern", "") or "")
+            try:
+                re.compile(pat)
+            except re.error:
+                skipped += 1
+                continue  # 管理员录入的无效正则不拖垮检测
+            patterns.setdefault(at, []).append(pat)
+            try:
+                w = float(r.get("weight") or 0)
+            except (TypeError, ValueError):
+                w = 0.0
+            if w > 0:
+                weights[cat] = max(weights.get(cat, 0.0), w)
+        self.last_load_skipped = skipped
+        return patterns, weights
+
+    def _load_rules(self, initial: bool = False) -> None:
+        """从 rule_definitions 表加载最新版本规则。
+
+        - 空表：首次启动将内置规则 seed 为 v1（changed_by=system）；
+        - 表内有规则：enabled 过滤 + 正则预校验后构建 attack_patterns；
+        - 首次初始化遇到存储异常：静默走内置兜底（不阻断检测流水线启动）；
+        - 热更新（initial=False）遇到异常/空结果：抛错拒绝，保留现行规则。
+        """
+        try:
+            from storage import get_storage
+            st = get_storage()
+            if st.get_latest_rule_version() == 0:
+                seed = [
+                    {"category": at.value, "pattern": p,
+                     "weight": self._default_weight(at), "enabled": True}
+                    for at, ps in self._builtin_patterns.items() for p in ps
+                ]
+                st.save_rules_version(seed, version=1, changed_by="system",
+                                      change_note="内置基线规则 v1 自动初始化")
+            version = st.get_latest_rule_version()
+            rows = st.get_rules(version)
+            patterns, weights = self._compile_rules(rows)
+            if not patterns:
+                raise ValueError(f"规则版本 v{version} 编译后无可用规则")
+            self.attack_patterns = patterns
+            self._rule_weights = weights
+            self.rules_version = version
+        except Exception:
+            if initial:
+                # 冷启动兜底：保留内置规则，检测能力不缺失
+                self.attack_patterns = {at: list(ps) for at, ps in self._builtin_patterns.items()}
+                self.rules_version = 0
+            else:
+                raise
+
+    def reload(self) -> Dict:
+        """热更新入口：重新加载最新版本规则（供 POST /api/security/rules/reload）。"""
+        prev = self.rules_version
+        self._load_rules(initial=False)
+        return {
+            "prev_version": prev,
+            "version": self.rules_version,
+            "rule_count": sum(len(ps) for ps in self.attack_patterns.values()),
+            "categories": sorted(at.value for at in self.attack_patterns),
+            "skipped": getattr(self, "last_load_skipped", 0),
+        }
+
+    def apply_update(self, rules: List[Dict], changed_by: str = "", change_note: str = "") -> Dict:
+        """保存新版本规则并热加载（供 POST /api/security/rules/update）。
+
+        rules: [{category, pattern, weight?, enabled?}]；全量替换式版本。
+        """
+        from storage import get_storage
+        st = get_storage()
+        normalized = []
+        for r in rules or []:
+            cat = str((r or {}).get("category", "")).strip()
+            pat = str((r or {}).get("pattern", "") or "")
+            if not cat or not pat:
+                continue
+            try:
+                AttackType(cat)
+            except ValueError:
+                continue
+            try:
+                re.compile(pat)
+            except re.error:
+                continue
+            normalized.append({
+                "category": cat, "pattern": pat,
+                "weight": float((r or {}).get("weight") or self._default_weight(AttackType(cat))),
+                "enabled": bool((r or {}).get("enabled", True)),
+            })
+        if not normalized:
+            raise ValueError("提交的规则集中无有效规则（分类非法/正则无效/字段缺失）")
+        new_version = st.get_latest_rule_version() + 1
+        st.save_rules_version(normalized, version=new_version,
+                              changed_by=changed_by or "admin", change_note=change_note)
+        self._load_rules(initial=False)
+        return {"version": new_version, "rule_count": len(normalized)}
+
+    def rollback(self, version: int, changed_by: str = "") -> Dict:
+        """回滚到指定版本：将目标版本规则复制为新版本（历史 append-only），并热加载。"""
+        from storage import get_storage
+        st = get_storage()
+        rows = st.get_rules(int(version))
+        if not rows:
+            raise ValueError(f"规则版本 v{version} 不存在或无规则")
+        new_version = st.get_latest_rule_version() + 1
+        st.save_rules_version(rows, version=new_version, changed_by=changed_by or "admin",
+                              change_note=f"回滚至 v{version}")
+        self._load_rules(initial=False)
+        return {"rolled_back_to": int(version), "new_version": new_version,
+                "rule_count": sum(len(ps) for ps in self.attack_patterns.values())}
+
+    def rules_summary(self) -> Dict:
+        """当前规则集概览（供 GET /api/security/rules）"""
+        from storage import get_storage
+        st = get_storage()
+        return {
+            "active_version": self.rules_version,
+            "builtin_fallback": self.rules_version == 0,
+            "rule_count": sum(len(ps) for ps in self.attack_patterns.values()),
+            "categories": {at.value: len(ps) for at, ps in self.attack_patterns.items()},
+            "versions": st.list_rule_versions(),
+        }
 
     def add_keywords(self, words: List[str], level: str = "medium") -> int:
         """动态扩充关键词库（持续优化闭环使用）
@@ -232,13 +388,8 @@ class RuleEngine:
         decoded_text = urllib.parse.unquote(text)
 
         for attack_type, patterns in self.attack_patterns.items():
-            # 根据攻击类型设置不同的置信度权重
-            if attack_type in [AttackType.COMMAND_EXECUTION, AttackType.SQL_INJECTION, AttackType.XSS]:
-                weight = 0.4
-            elif attack_type in [AttackType.PATH_TRAVERSAL, AttackType.CRLF_INJECTION, AttackType.JSON_INJECTION]:
-                weight = 0.35
-            else:
-                weight = 0.25
+            # 置信度权重：rule_definitions 表版本化权重优先，缺省回退内置分层
+            weight = self._rule_weights.get(attack_type.value) or self._default_weight(attack_type)
             
             for pattern in patterns:
                 matches = re.finditer(pattern, decoded_text, re.IGNORECASE)

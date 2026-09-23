@@ -1,0 +1,67 @@
+# SafeAgent 告警规则组（由 prometheus.yml 的 rule_files 引用）
+# 指标来源：ai_service/routers/metrics.py（Prometheus /metrics 端点）
+groups:
+  - name: safeagent-alerts
+    rules:
+      # ---- 检测失败率过高 ----
+      # 注：检测层暂无独立 fail 埋点（metrics_collector 的 record_detect 无失败维度），
+      # 以 5xx 占比作为服务失败率代理；后续接入 fail 计数后可切换为
+      # rate(safeagent_detect_requests_total{status="fail"}[5m]) / rate(safeagent_detect_requests_total[5m])
+      - alert: DetectFailureRateHigh
+        expr: >-
+          sum(rate(safeagent_http_status_total{status_class="5xx"}[5m]))
+          / clamp_min(sum(rate(safeagent_http_requests_total[5m])), 0.000001) > 0.01
+        for: 5m
+        labels:
+          severity: critical
+          service: safeagent-ai
+        annotations:
+          summary: "检测服务失败率过高（>1%）"
+          description: "5 分钟窗口内 5xx 占比超过 1%，当前值 {{ $value | humanizePercentage }}，请检查 ai-service 日志与依赖。"
+
+      # ---- LLM 连续失败熔断 ----
+      - alert: LLMBreakerActive
+        expr: increase(safeagent_llm_calls_total{status="fail"}[5m]) > 10
+        labels:
+          severity: critical
+          service: safeagent-ai
+        annotations:
+          summary: "LLM 连续失败（疑似熔断）"
+          description: "5 分钟内 LLM 调用失败 {{ $value | humanize }} 次（超过阈值 10），主/备用模型可能均不可用，请检查供应商配额与网络。"
+
+      # ---- 沙箱不可用 ----
+      # 注：沙箱执行结果暂无计数来源（见 routers/metrics.py 中的 TODO），
+      # 主流程补 record_sandbox 打点后本规则即生效
+      - alert: SandboxUnavailable
+        expr: increase(safeagent_sandbox_executions_total{status="rejected"}[5m]) > 0
+        for: 1m
+        labels:
+          severity: warning
+          service: safeagent-ai
+        annotations:
+          summary: "沙箱执行出现拒绝（可能不可用）"
+          description: "5 分钟内沙箱 rejected 计数增加 {{ $value | humanize }}，请检查 Docker 沙箱运行状态与本地降级策略。"
+
+      # ---- 审计链校验失败 ----
+      # 指标为 Gauge：routers/metrics.py 黑盒读取 audit_logger.verify_chain() 的 tampered 条数
+      #（-1 表示采集异常，同样触发告警）
+      - alert: AuditChainVerifyFailed
+        expr: safeagent_audit_verify_failures_total > 0
+        for: 2m
+        labels:
+          severity: critical
+          service: safeagent-ai
+        annotations:
+          summary: "审计链校验失败"
+          description: "审计哈希链/签名校验发现 {{ $value | humanize }} 条异常记录（-1 为采集异常），可能存在篡改或签名密钥不一致，请立即核查。"
+
+      # ---- 审批积压 ----
+      - alert: ApprovalBacklogHigh
+        expr: safeagent_approval_queue_length > 100
+        for: 5m
+        labels:
+          severity: warning
+          service: safeagent-ai
+        annotations:
+          summary: "审批队列积压（>100）"
+          description: "待审批队列长度持续超过 100（当前 {{ $value | humanize }}），审批处理可能已停滞，请检查审批流转与通知渠道。"

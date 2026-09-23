@@ -1,0 +1,19 @@
+# Prometheus 抓取配置（阶段7：可观测性）
+# 用法：prometheus --config.file=prometheus.yml（容器内相对本文件目录挂载）
+global:
+  scrape_interval: 15s      # 全局抓取间隔
+  evaluation_interval: 15s  # 告警规则评估间隔
+
+# 告警规则（与 prometheus.yml 同目录挂载）
+rule_files:
+  - alerts.yml
+
+scrape_configs:
+  # AI 安全核心服务（FastAPI，GET /metrics，桥接 metrics_collector）
+  - job_name: safeagent-ai
+    metrics_path: /metrics
+    scrape_interval: 15s
+    static_configs:
+      - targets: ["ai-service:8080"]
+        labels:
+          service: safeagent-ai

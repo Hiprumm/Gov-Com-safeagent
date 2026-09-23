@@ -1,17 +1,18 @@
 # ============================================================
-# Docker Compose 一键部署（生产推荐形态）
-# 启动: docker compose -f deploy/docker-compose.yml up -d
+# Docker Compose 一键部署（生产全栈）—— 阶段8 一键式生产改造
+# 启动: ./start.sh --prod（推荐，自动生成密钥/.env 并健康等待）
+#   或: docker compose -f deploy/docker-compose.yml --env-file deploy/.env up -d
 # 停止: docker compose -f deploy/docker-compose.yml down
 #
-# 默认存储：PostgreSQL（生产建议）。若需沿用零依赖 SQLite，
-# 可 export STORAGE_BACKEND=sqlite 再启动，数据落 ai_data 卷。
-# 务必在生产 .env 配置 AUTH_JWT_SECRET（否则令牌跨重启失效）。
+# 架构: nginx(80/443) → gateway-lite(8090 统一鉴权/限流/分流)
+#        ├─ ai-service(8080, FastAPI)
+#        └─ biz-service(8300, Spring Boot)
+#        存储共享 PostgreSQL；可观测 Prometheus+Grafana；每日 pg-backup。
+# 注：不加 Redis——网关限流/IP封锁计数已落共享库（rate_limit_hits），多副本一致。
 # ============================================================
 
-version: "3.8"
-
 services:
-  # 生产数据库（PostgreSQL，替代 SQLite 单文件，支持多 worker 并发写）
+  # ---------- 生产数据库 ----------
   postgres:
     image: postgres:16-alpine
     container_name: safeagent-pg
@@ -19,8 +20,17 @@ services:
       POSTGRES_DB: ${POSTGRES_DB:-safeagent}
       POSTGRES_USER: ${POSTGRES_USER:-safeagent}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-safeagent}
+    command:
+      - postgres
+      - -c
+      - archive_mode=on
+      - -c
+      - archive_command=test ! -f /wal_archive/%f && cp %p /wal_archive/%f
+      - -c
+      - wal_level=replica
     volumes:
       - pg_data:/var/lib/postgresql/data
+      - wal_archive:/wal_archive
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-safeagent} -d ${POSTGRES_DB:-safeagent}"]
       interval: 5s
@@ -28,39 +38,111 @@ services:
       retries: 10
     restart: unless-stopped
 
-  # AI 服务（多 worker；应急/限流等关键状态已改为读库为准，跨 worker 一致）
+  # ---------- AI 安全服务（FastAPI，多 worker） ----------
   ai-service:
     build:
       context: ..
       dockerfile: deploy/Dockerfile
     container_name: safeagent-ai
-    ports:
-      - "8080:8080"
-    env_file:
-      - ../ai_service/.env
     environment:
-      # environment 优先于 env_file；生产默认 postgres，可用 ${VAR} 覆盖
       STORAGE_BACKEND: ${STORAGE_BACKEND:-postgres}
-      POSTGRES_DSN: ${POSTGRES_DSN:-}
       POSTGRES_HOST: postgres
       POSTGRES_PORT: 5432
       POSTGRES_DB: ${POSTGRES_DB:-safeagent}
       POSTGRES_USER: ${POSTGRES_USER:-safeagent}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-safeagent}
+      # 生产密钥（start.sh --prod 生成 deploy/.env 注入；演示缺省为空走 data/ 落盘兜底）
+      ENV: ${ENV:-development}
       AUTH_JWT_SECRET: ${AUTH_JWT_SECRET:-}
+      AUTH_MFA_SECRET_KEY: ${AUTH_MFA_SECRET_KEY:-}
+      GRADED_HMAC_KEY: ${GRADED_HMAC_KEY:-}
+      ZKP_PROVING_KEY: ${ZKP_PROVING_KEY:-}
+      # 工具沙箱网络白名单（与下方显式命名的 sandbox_net 对齐）
+      TOOL_NETWORK_WHITELIST: sandbox_net
     volumes:
       - ai_data:/app/data
+      # DooD：挂载宿主 docker.sock 控制沙箱兄弟容器（生产 SANDBOX_ALLOW_LOCAL_FALLBACK=0 不降级）
+      - /var/run/docker.sock:/var/run/docker.sock
     depends_on:
       postgres:
         condition: service_healthy
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/api/health')"]
-      interval: 30s
+      interval: 15s
       timeout: 10s
-      retries: 3
+      retries: 5
+      start_period: 30s
 
-  # Nginx (前端 + 反向代理 + HTTPS 终止)
+  # ---------- 统一鉴权网关（/api 分流 ai|biz + 限流 + IP 封锁 + 熔断） ----------
+  gateway-lite:
+    build:
+      context: ..
+      dockerfile: deploy/gateway-lite.Dockerfile
+    container_name: safeagent-gateway
+    environment:
+      GATEWAY_LITE_PORT: "8090"
+      AI_UPSTREAM: http://ai-service:8080
+      BIZ_UPSTREAM: http://biz-service:8300
+      STORAGE_BACKEND: ${STORAGE_BACKEND:-postgres}
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: ${POSTGRES_DB:-safeagent}
+      POSTGRES_USER: ${POSTGRES_USER:-safeagent}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-safeagent}
+      AUTH_JWT_SECRET: ${AUTH_JWT_SECRET:-}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      ai-service:
+        condition: service_healthy
+      biz-service:
+        condition: service_started
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8090/api/gateway/health')"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 20s
+
+  # ---------- 业务治理服务（Spring Boot：auth/admin/governance/audit读取） ----------
+  biz-service:
+    build:
+      context: ..
+      dockerfile: deploy/biz-service.Dockerfile
+    container_name: safeagent-biz
+    environment:
+      SAFEAGENT_BIZ_PORT: "8300"
+      SAFEAGENT_DB_TYPE: ${STORAGE_BACKEND:-postgres}   # 与 ai_service 存储对齐
+      SAFEAGENT_PG_HOST: postgres
+      SAFEAGENT_PG_PORT: "5432"
+      SAFEAGENT_PG_DB: ${POSTGRES_DB:-safeagent}
+      SAFEAGENT_PG_USER: ${POSTGRES_USER:-safeagent}
+      SAFEAGENT_PG_PASSWORD: ${POSTGRES_PASSWORD:-safeagent}
+      # 与 Python 侧令牌互认：同一份签名密钥（文件挂载自 deploy/secrets/）
+      SAFEAGENT_JWT_SECRET_FILE: /app/secrets/jwt_secret.key
+      SAFEAGENT_LOGIN_RSA_FILE: /app/data/login_rsa.key
+      SAFEAGENT_CREDENTIALS_FILE: /app/data/initial_credentials.txt
+      SAFEAGENT_ENV: ${ENV:-development}
+    volumes:
+      - biz_data:/app/data
+      - ./secrets:/app/secrets:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      # ai 先健康（首启由 ai 侧统一 seed 生产随机口令，避免双写竞争）
+      ai-service:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8300/health"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 40s
+
+  # ---------- Nginx（前端静态 + HTTPS 终止 + 单入口反代） ----------
   nginx:
     image: nginx:alpine
     container_name: safeagent-nginx
@@ -75,17 +157,18 @@ services:
       - "80:80"
       - "443:443"
     depends_on:
-      - ai-service
+      gateway-lite:
+        condition: service_healthy
     restart: unless-stopped
 
-  # 工具执行沙箱（可选——Docker 不可用时自动降级为本地模拟）
+  # ---------- 工具执行沙箱（Docker-in-Docker 由 ai-service 挂载 /var/run/docker.sock 控制） ----------
+  # 注：镜像构建后常驻待命；生产 SANDBOX_ALLOW_LOCAL_FALLBACK=0，沙箱不可用即拒绝执行（不降级）
   tool-sandbox:
     build:
       context: ../docker/tool-sandbox
       dockerfile: Dockerfile
     image: safeagent-tool-sandbox:latest
     container_name: safeagent-sandbox
-    # 不暴露端口（仅内部使用）
     read_only: true
     tmpfs:
       - /tmp:rw,noexec,nosuid,size=64m
@@ -100,13 +183,73 @@ services:
           memory: 256M
     networks:
       - sandbox_net
-    restart: "no"  # 按需启动，不自动重启
+    restart: "no"  # 按需由 ai-service 启停，不自动重启
+
+  # ---------- 可观测性：Prometheus（抓取 /metrics + 告警规则） ----------
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: safeagent-prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=30d
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./monitoring/alerts.yml:/etc/prometheus/alerts.yml:ro
+      - prometheus_data:/prometheus
+    depends_on:
+      ai-service:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ---------- 可观测性：Grafana（provisioning 自动装配数据源+面板） ----------
+  grafana:
+    image: grafana/grafana:latest
+    container_name: safeagent-grafana
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana_data:/var/lib/grafana
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+
+  # ---------- 每日 PostgreSQL 备份（保留周期对齐审计留存天数） ----------
+  pg-backup:
+    image: postgres:16-alpine
+    container_name: safeagent-backup
+    entrypoint: ["/bin/sh", "/backup/backup.sh"]
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      POSTGRES_USER: ${POSTGRES_USER:-safeagent}
+      POSTGRES_DB: ${POSTGRES_DB:-safeagent}
+      PGPASSWORD: ${POSTGRES_PASSWORD:-safeagent}
+      BACKUP_RETENTION_DAYS: ${AUDIT_RETENTION_DAYS:-180}
+      BACKUP_INTERVAL_SECONDS: "86400"
+    volumes:
+      - ./backup/backup.sh:/backup/backup.sh:ro
+      - ./backups:/backups
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
 
 networks:
+  default:
+    name: safeagent_net
   sandbox_net:
+    name: sandbox_net   # 显式命名：ai-service TOOL_NETWORK_WHITELIST 按 net 名匹配
     driver: bridge
-    internal: true  # 仅内部网络，无出站访问
+    internal: true  # 沙箱仅内部网络，无出站访问
 
 volumes:
   pg_data:
+  wal_archive:
   ai_data:
+  biz_data:
+  prometheus_data:
+  grafana_data:

@@ -17,6 +17,8 @@ gov-safeagent-gateway-lite —— 阶段2 轻量统一鉴权网关（/ai 与 /bi
 """
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import os
 import sys
@@ -153,6 +155,12 @@ _PROTECTED_ROUTES: list[tuple] = [
     ("GET", "/api/security/tool_management/status", "tools.view"),
     # ---- 检测调优 / 对抗评测 / 回放 ----
     ("POST", "/api/optimization/", "security.scan"),
+    # ---- 检测规则版本化热更新 / 误报标记（P0-5）----
+    ("POST", "/api/security/feedback/", "system.maintain"),   # review 审核在前（长前缀优先）
+    ("GET", "/api/security/rules", "login"),
+    ("POST", "/api/security/rules", "system.maintain"),       # update/reload/rollback
+    ("POST", "/api/security/feedback", "login"),              # 提交误报标记
+    ("GET", "/api/security/feedback", "security.scan"),       # 队列查看（admin/operator）
     ("POST", "/api/security/bypass_test", "security.scan"),
     ("POST", "/api/security/bypass_batch_test", "security.scan"),
     ("POST", "/api/security/pssu/assess", "security.scan"),
@@ -235,6 +243,29 @@ async def security_middleware(request: Request, call_next):
         return JSONResponse(status_code=e.status, content=e.content)
 
 
+def _check_integration_api_key(request: Request) -> bool:
+    """服务间 API Key 校验（P0-2 密钥管理：多版本 + 可轮换 + 可吊销）。
+
+    两条验证路径，任一通过即可：
+    1. 环境变量静态 Key：AUTH_API_KEY（保留兼容，轮换需重启）；
+    2. api_keys 表多版本 Key：sha256(presented) 哈希查库（verify_api_key_hash），
+       支持多版本并存轮换、expires_at 过期与 status 吊销，无需重启网关。
+    存储层故障时仅回退静态 Key 校验，不放大为服务中断。
+    """
+    presented = request.headers.get("X-API-Key") or ""
+    if not presented:
+        return False
+    static_key = str(getattr(settings, "AUTH_API_KEY", "") or "")
+    if static_key and hmac.compare_digest(presented, static_key):
+        return True
+    try:
+        from storage import get_storage
+        key_hash = hashlib.sha256(presented.encode("utf-8")).hexdigest()
+        return bool(get_storage().verify_api_key_hash(key_hash))
+    except Exception:
+        return False
+
+
 async def _security_guard(request: Request, call_next):
     path = request.url.path
     if _is_open(path):
@@ -253,16 +284,22 @@ async def _security_guard(request: Request, call_next):
             pass
 
     # ---- 滑动窗口限流（计数落共享库 rate_limit_hits，多 worker 一致）----
+    # 生产级改造：用户 + IP 双维度叠加检查（对齐改进清单 P0-2：
+    # 登录用户按账号维度限流，未登录/匿名按 IP 维度限流，已登录用户同样计入 IP 维度）
     if getattr(settings, "RATE_LIMIT_ENABLED", False):
         try:
             from storage import get_storage
             client_ip = request.client.host if request.client else "unknown"
             identity = current_identity(request.headers.get("X-Auth-Token"))
-            key = (identity or {}).get("username") or f"ip:{client_ip}"
-            if get_storage().rate_limit_check(
-                    key, getattr(settings, "RATE_LIMIT_REQUESTS", 120),
-                    getattr(settings, "RATE_LIMIT_WINDOW", 60)):
-                raise GatewayReject(429, {"detail": "Too Many Requests"})
+            username = (identity or {}).get("username")
+            window = getattr(settings, "RATE_LIMIT_WINDOW", 60)
+            checks = []
+            if username:
+                checks.append((username, int(getattr(settings, "RATE_LIMIT_REQUESTS", 120))))
+            checks.append((f"ip:{client_ip}", int(getattr(settings, "RATE_LIMIT_IP_REQUESTS", 120))))
+            for key, limit in checks:
+                if get_storage().rate_limit_check(key, limit, window):
+                    raise GatewayReject(429, {"detail": "Too Many Requests"})
         except GatewayReject:
             raise
         except Exception:
@@ -293,9 +330,8 @@ async def _security_guard(request: Request, call_next):
             need = perm
             break
     if need is not None:
-        # 服务间调用：已配置 API Key 且请求头匹配
-        if (need == "integration" and getattr(settings, "AUTH_API_KEY", "")
-                and request.headers.get("X-API-Key") == getattr(settings, "AUTH_API_KEY", "")):
+        # 服务间调用：X-API-Key 多版本校验（静态 env Key 兼容 + api_keys 表查库轮换）
+        if need == "integration" and _check_integration_api_key(request):
             return await call_next(request)
         identity = current_identity(request.headers.get("X-Auth-Token"))
         if not identity:

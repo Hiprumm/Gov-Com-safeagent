@@ -52,6 +52,66 @@ PLATFORM_CONTROLS = {
 CONTENT_RISK_IDS = {r["id"] for r in CONTENT_RISKS}  # 全部31项均可通过词库检测+拒答覆盖
 
 
+# ============================================================================
+# 法规条款映射（阶段5 审计链生产化）：审计日志字段/机制 → 法规条款
+# 供报告"法规条款对照"章节引用，外部审计方可按条款索引系统证据
+# 格式：{法规: {条款: [对应审计字段/机制列表]}}
+# ============================================================================
+COMPLIANCE_MAPPING = {
+    "等保2.0（GB/T 22239-2019）": {
+        "8.1.4.3 安全审计——审计记录保护（防篡改/防删除/防中断）": [
+            "log_hash：SHA-256 哈希链（链式互锁，篡改可检测）",
+            "signature：HMAC-SHA256 全量日志签名（防伪造）",
+            "graded_hmac/graded_agent_signature/graded_zkp_proof：分级签名（HIGH 敏感操作加 ZKP）",
+            "WORM 锚定链 data/worm_anchor.jsonl（append-only 独立证据）",
+            "TSA 可信时间戳锚点 audit_anchors（防整体回滚/截断）",
+            "audit_protection：归档目录保护 + 受控维护窗口清理",
+        ],
+        "8.1.4.3 安全审计——审计记录留存（≥6个月）": [
+            "AUDIT_RETENTION_DAYS 留存策略（默认 180 天=6个月）",
+            "retention_archive_and_purge：超期日志先归档（WORM）再清理",
+            "audit_archives 归档文件留档，可审计追溯",
+        ],
+    },
+    "个人信息保护法（PIPL）": {
+        "第50条 个人信息处理者义务（建立申诉/投诉处理机制）": [
+            "operation_subject/source_ip：处理行为可归属到主体（投诉调查取证）",
+            "action_details + return_value：处理过程全留痕",
+            "audit_forwarder SIEM 外发：投诉处置证据可移交监管",
+        ],
+        "第51条 安全技术措施（加密/去标识化/访问控制等）": [
+            "user_role + 权限矩阵（permission_engine）联动审计",
+            "is_blocked/blocking_reason：越权访问实时阻断并留痕",
+            "log_hash 链 + HMAC 签名：审计记录自身完整性保护",
+            "数据外泄检测（防泄露关键词/URL 黑白名单）审计记录",
+        ],
+    },
+    "数据安全法": {
+        "第27条 数据安全保护义务（管理制度与技术措施）": [
+            "哈希链 + 签名 + WORM + TSA 多重防篡改证据固定",
+            "AUDIT_RETENTION_DAYS 留存与归档（数据全生命周期管理）",
+            "供应链扫描（MCP/Skill/插件）审计记录：数据来源安全",
+        ],
+        "第29条 数据安全风险监测与处置（发现风险立即补救）": [
+            "risk_level 风险分级审计（none/low/medium/high/critical 分布）",
+            "is_blocked 实时阻断记录 + blocking_reason 处置依据",
+            "verify_anchor 链截断/回滚监测（数据被破坏即时发现）",
+            "audit_forwarder：风险事件实时外发 SIEM/监管",
+        ],
+    },
+    "GB/T 45654-2025": {
+        "附录A 31项安全风险覆盖（内容安全）": [
+            "risk_matrix：31 项风险逐项关键词检测覆盖矩阵",
+            "生成内容安全合格率评测（要求≥90%）",
+        ],
+        "AIGC 标识（显式+隐式）": [
+            "aigc_explicit_label_enabled：输出附加【AI生成内容】声明",
+            "aigc_implicit_marker_enabled：隐式元数据（模型/提供方/备案号）",
+        ],
+    },
+}
+
+
 class ComplianceReportGenerator:
     """合规报告生成器"""
 
@@ -301,6 +361,8 @@ class ComplianceReportGenerator:
                 "total": self.lexicon_stats["total_keywords"],
                 "categories": self.lexicon_stats["risk_categories"],
             },
+            # 法规条款对照（阶段5）：审计字段/机制 → 等保2.0/PIPL/数据安全法/GB-T 45654 条款
+            "regulation_mapping": COMPLIANCE_MAPPING,
             "suggestions": suggestions,
         }
 
@@ -351,6 +413,16 @@ class ComplianceReportGenerator:
         else:
             lines.append("- 无（全部达标）")
 
+        # 法规条款对照（阶段5 审计链生产化）：每条法规条款对应的本系统审计能力
+        lines.append("\n## 六、法规条款对照\n")
+        for law, clauses in data.get("regulation_mapping", {}).items():
+            lines.append(f"### {law}\n")
+            lines.append("| 条款 | 本系统对应审计能力 |")
+            lines.append("|---|---|")
+            for clause, capabilities in clauses.items():
+                lines.append(f"| {clause} | {'；'.join(capabilities)} |")
+            lines.append("")
+
         lines.append("\n---\n")
         lines.append("本报告由政企大模型智能体安全平台自动生成，仅供合规评估参考。")
         return "\n".join(lines)
@@ -375,6 +447,18 @@ class ComplianceReportGenerator:
         ae = data["audit_evidence"]
         cv = ae["chain_verify"]
         cov = ae["audit_element_coverage"]
+
+        # 法规条款对照（阶段5）：生成 HTML 表格行（与 Markdown 章节六对应）
+        law_tables = []
+        for law, clauses in data.get("regulation_mapping", {}).items():
+            clause_rows = "".join(
+                f"<tr><td>{clause}</td><td>{'；'.join(capabilities)}</td></tr>"
+                for clause, capabilities in clauses.items()
+            )
+            law_tables.append(
+                f"<h3>{law}</h3>"
+                f"<table><tr><th>条款</th><th>本系统对应审计能力</th></tr>{clause_rows}</table>"
+            )
 
         html = f"""<!DOCTYPE html>
 <html lang="zh">
@@ -417,6 +501,9 @@ th{{background:#f3f4f6}}
 
 <h2>五、整改建议</h2>
 <ul>{''.join(f'<li>{s}</li>' for s in data['suggestions']) or '<li>无（全部达标）</li>'}</ul>
+
+<h2>六、法规条款对照</h2>
+{''.join(law_tables)}
 <hr>
 <p style="color:#888;font-size:13px">本报告由政企大模型智能体安全平台自动生成，仅供合规评估参考。</p>
 </body></html>"""

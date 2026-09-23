@@ -155,7 +155,15 @@ class LLMClassifier:
         self.base_url = cfg["base_url"]
         self.completions_url = completions_url(cfg["base_url"])
         self.enabled = bool(self.api_key)
-        self.timeout = 15                    # 15 秒超时（覆盖 GLM-4-flash 偶发慢响应，避免误回退）
+        # 仲裁层超时配置化（P0-5）：读 LLM_ARBITER_TIMEOUT_MS（默认 2000ms）。
+        # 注：改进.md 建议 500ms 仅适用"规则预筛"场景；仲裁层需完成完整 JSON 推理
+        # （GLM-4-flash 实测 1-2s），过短会大量误回退规则层，故默认 2s。
+        # 内网 vLLM 可调小，公网慢链路可经 env/.env 调大。
+        try:
+            from config import settings as _settings
+            self.timeout = max(1.0, int(getattr(_settings, "LLM_ARBITER_TIMEOUT_MS", 2000)) / 1000.0)
+        except Exception:
+            self.timeout = 15.0
         # 备用模型（多供应商容灾）：主模型故障/超时自动切换重试一次
         self.backup_api_key = cfg.get("backup_api_key") or ""
         self.backup_base_url = cfg.get("backup_base_url") or ""

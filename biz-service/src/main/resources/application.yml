@@ -12,10 +12,20 @@ spring:
 
 app:
   db:
-    # 与 FastAPI AI 服务共享的 SQLite 文件（绝对路径）
+    # 数据库类型：sqlite（默认，共享 .db 文件）| postgres（生产 compose，与 ai_service STORAGE_BACKEND=postgres 对齐）
+    # 可用环境变量 SAFEAGENT_DB_TYPE 覆盖
+    type: ${SAFEAGENT_DB_TYPE:sqlite}
+    # 与 FastAPI AI 服务共享的 SQLite 文件（绝对路径，仅 type=sqlite 时生效）
     # 对应 ai_service/storage.py 中 DB_PATH = <ai_service>/data/safeagent.db
     # 可用环境变量 SAFEAGENT_DB_PATH 覆盖（多环境部署时无需改本文件）
     path: ${SAFEAGENT_DB_PATH:x:/ZuoYe/揭榜挂帅26/Gov-Com-safeagent/ai_service/data/safeagent.db}
+    # PostgreSQL 连接参数（仅 type=postgres 时生效），默认值对齐 deploy compose（postgres:5432/safeagent/safeagent）
+    pg:
+      host: ${SAFEAGENT_PG_HOST:postgres}
+      port: ${SAFEAGENT_PG_PORT:5432}
+      db: ${SAFEAGENT_PG_DB:safeagent}
+      user: ${SAFEAGENT_PG_USER:safeagent}
+      password: ${SAFEAGENT_PG_PASSWORD:safeagent}
   jwt:
     # 与 Python auth.py 一致：优先读取共享的持久化签名密钥，便于两服务令牌互认
     # 可用 SAFEAGENT_JWT_SECRET_FILE 覆盖

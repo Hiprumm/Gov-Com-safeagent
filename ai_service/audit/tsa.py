@@ -7,6 +7,8 @@
 
 - TSA 通过 HTTP JSON 契约对接（{digest, alg} → {timestamp, serial,...}）；
   生产可替换为符合 RFC3161 的时间戳服务或单位自建 TSA（只需适配 request_timestamp）。
+- 阶段5 审计链生产化：支持**多 TSA 端点主备**（环境变量 TSA_ENDPOINTS，逗号分隔），
+  按列表顺序依次尝试，全部失败才降级本地时间戳；
 - 未配置 TSA 时降级为**本地可信时钟锚点**（mode=local），仍可固定链头、检测截断。
 
 配置持久化于 policy_config（key=audit_tsa）；锚点存 policy_config（key=audit_anchors，保留最近 50 条）。
@@ -19,6 +21,7 @@ from datetime import datetime
 from typing import Dict, List, Optional
 
 from storage import get_storage
+from config import settings
 
 CONFIG_KEY = "audit_tsa"
 ANCHOR_KEY = "audit_anchors"
@@ -29,9 +32,28 @@ ANCHOR_KEEP = 50
 # 配置
 # ==================================================================
 def load_tsa_config(force: bool = False) -> Dict:
+    """加载 TSA 配置（多端点主备）。
+
+    端点列表构成（按尝试顺序）：
+    1. policy_config 旧单端点配置（url）——作为列表第一项，保持向后兼容；
+    2. 环境变量 settings.TSA_ENDPOINTS（逗号分隔）解析出的多端点，去重追加。
+
+    返回：
+        {"url": 主端点(urls[0]，兼容旧调用方), "urls": [端点列表], "enabled": bool}
+    """
     cfg = get_storage().get_setting(CONFIG_KEY, {}) or {}
+    legacy_url = str(cfg.get("url", "") or "").strip()
+    # 生产级改造：环境变量注入多 TSA 端点（逗号分隔，主备依次尝试）
+    env_urls = [u.strip() for u in str(getattr(settings, "TSA_ENDPOINTS", "") or "").split(",") if u.strip()]
+    urls: List[str] = []
+    if legacy_url:  # 旧单端点配置作为列表第一项
+        urls.append(legacy_url)
+    for u in env_urls:
+        if u not in urls:
+            urls.append(u)
     return {
-        "url": str(cfg.get("url", "") or ""),
+        "url": urls[0] if urls else "",
+        "urls": urls,
         "enabled": bool(cfg.get("enabled", False)),
     }
 
@@ -63,26 +85,40 @@ def _post_json(url: str, payload: Dict) -> Dict:
 
 
 def request_timestamp(digest_hex: str) -> Dict:
-    """为摘要请求可信时间戳；TSA 未启用/失败时降级为本地时间戳。"""
+    """为摘要请求可信时间戳（多端点主备）。
+
+    按配置端点列表顺序依次尝试：某端点失败记录 WARN 后尝试下一个；
+    **全部失败**才降级为本地时间戳（复用原有 tsa-failed 降级语义）。
+    返回值通过 tsa_endpoint 字段记录实际命中的端点，便于观测主备切换。
+    """
     cfg = load_tsa_config(force=True)
-    if cfg["enabled"] and cfg["url"]:
-        try:
-            resp = _post_json(cfg["url"], {"digest": digest_hex, "alg": "sha256"})
-            return {
-                "mode": "tsa",
-                "digest": digest_hex,
-                "timestamp": resp.get("timestamp") or _now_iso(),
-                "serial": str(resp.get("serial", "")),
-                "tsa_url": cfg["url"],
-                "token": resp,
-            }
-        except Exception as e:
-            return {
-                "mode": "tsa-failed",
-                "digest": digest_hex,
-                "timestamp": _now_iso(),
-                "error": str(e)[:200],
-            }
+    endpoints = list(cfg.get("urls") or [])
+    if cfg["enabled"] and endpoints:
+        errors = []
+        for ep in endpoints:
+            try:
+                resp = _post_json(ep, {"digest": digest_hex, "alg": "sha256"})
+                return {
+                    "mode": "tsa",
+                    "digest": digest_hex,
+                    "timestamp": resp.get("timestamp") or _now_iso(),
+                    "serial": str(resp.get("serial", "")),
+                    "tsa_url": ep,       # 兼容旧字段：实际命中的端点
+                    "tsa_endpoint": ep,  # 阶段5：标记实际使用端点（观测主备切换）
+                    "token": resp,
+                }
+            except Exception as e:
+                # 单端点失败：WARN 后尝试下一个（不影响降级前的重试链路）
+                print(f"[TSA][WARN] 端点请求失败，尝试下一端点：{ep} -> {str(e)[:120]}")
+                errors.append(f"{ep}: {str(e)[:120]}")
+        # 全部端点失败 → 本地时间戳降级（复用原降级逻辑）
+        return {
+            "mode": "tsa-failed",
+            "digest": digest_hex,
+            "timestamp": _now_iso(),
+            "error": "; ".join(errors)[:200],
+            "tried_endpoints": endpoints,
+        }
     return {"mode": "local", "digest": digest_hex, "timestamp": _now_iso()}
 
 

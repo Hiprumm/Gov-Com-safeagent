@@ -1,5 +1,7 @@
 package cn.safeagent.biz.tool;
 
+import cn.safeagent.biz.common.config.AppProperties;
+import cn.safeagent.biz.common.config.JdbcConfig;
 import cn.safeagent.biz.common.util.Rows;
 import org.springframework.jdbc.core.namedparam.MapSqlParameterSource;
 import org.springframework.jdbc.core.namedparam.NamedParameterJdbcTemplate;
@@ -23,17 +25,22 @@ public class ToolRepository {
     private static final String ENABLED_KEY = "enabled";
 
     private final NamedParameterJdbcTemplate named;
+    private final AppProperties props;
 
-    public ToolRepository(NamedParameterJdbcTemplate named) {
+    public ToolRepository(NamedParameterJdbcTemplate named, AppProperties props) {
         this.named = named;
+        this.props = props;
     }
 
-    /** 兜底建表（幂等）：表由 ai_service/storage.py 的 _init_db 统一创建，此处确保独立启动时存在。 */
+    /** 兜底建表（幂等）：表由 ai_service/storage.py 的 _init_db 统一创建，此处确保独立启动时存在。
+     *  PG 侧 postgres_storage.py 未建此表，本分支为唯一保障。 */
     @PostConstruct
     public void ensureTable() {
+        boolean pg = JdbcConfig.isPostgres(props);
         named.getJdbcTemplate().execute(
                 "CREATE TABLE IF NOT EXISTS tool_management (" +
-                        "id INTEGER PRIMARY KEY AUTOINCREMENT," +
+                        // SQLite 自增：INTEGER PRIMARY KEY AUTOINCREMENT；PG 自增：BIGSERIAL
+                        (pg ? "id BIGSERIAL PRIMARY KEY," : "id INTEGER PRIMARY KEY AUTOINCREMENT,") +
                         "key TEXT UNIQUE," +
                         "value TEXT," +
                         "updated_at TEXT)");

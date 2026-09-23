@@ -1,0 +1,14 @@
+# Grafana 数据源自动装配（provisioning）
+# 用法：挂载本目录到容器 /etc/grafana/provisioning/datasources/
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    uid: prometheus            # dashboard JSON 中以 uid 引用
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: false
+    jsonData:
+      timeInterval: 15s        # 与 Prometheus scrape_interval 对齐

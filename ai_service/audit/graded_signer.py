@@ -112,6 +112,8 @@ class AgentIdentity:
 
 
 # 方向A-6：持久化密钥文件（多 AuditLogger 实例共享同一套密钥，保证 sign/verify 一致）
+# 生产级改造：优先环境变量（GRADED_HMAC_KEY / ZKP_PROVING_KEY）或 KMS 注入，
+# data/ 落盘文件仅作演示模式兜底（生产模式禁止，见 secrets_provider）
 _GRADED_HMAC_KEY_FILE = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
     "data", "graded_hmac.key",
@@ -122,8 +124,22 @@ _ZKP_PROVING_KEY_FILE = os.path.join(
 )
 
 
-def _load_or_create_hex_key(path: str) -> str:
-    """从文件加载或生成 hex 密钥（多实例共享，保证 sign/verify 一致）"""
+def _load_or_create_hex_key(path: str, env_name: str = "") -> str:
+    """加载 hex 密钥：环境变量/KMS → 演示模式落盘文件（不存在则生成）。
+
+    生产模式（ENV=production）未注入时抛错，由启动流程终止——
+    防止多实例各自随机生成导致签名互不认可。
+    """
+    try:
+        from secrets_provider import get_secret
+        return get_secret(
+            env_name or "GRADED_HMAC_KEY",
+            fallback_file=os.path.relpath(path, os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+        )
+    except RuntimeError:
+        raise
+    except Exception:  # noqa: BLE001 - provider 不可用时退回文件加载（仅演示）
+        pass
     key_dir = os.path.dirname(path)
     if not os.path.isdir(key_dir):
         os.makedirs(key_dir, exist_ok=True)
@@ -145,7 +161,7 @@ class ZKPProver:
 
     def __init__(self, proving_key: Optional[str] = None):
         # 方向A-6：未显式传入则从文件加载持久化密钥（多实例共享）
-        self._proving_key = proving_key or _load_or_create_hex_key(_ZKP_PROVING_KEY_FILE)
+        self._proving_key = proving_key or _load_or_create_hex_key(_ZKP_PROVING_KEY_FILE, "ZKP_PROVING_KEY")
         self._proof_count = 0
 
     def prove(self, content_hash: str, agent_signature: str,
@@ -270,7 +286,7 @@ class GradedAuditSigner:
         self.tsa = tsa_client or BatchTsaClient()
         # 方向A-6：未显式传入则从文件加载持久化密钥（多实例共享，保证 sign/verify 一致）
         if hmac_key is None:
-            self._hmac_key = _load_or_create_hex_key(_GRADED_HMAC_KEY_FILE).encode()
+            self._hmac_key = _load_or_create_hex_key(_GRADED_HMAC_KEY_FILE, "GRADED_HMAC_KEY").encode()
         else:
             self._hmac_key = hmac_key
 

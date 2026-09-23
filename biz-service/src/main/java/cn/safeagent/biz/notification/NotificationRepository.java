@@ -33,15 +33,16 @@ public class NotificationRepository {
     }
 
     public long countUnread() {
-        Long n = jdbc.queryForObject("SELECT COUNT(*) FROM notifications WHERE read = 0", Long.class);
+        // PG 侧 read 为 BOOLEAN 严格类型（SQLite 中 TRUE/FALSE 等价 1/0），两边统一用布尔字面量
+        Long n = jdbc.queryForObject("SELECT COUNT(*) FROM notifications WHERE read = FALSE", Long.class);
         return n == null ? 0 : n;
     }
 
     public void markRead(Integer notifId) {
         if (notifId == null) {
-            jdbc.update("UPDATE notifications SET read = 1 WHERE read = 0");
+            jdbc.update("UPDATE notifications SET read = TRUE WHERE read = FALSE");
         } else {
-            named.update("UPDATE notifications SET read = 1 WHERE id = :id",
+            named.update("UPDATE notifications SET read = TRUE WHERE id = :id",
                     new MapSqlParameterSource("id", notifId));
         }
     }

@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """安全检测 / 工具管控 / 审批 / 运行时 / 优化闭环 / 场景 / 回放 / 评测 路由模块 —— P1-1 按业务域拆分（原 main.py 同域路由收敛）
 
 - URL 与行为与原 main.py 完全一致，仅注册载体由 app 改为 router，由 main.py include_router 装配；
@@ -1554,3 +1554,183 @@ async def evaluation_generate_status():
 
 # ==================== 模型接入配置（P2-6：内网/离线 OpenAI 兼容端点） ====================
 
+
+
+# ==================== 检测规则版本化热更新 / 误报标记（P0-5 检测流水线生产化） ====================
+
+def _rule_engine_shared():
+    """取共享规则引擎单例（reload/rollback 作用于全局检测流水线）。"""
+    from security.rule_engine import get_rule_engine
+    return get_rule_engine()
+
+
+def _perm_guard(request: Request, perm: str):
+    """按权限点守卫：返回具备该权限的身份，无权限返回 None。"""
+    identity = current_identity(request.headers.get("X-Auth-Token"))
+    if identity and permission_engine.has_permission(identity.get("role"), perm):
+        return identity
+    return None
+
+
+@router.get("/api/security/rules")
+async def security_rules_summary(request: Request):
+    """当前规则集概览：激活版本/规则数/分类分布/版本历史。"""
+    identity = _login_guard(request)
+    if not identity:
+        raise HTTPException(status_code=401, detail="未登录或登录已失效")
+    try:
+        return _rule_engine_shared().rules_summary()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"规则概览读取失败: {e}")
+
+
+@router.post("/api/security/rules/update")
+async def security_rules_update(request: Request):
+    """保存新版本规则集并热加载（仅管理员；全量替换式，历史 append-only 可回滚）。
+
+    Body: {"rules": [{"category", "pattern", "weight"?, "enabled"?}], "change_note": "..."}
+    """
+    identity = _admin_guard(request)
+    if not identity:
+        raise HTTPException(status_code=403, detail="仅系统管理员可更新检测规则")
+    body = await _body(request)
+    rules = body.get("rules") or []
+    change_note = str(body.get("change_note") or "")[:200]
+    try:
+        result = _rule_engine_shared().apply_update(
+            rules, changed_by=identity.get("username", "admin"), change_note=change_note)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"规则更新失败: {e}")
+    audit_logger.create_log(
+        user_id=identity.get("username", ""), user_role=identity.get("role", ""),
+        agent_id="security_rules", action_type="rules_update",
+        action_details={"new_version": result["version"], "rule_count": result["rule_count"],
+                        "change_note": change_note},
+    )
+    return {"success": True, **result}
+
+
+@router.post("/api/security/rules/reload")
+async def security_rules_reload(request: Request):
+    """热加载最新版本规则（仅管理员；多 worker 部署时各副本需分别触发或重启）。"""
+    identity = _admin_guard(request)
+    if not identity:
+        raise HTTPException(status_code=403, detail="仅系统管理员可热更新检测规则")
+    try:
+        result = _rule_engine_shared().reload()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"规则热加载失败（保留现行规则）: {e}")
+    audit_logger.create_log(
+        user_id=identity.get("username", ""), user_role=identity.get("role", ""),
+        agent_id="security_rules", action_type="rules_reload",
+        action_details={"prev_version": result["prev_version"], "version": result["version"],
+                        "rule_count": result["rule_count"], "skipped": result.get("skipped", 0)},
+    )
+    return {"success": True, **result}
+
+
+@router.post("/api/security/rules/rollback/{version}")
+async def security_rules_rollback(version: int, request: Request):
+    """回滚到指定版本：目标版本规则复制为新版本并热加载（仅管理员）。"""
+    identity = _admin_guard(request)
+    if not identity:
+        raise HTTPException(status_code=403, detail="仅系统管理员可回滚检测规则")
+    if version < 1:
+        raise HTTPException(status_code=400, detail="版本号必须 >= 1")
+    try:
+        result = _rule_engine_shared().rollback(version, changed_by=identity.get("username", "admin"))
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"规则回滚失败: {e}")
+    audit_logger.create_log(
+        user_id=identity.get("username", ""), user_role=identity.get("role", ""),
+        agent_id="security_rules", action_type="rules_rollback",
+        action_details={"rolled_back_to": result["rolled_back_to"],
+                        "new_version": result["new_version"], "rule_count": result["rule_count"]},
+    )
+    return {"success": True, **result}
+
+
+@router.post("/api/security/feedback")
+async def security_feedback_submit(request: Request):
+    """提交误报标记（登录用户；进入待审核队列，供检测调优闭环使用）。
+
+    Body: {"log_id", "session_id"?, "content_sample", "detected_as", "user_comment"?}
+    """
+    identity = _login_guard(request)
+    if not identity:
+        raise HTTPException(status_code=401, detail="未登录或登录已失效")
+    body = await _body(request)
+    log_id = str(body.get("log_id") or "").strip()
+    content_sample = str(body.get("content_sample") or "").strip()
+    detected_as = str(body.get("detected_as") or "").strip()
+    if not log_id or not content_sample:
+        raise HTTPException(status_code=400, detail="log_id 与 content_sample 必填")
+    try:
+        from storage import get_storage
+        get_storage().add_detection_feedback(
+            log_id=log_id, session_id=str(body.get("session_id") or ""),
+            content_sample=content_sample, detected_as=detected_as,
+            user_comment=str(body.get("user_comment") or "")[:500],
+            submitted_by=identity.get("username", ""),
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"误报标记提交失败: {e}")
+    audit_logger.create_log(
+        user_id=identity.get("username", ""), user_role=identity.get("role", ""),
+        agent_id="security_feedback", action_type="detection_feedback",
+        action_details={"log_id": log_id, "detected_as": detected_as,
+                        "content_preview": content_sample[:100]},
+    )
+    return {"success": True, "message": "误报标记已进入待审核队列"}
+
+
+@router.get("/api/security/feedback")
+async def security_feedback_list(request: Request, status: Optional[str] = None, limit: int = 100):
+    """误报标记队列（管理员/安全运营可按 status 过滤审核）。"""
+    identity = _admin_guard(request) or _perm_guard(request, "security.scan")
+    if not identity:
+        raise HTTPException(status_code=403, detail="无权查看误报标记队列")
+    if status and status not in ("pending", "approved", "rejected"):
+        raise HTTPException(status_code=400, detail="status 仅支持 pending/approved/rejected")
+    try:
+        from storage import get_storage
+        rows = get_storage().list_detection_feedback(status=status, limit=min(max(limit, 1), 500))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"误报队列读取失败: {e}")
+    return {"success": True, "count": len(rows), "items": rows}
+
+
+@router.post("/api/security/feedback/{feedback_id}/review")
+async def security_feedback_review(feedback_id: int, request: Request):
+    """审核误报标记（仅管理员）：approved=确认误报（供调优剔除），rejected=维持检出。
+
+    Body: {"decision": "approved" | "rejected", "comment"?}
+    """
+    identity = _admin_guard(request)
+    if not identity:
+        raise HTTPException(status_code=403, detail="仅系统管理员可审核误报标记")
+    body = await _body(request)
+    decision = str(body.get("decision") or "").strip()
+    if decision not in ("approved", "rejected"):
+        raise HTTPException(status_code=400, detail="decision 仅支持 approved/rejected")
+    try:
+        from storage import get_storage
+        ok = get_storage().review_detection_feedback(
+            feedback_id, decision, reviewed_by=identity.get("username", ""))
+        if not ok:
+            raise HTTPException(status_code=404, detail=f"误报标记 #{feedback_id} 不存在或已审核")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"误报审核失败: {e}")
+    audit_logger.create_log(
+        user_id=identity.get("username", ""), user_role=identity.get("role", ""),
+        agent_id="security_feedback", action_type="detection_feedback_review",
+        action_details={"feedback_id": feedback_id, "decision": decision,
+                        "review_comment": str(body.get("comment") or "")[:500]},
+    )
+    return {"success": True, "feedback_id": feedback_id, "decision": decision}

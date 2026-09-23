@@ -3,8 +3,17 @@ package cn.safeagent.biz.auth;
 import cn.safeagent.biz.common.config.AppProperties;
 import cn.safeagent.biz.common.security.JwtService;
 import cn.safeagent.biz.common.util.PasswordHasher;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
 
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.attribute.PosixFilePermissions;
+import java.security.SecureRandom;
+import java.util.Base64;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -17,7 +26,14 @@ import java.util.concurrent.ConcurrentHashMap;
 @Service
 public class AuthService {
 
+    private static final Logger log = LoggerFactory.getLogger(AuthService.class);
+
     private static final List<String> ROLES = List.of("admin", "operator", "auditor", "manager", "user");
+
+    /** 强制 MFA 的角色（seed 时写 force_mfa=1） */
+    private static final List<String> FORCE_MFA_ROLES = List.of("admin", "operator", "auditor");
+
+    private static final SecureRandom RANDOM = new SecureRandom();
 
     private static final String[] DEMO = {
             // username, display_name, role, department, position
@@ -41,16 +57,70 @@ public class AuthService {
         this.maxLoginFails = props.getJwt().getMaxLoginFails() > 0 ? props.getJwt().getMaxLoginFails() : 5;
         this.lockSeconds = props.getJwt().getLoginLockSeconds() > 0 ? props.getJwt().getLoginLockSeconds() : 300L;
         users.ensureTokenVersionColumn(); // 存量库迁移：补充 token_version 列（幂等）
+        users.ensureForceMfaColumn();     // 存量库迁移：补充 force_mfa 列（幂等，与 Python 侧对齐）
         seedIfEmpty();
+    }
+
+    /** 生产模式判定：SAFEAGENT_ENV=production（未设置或其它值视为演示模式） */
+    public static boolean isProductionEnv() {
+        return "production".equalsIgnoreCase(System.getenv("SAFEAGENT_ENV"));
     }
 
     private void seedIfEmpty() {
         if (users.countUsers() > 0) return;
-        String password = "admin123";
+        boolean production = isProductionEnv();
+        StringBuilder creds = new StringBuilder();
         for (String line : DEMO) {
             String[] p = line.split(":");
+            // 生产模式：每账号独立随机口令（绝不使用 admin123）；演示模式保留固定口令
+            String password = production ? randomPassword() : "admin123";
             String[] hs = PasswordHasher.hashNewSalt(password);
             users.upsertUser(p[0], hs[0], hs[1], p[1], p[2], p[3], p[4], "active", "");
+            users.markForceMfa(p[0], FORCE_MFA_ROLES.contains(p[2]));
+            if (production) {
+                creds.append(p[0]).append(':').append(password).append(System.lineSeparator());
+            }
+        }
+        if (production) {
+            String file = writeInitialCredentials(creds.toString());
+            // 只提示文件位置，不在日志回显口令本体
+            log.warn("【生产模式】首次启动已为初始账号生成随机口令并写入 {}，请立即妥善保管并限制访问权限", file);
+        } else {
+            log.warn(">>> 安全警告：演示口令 admin123 仅限开发环境使用，生产部署必须设置 SAFEAGENT_ENV=production <<<");
+        }
+    }
+
+    /** 生成 22 字符 URL-safe Base64 随机口令（16 字节 SecureRandom 熵） */
+    private static String randomPassword() {
+        byte[] buf = new byte[16];
+        RANDOM.nextBytes(buf);
+        return Base64.getUrlEncoder().withoutPadding().encodeToString(buf); // 16 字节 -> 22 字符
+    }
+
+    /** 初始凭据文件路径：环境变量 SAFEAGENT_CREDENTIALS_FILE，默认 data/initial_credentials.txt（相对工作目录） */
+    private static String credentialsFilePath() {
+        String p = System.getenv("SAFEAGENT_CREDENTIALS_FILE");
+        return p == null || p.isBlank() ? "data/initial_credentials.txt" : p.trim();
+    }
+
+    /** 生产口令落盘（尽力设置 POSIX 600，Windows 自动忽略）；失败则终止启动，避免凭据丢失后无法登录 */
+    private static String writeInitialCredentials(String content) {
+        String path = credentialsFilePath();
+        try {
+            Path file = Path.of(path);
+            if (file.getParent() != null) Files.createDirectories(file.getParent());
+            Files.writeString(file, content, StandardCharsets.UTF_8,
+                    java.nio.file.StandardOpenOption.CREATE,
+                    java.nio.file.StandardOpenOption.TRUNCATE_EXISTING,
+                    java.nio.file.StandardOpenOption.WRITE);
+            try {
+                Files.setPosixFilePermissions(file, PosixFilePermissions.fromString("rw-------"));
+            } catch (Exception ignore) {
+                // Windows 或不支持 POSIX 权限的文件系统：忽略，依赖目录权限兜底
+            }
+            return file.toAbsolutePath().toString();
+        } catch (IOException e) {
+            throw new IllegalStateException("生产模式初始口令文件写入失败：" + path, e);
         }
     }
 
@@ -82,6 +152,20 @@ public class AuthService {
         }
         clearFailure(username);
         boolean mfa = isMfaEnabled(username);
+        boolean forceMfa = users.getForceMfa(username);
+        if (forceMfa && !mfa) {
+            // 强制 MFA 且未绑定 TOTP：不签发访问令牌，要求先完成 MFA 注册。
+            // mfa_ticket 为 scope=mfa 临时票据（复用二步验证票据），供前端引导绑定 TOTP 的注册流程鉴权；
+            // mfa_enrollment_required 为增量字段：旧前端按 mfa_enabled 走二步验证分支不受影响。
+            return new LinkedHashMap<>(Map.of(
+                    "ok", true,
+                    "reason", "mfa_enrollment_required",
+                    "locked", false,
+                    "remain", 0,
+                    "mfa_enabled", true,
+                    "mfa_enrollment_required", true,
+                    "mfa_ticket", createMfaTicket(username)));
+        }
         Map<String, Object> r = new LinkedHashMap<>();
         r.put("ok", true);
         r.put("reason", "ok");

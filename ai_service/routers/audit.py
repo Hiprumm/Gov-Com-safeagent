@@ -195,6 +195,103 @@ async def verify_audit_chain():
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@router.get("/api/audit/verify")
+async def verify_audit_public(log_id: Optional[str] = None):
+    """第三方独立验签 API（阶段5 审计链生产化，**无需登录**）
+
+    gateway-lite 已对 audit verify 前缀放行（/api/audit/verify 归入
+    _AI_KEPT_AUDIT_PREFIXES 且不要求登录），第三方监管/审计方无需平台账号
+    即可核验审计链真实性。入参：
+    - log_id 可选：指定时做单条验证（重算哈希 + HMAC 验签）；
+    - log_id 缺省：全链验证（哈希链 + 分级签名 + WORM 锚定链）。
+
+    响应字段：
+    - valid / checked_count / algorithm：验签结论与算法标识；
+    - key_fingerprint：HMAC 密钥 sha256 前 16 位指纹（供第三方比对密钥一致性，
+      仅指纹不泄露密钥本体；密钥取自 graded_signer 现有单例，与验签同源）；
+    - worm_chain：WORM 锚定链（data/worm_anchor.jsonl）完整性校验结果。
+    """
+    import hashlib
+    import hmac
+    from audit.worm_store import get_worm_store
+    from audit.audit_logger import _parse_extra, _canonical_content
+
+    algorithm = "HMAC-SHA256 + SHA256 hash-chain + ZKP(HIGH)"
+
+    # ---- HMAC 密钥指纹：从 graded_signer 现有单例（app_deps.audit_logger 内）取密钥计算 ----
+    # 注意只输出 sha256 指纹前 16 位，绝不回传密钥本体
+    key_fingerprint = ""
+    try:
+        key_bytes = None
+        gs = getattr(audit_logger, "_graded_signer", None)
+        if gs is not None and getattr(gs, "_hmac_key", None):
+            key_bytes = gs._hmac_key
+        elif getattr(audit_logger, "_signing_key", None):
+            key_bytes = audit_logger._signing_key
+        if key_bytes:
+            key_fingerprint = hashlib.sha256(key_bytes).hexdigest()[:16]
+    except Exception:
+        key_fingerprint = ""
+
+    # ---- WORM 锚定链完整性（与数据库内哈希链形成双重证据）----
+    try:
+        worm_chain = get_worm_store().verify_chain()
+    except Exception as e:
+        worm_chain = {"valid": False, "checked": 0, "first_bad_seq": None, "error": str(e)[:200]}
+
+    try:
+        if log_id:
+            # ---- 单条验证：按存储记录重算哈希 + HMAC 验签 ----
+            data = audit_logger.storage.get_audit_log_by_id(log_id)
+            if not data:
+                raise HTTPException(status_code=404, detail=f"审计记录不存在：{log_id}")
+            extra = _parse_extra(data)
+            stored_hash = extra.get("log_hash", "")
+            stored_prev = extra.get("prev_hash", "")
+            stored_sig = extra.get("signature", "")
+            hash_ok = bool(stored_hash) and hashlib.sha256(
+                _canonical_content(data, stored_prev).encode("utf-8")
+            ).hexdigest() == stored_hash
+            sig_ok = False
+            if stored_sig and getattr(audit_logger, "_signing_key", None):
+                expected = hmac.new(
+                    audit_logger._signing_key, stored_hash.encode(), hashlib.sha256
+                ).hexdigest()
+                sig_ok = hmac.compare_digest(expected, stored_sig)
+            return {
+                "success": True,
+                "mode": "single",
+                "log_id": log_id,
+                "valid": bool(hash_ok and sig_ok),
+                "checks": {"hash_ok": hash_ok, "signature_ok": sig_ok},
+                "checked_count": 1,
+                "algorithm": algorithm,
+                "key_fingerprint": key_fingerprint,
+                "worm_chain": worm_chain,
+            }
+
+        # ---- 全链验证：基础哈希链 + 分级签名（HMAC/Agent签名/ZKP）----
+        chain = audit_logger.verify_chain()
+        graded = audit_logger.verify_graded_chain()
+        checked_count = int(chain.get("checked", 0)) + int(graded.get("graded_checked", 0))
+        valid = bool(chain.get("ok")) and bool(graded.get("ok", True)) and bool(worm_chain.get("valid", True))
+        return {
+            "success": True,
+            "mode": "full",
+            "valid": valid,
+            "checked_count": checked_count,
+            "algorithm": algorithm,
+            "key_fingerprint": key_fingerprint,
+            "chain": chain,
+            "graded": graded,
+            "worm_chain": worm_chain,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @router.get("/api/audit/logs/verify-graded")
 async def verify_graded_chain():
     """校验分级审计签名链完整性（方向A-6）

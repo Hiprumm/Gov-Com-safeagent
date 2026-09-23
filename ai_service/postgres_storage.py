@@ -12,10 +12,11 @@
 依赖：`psycopg[binary]`（psycopg 3）。未安装时本模块可被导入，但实例化会给出明确报错。
 """
 import json
+import os
 import uuid
 import time
 from datetime import datetime, timedelta
-from threading import Lock
+from threading import Lock, Thread
 from typing import Any, Dict, List, Optional
 from contextlib import contextmanager
 
@@ -25,13 +26,22 @@ from storage_base import StorageBackend
 try:
     import psycopg
     from psycopg.rows import dict_row
-    from psycopg.errors import UniqueViolation
+    from psycopg.errors import UniqueViolation, OperationalError
     PSYCOPG_AVAILABLE = True
 except Exception:  # pragma: no cover
     psycopg = None
     dict_row = None
     UniqueViolation = Exception
+    OperationalError = Exception
     PSYCOPG_AVAILABLE = False
+
+# psycopg_pool 连接池（生产级改造：复用连接 + checkout 前健康检查，等效 pool_pre_ping）
+try:
+    from psycopg_pool import ConnectionPool
+    POOL_AVAILABLE = True
+except Exception:  # pragma: no cover
+    ConnectionPool = None
+    POOL_AVAILABLE = False
 
 # 会话标题长度上限（缩略显示）
 AUTO_TITLE_MAX = 30
@@ -55,9 +65,11 @@ def _build_dsn() -> str:
 
 
 _SCHEMA_STATEMENTS = [
+    # 审计日志：按月分区（生产级改造，防单表膨胀）。分区键 log_date 须入主键；
+    # 存量非分区表由 _init_db 的迁移逻辑自动转换为分区表
     """CREATE TABLE IF NOT EXISTS audit_logs (
         seq BIGSERIAL,
-        log_id TEXT PRIMARY KEY,
+        log_id TEXT NOT NULL,
         timestamp TEXT NOT NULL,
         user_id TEXT,
         user_role TEXT,
@@ -70,8 +82,10 @@ _SCHEMA_STATEMENTS = [
         approval_status TEXT,
         is_blocked BOOLEAN DEFAULT FALSE,
         blocking_reason TEXT,
-        extra_data TEXT
-    )""",
+        extra_data TEXT,
+        log_date DATE NOT NULL DEFAULT CURRENT_DATE,
+        PRIMARY KEY (log_id, log_date)
+    ) PARTITION BY RANGE (log_date)""",
     """CREATE TABLE IF NOT EXISTS approval_requests (
         request_id TEXT PRIMARY KEY,
         tool_name TEXT NOT NULL,
@@ -195,6 +209,46 @@ _SCHEMA_STATEMENTS = [
         updated_at TEXT
     )""",
     """CREATE INDEX IF NOT EXISTS idx_pipl_type ON pipl_records(pii_type)""",
+    # ---- 生产级改造：API Key 多版本并存/过期/灰度轮换（P0-2）----
+    """CREATE TABLE IF NOT EXISTS api_keys (
+        key_id TEXT PRIMARY KEY,
+        key_hash TEXT NOT NULL,
+        version INTEGER NOT NULL DEFAULT 1,
+        label TEXT DEFAULT '',
+        status TEXT DEFAULT 'active',
+        expires_at TEXT DEFAULT '',
+        created_by TEXT DEFAULT '',
+        created_at TEXT NOT NULL
+    )""",
+    """CREATE INDEX IF NOT EXISTS idx_api_keys_status ON api_keys(status, version)""",
+    # ---- 生产级改造：检测规则版本化（热更新/回滚，P0-5）----
+    """CREATE TABLE IF NOT EXISTS rule_definitions (
+        id BIGSERIAL PRIMARY KEY,
+        version INTEGER NOT NULL,
+        category TEXT NOT NULL,
+        pattern TEXT NOT NULL,
+        weight DOUBLE PRECISION DEFAULT 1.0,
+        enabled BOOLEAN DEFAULT TRUE,
+        changed_by TEXT DEFAULT '',
+        change_note TEXT DEFAULT '',
+        created_at TEXT NOT NULL
+    )""",
+    """CREATE INDEX IF NOT EXISTS idx_rules_version ON rule_definitions(version, enabled)""",
+    # ---- 生产级改造：检测误报标记（待审核队列，P0-5）----
+    """CREATE TABLE IF NOT EXISTS detection_feedback (
+        id BIGSERIAL PRIMARY KEY,
+        log_id TEXT NOT NULL DEFAULT '',
+        session_id TEXT DEFAULT '',
+        content_sample TEXT DEFAULT '',
+        detected_as TEXT DEFAULT '',
+        user_comment TEXT DEFAULT '',
+        status TEXT DEFAULT 'pending',
+        submitted_by TEXT DEFAULT '',
+        created_at TEXT NOT NULL,
+        reviewed_at TEXT DEFAULT '',
+        reviewed_by TEXT DEFAULT ''
+    )""",
+    """CREATE INDEX IF NOT EXISTS idx_feedback_status ON detection_feedback(status)""",
     "CREATE INDEX IF NOT EXISTS idx_audit_timestamp ON audit_logs(timestamp)",
     "CREATE INDEX IF NOT EXISTS idx_audit_user ON audit_logs(user_id)",
     "CREATE INDEX IF NOT EXISTS idx_audit_risk ON audit_logs(risk_level)",
@@ -219,6 +273,30 @@ class PostgresStorage(StorageBackend):
             )
         self._lock = Lock()
         self._dsn = dsn or _build_dsn()
+        # ======== 生产级改造：连接池（psycopg_pool）========
+        # min 2 / max 10；check_connection 在每次 checkout 前做 SELECT 1 健康检查
+        # （等效 SQLAlchemy pool_pre_ping），坏连接自动重建
+        self._pool = None
+        if POOL_AVAILABLE:
+            try:
+                self._pool = ConnectionPool(
+                    self._dsn,
+                    min_size=2,
+                    max_size=10,
+                    kwargs={"row_factory": dict_row},
+                    check=ConnectionPool.check_connection,
+                    timeout=10.0,
+                    open=True,
+                )
+            except Exception as e:  # noqa: BLE001 - 池创建失败退回逐次连接
+                print(f"[PG][WARN] 连接池创建失败（{e}），退回逐次连接模式")
+                self._pool = None
+        # ======== 生产级改造：只读降级（主库不可用）========
+        self._readonly = False
+        self._wal_lock = Lock()
+        self._replay_thread: Optional[Thread] = None
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        self._wal_buffer_path = os.path.join(base_dir, "data", "pg_wal_buffer.jsonl")
         self._init_db()
 
     # ------------------------------------------------------------------
@@ -233,17 +311,105 @@ class PostgresStorage(StorageBackend):
     def is_file_backed(self) -> bool:
         return False
 
+    def is_readonly(self) -> bool:
+        """主库连接是否处于降级只读状态（审计写本地 WAL 缓冲中）。"""
+        return self._readonly
+
+    def _mark_readonly_and_buffer(self, log_data: Dict[str, Any]) -> None:
+        """主库不可用：置只读标记，审计写本地 WAL 缓冲，并启动后台补写线程。"""
+        self._readonly = True
+        os.makedirs(os.path.dirname(self._wal_buffer_path), exist_ok=True)
+        try:
+            with self._wal_lock, open(self._wal_buffer_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(log_data, ensure_ascii=False) + "\n")
+            print(f"[PG][WARN] 主库不可用，审计日志已写本地 WAL 缓冲 {self._wal_buffer_path}")
+        except Exception as e:  # noqa: BLE001
+            print(f"[PG][ERROR] WAL 缓冲写入失败（审计日志可能丢失）: {e}")
+        self._ensure_replay_thread()
+
+    def _ensure_replay_thread(self) -> None:
+        """启动（仅一次）后台重放线程：主库恢复后将 WAL 缓冲补写入库。"""
+        if self._replay_thread is not None and self._replay_thread.is_alive():
+            return
+        self._replay_thread = Thread(target=self._replay_wal_buffer, daemon=True,
+                                     name="pg-wal-replay")
+        self._replay_thread.start()
+
+    def _replay_wal_buffer(self) -> None:
+        """后台循环：探测主库恢复 → 重放 WAL 缓冲 → 清空缓冲 → 解除只读。"""
+        while True:
+            time.sleep(5.0)
+            try:
+                with self._get_conn() as conn:
+                    conn.execute("SELECT 1").fetchone()
+            except Exception:  # noqa: BLE001 - 尚未恢复，继续等
+                continue
+            # 主库已恢复：重放缓冲
+            try:
+                if not os.path.isfile(self._wal_buffer_path):
+                    self._readonly = False
+                    print("[PG] 主库已恢复，WAL 缓冲为空，解除只读降级")
+                    return
+                with self._wal_lock, open(self._wal_buffer_path, "r", encoding="utf-8") as f:
+                    lines = [ln for ln in (l.strip() for l in f) if ln]
+                replayed = 0
+                for ln in lines:
+                    try:
+                        data = json.loads(ln)
+                        with self._get_conn() as conn:
+                            conn.execute(
+                                """INSERT INTO audit_logs
+                                (log_id, timestamp, user_id, user_role, agent_id, action_type,
+                                 action_details, risk_level, detection_result, tool_call_result,
+                                 approval_status, is_blocked, blocking_reason, extra_data, log_date)
+                                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                                ON CONFLICT DO NOTHING""",
+                                (
+                                    data.get("id", data.get("log_id", "")),
+                                    data.get("timestamp", datetime.now().isoformat()),
+                                    data.get("user_id", ""),
+                                    data.get("user_role", "user"),
+                                    data.get("agent_id", ""),
+                                    data.get("action_type", ""),
+                                    json.dumps(data.get("action_details", {}), ensure_ascii=False),
+                                    data.get("risk_level", "none"),
+                                    json.dumps(data.get("detection_result", {}), ensure_ascii=False),
+                                    json.dumps(data.get("tool_call_result", {}), ensure_ascii=False),
+                                    data.get("approval_status", ""),
+                                    bool(data.get("is_blocked")),
+                                    data.get("blocking_reason", ""),
+                                    json.dumps(data.get("extra_data", {}), ensure_ascii=False),
+                                    str(data.get("timestamp", datetime.now().isoformat()))[:10],
+                                ),
+                            )
+                        replayed += 1
+                    except Exception:  # noqa: BLE001 - 单条失败跳过，保留其余
+                        continue
+                with self._wal_lock, open(self._wal_buffer_path, "w", encoding="utf-8"):
+                    pass  # 清空已重放的缓冲
+                self._readonly = False
+                print(f"[PG] 主库已恢复，WAL 缓冲补写完成（{replayed}/{len(lines)} 条），解除只读降级")
+                return
+            except Exception as e:  # noqa: BLE001 - 重放过程出错，下一轮重试
+                print(f"[PG][WARN] WAL 重放出错，5s 后重试: {e}")
+
     @contextmanager
     def _get_conn(self):
-        conn = psycopg.connect(self._dsn, row_factory=dict_row)
-        try:
-            yield conn
-            conn.commit()
-        except Exception:
-            conn.rollback()
-            raise
-        finally:
-            conn.close()
+        """取连接：优先连接池（自动 commit/rollback/归还），退回逐次连接。"""
+        if self._pool is not None:
+            # pool.connection() 上下文管理器：正常退出 commit，异常 rollback 并归还
+            with self._pool.connection() as conn:
+                yield conn
+        else:
+            conn = psycopg.connect(self._dsn, row_factory=dict_row)
+            try:
+                yield conn
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+            finally:
+                conn.close()
 
     def _init_db(self):
         with self._get_conn() as conn:
@@ -255,6 +421,103 @@ class PostgresStorage(StorageBackend):
                 cur.execute("ALTER TABLE sys_users ADD COLUMN IF NOT EXISTS mfa_enabled BOOLEAN DEFAULT FALSE")
                 # 迁移：conversation_history 补充 metadata 列（"思考中"过程等结构化元数据持久化，幂等）
                 cur.execute("ALTER TABLE conversation_history ADD COLUMN IF NOT EXISTS metadata TEXT")
+                # 迁移：sys_users 补充 force_mfa 列（生产级改造：admin/operator/auditor 强制 MFA）
+                cur.execute("ALTER TABLE sys_users ADD COLUMN IF NOT EXISTS force_mfa BOOLEAN DEFAULT FALSE")
+                # 迁移：audit_logs 老表补 log_date 分区键列（后续若触发分区迁移需要）
+                cur.execute("ALTER TABLE audit_logs ADD COLUMN IF NOT EXISTS log_date DATE")
+                self._migrate_audit_partition(cur)
+                self._ensure_month_partitions(cur)
+
+    @staticmethod
+    def _migrate_audit_partition(cur) -> None:
+        """存量非分区 audit_logs → 按月分区表迁移（建新表→INSERT SELECT→改名）。
+
+        幂等：已是分区表则直接返回。迁移前建议已有 pg_dump 备份
+        （deploy/backup/backup.sh 每日全量）。
+        """
+        cur.execute(
+            "SELECT COUNT(*) AS c FROM pg_partitioned_table pt "
+            "JOIN pg_class c ON c.oid = pt.partrelid WHERE c.relname = 'audit_logs'"
+        )
+        row = cur.fetchone()
+        if row and int(row["c"]) > 0:
+            return  # 已是分区表
+        cur.execute(
+            "SELECT COUNT(*) AS c FROM information_schema.tables "
+            "WHERE table_name = 'audit_logs'"
+        )
+        row = cur.fetchone()
+        if not row or int(row["c"]) == 0:
+            return  # 表不存在（_SCHEMA_STATEMENTS 刚建的就是分区版）
+        # 存量非分区表 → 迁移
+        print("[PG][MIGRATE] 检测到非分区 audit_logs，开始按月分区迁移（旧表保留为 audit_logs_legacy）")
+        cur.execute("ALTER TABLE audit_logs RENAME TO audit_logs_legacy")
+        # 重建为分区表（与 _SCHEMA_STATEMENTS 同构）
+        cur.execute("""
+            CREATE TABLE audit_logs (
+                seq BIGSERIAL,
+                log_id TEXT NOT NULL,
+                timestamp TEXT NOT NULL,
+                user_id TEXT, user_role TEXT, agent_id TEXT, action_type TEXT,
+                action_details TEXT, risk_level TEXT, detection_result TEXT,
+                tool_call_result TEXT, approval_status TEXT,
+                is_blocked BOOLEAN DEFAULT FALSE,
+                blocking_reason TEXT, extra_data TEXT,
+                log_date DATE NOT NULL DEFAULT CURRENT_DATE,
+                PRIMARY KEY (log_id, log_date)
+            ) PARTITION BY RANGE (log_date)
+        """)
+        # 存量数据搬移：log_date 取 timestamp 前 10 位（isoformat 日期）；异常日期落 DEFAULT 分区
+        cur.execute("""
+            INSERT INTO audit_logs
+                (seq, log_id, timestamp, user_id, user_role, agent_id, action_type,
+                 action_details, risk_level, detection_result, tool_call_result,
+                 approval_status, is_blocked, blocking_reason, extra_data, log_date)
+            SELECT seq, log_id, timestamp, user_id, user_role, agent_id, action_type,
+                   action_details, risk_level, detection_result, tool_call_result,
+                   approval_status, is_blocked, blocking_reason, extra_data,
+                   CASE WHEN timestamp ~ '^\\d{4}-\\d{2}-\\d{2}'
+                        THEN substring(timestamp from 1 for 10)::date
+                        ELSE DATE '1970-01-01' END
+            FROM audit_logs_legacy
+        """)
+        cur.execute("DROP TABLE audit_logs_legacy")
+        # 分区父表上重建索引（跟随 rename 的旧索引已随旧表删除）
+        for idx in ("CREATE INDEX IF NOT EXISTS idx_audit_timestamp ON audit_logs(timestamp)",
+                    "CREATE INDEX IF NOT EXISTS idx_audit_user ON audit_logs(user_id)",
+                    "CREATE INDEX IF NOT EXISTS idx_audit_risk ON audit_logs(risk_level)"):
+            cur.execute(idx)
+        print("[PG][MIGRATE] audit_logs 分区迁移完成")
+
+    @staticmethod
+    def _ensure_month_partitions(cur) -> None:
+        """预建当月与未来 2 个月的月分区 + DEFAULT 兜底分区（捕获异常日期）。"""
+        from datetime import date
+        today = date.today()
+        # 兜底分区（重复创建会报错，先判断存在性；用 SAVEPOINT 防并发竞争毒化事务）
+        cur.execute(
+            "SELECT COUNT(*) AS c FROM pg_class WHERE relname = 'audit_logs_default'"
+        )
+        if not cur.fetchone()["c"]:
+            cur.execute("SAVEPOINT sp_default")
+            try:
+                cur.execute(
+                    "CREATE TABLE audit_logs_default PARTITION OF audit_logs DEFAULT")
+                cur.execute("RELEASE SAVEPOINT sp_default")
+            except Exception:  # noqa: BLE001 - 并发创建竞争时回滚到保存点
+                cur.execute("ROLLBACK TO SAVEPOINT sp_default")
+        for i in range(0, 3):
+            first = date(today.year, today.month, 1)
+            for _ in range(i):
+                first = (date(first.year, first.month, 28) + timedelta(days=8)).replace(day=1)
+            nxt = (date(first.year, first.month, 28) + timedelta(days=8)).replace(day=1)
+            name = f"audit_logs_{first.year}{first.month:02d}"
+            cur.execute("SELECT COUNT(*) AS c FROM pg_class WHERE relname = %s", (name,))
+            if not cur.fetchone()["c"]:
+                cur.execute(
+                    f"CREATE TABLE {name} PARTITION OF audit_logs "
+                    f"FOR VALUES FROM ('{first.isoformat()}') TO ('{nxt.isoformat()}')"
+                )
 
     @staticmethod
     def _row_to_dict(row: Any) -> Dict[str, Any]:
@@ -272,31 +535,37 @@ class PostgresStorage(StorageBackend):
 
     # ==================== 审计日志 ====================
     def save_audit_log(self, log_data: Dict[str, Any]):
-        with self._lock:
-            with self._get_conn() as conn:
-                conn.execute(
-                    """INSERT INTO audit_logs
-                    (log_id, timestamp, user_id, user_role, agent_id, action_type,
-                     action_details, risk_level, detection_result, tool_call_result,
-                     approval_status, is_blocked, blocking_reason, extra_data)
-                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
-                    (
-                        log_data.get("id", log_data.get("log_id", "")),
-                        log_data.get("timestamp", datetime.now().isoformat()),
-                        log_data.get("user_id", ""),
-                        log_data.get("user_role", "user"),
-                        log_data.get("agent_id", ""),
-                        log_data.get("action_type", ""),
-                        json.dumps(log_data.get("action_details", {}), ensure_ascii=False),
-                        log_data.get("risk_level", "none"),
-                        json.dumps(log_data.get("detection_result", {}), ensure_ascii=False),
-                        json.dumps(log_data.get("tool_call_result", {}), ensure_ascii=False),
-                        log_data.get("approval_status", ""),
-                        bool(log_data.get("is_blocked")),
-                        log_data.get("blocking_reason", ""),
-                        json.dumps(log_data.get("extra_data", {}), ensure_ascii=False),
-                    ),
-                )
+        ts = log_data.get("timestamp", datetime.now().isoformat())
+        try:
+            with self._lock:
+                with self._get_conn() as conn:
+                    conn.execute(
+                        """INSERT INTO audit_logs
+                        (log_id, timestamp, user_id, user_role, agent_id, action_type,
+                         action_details, risk_level, detection_result, tool_call_result,
+                         approval_status, is_blocked, blocking_reason, extra_data, log_date)
+                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                        (
+                            log_data.get("id", log_data.get("log_id", "")),
+                            ts,
+                            log_data.get("user_id", ""),
+                            log_data.get("user_role", "user"),
+                            log_data.get("agent_id", ""),
+                            log_data.get("action_type", ""),
+                            json.dumps(log_data.get("action_details", {}), ensure_ascii=False),
+                            log_data.get("risk_level", "none"),
+                            json.dumps(log_data.get("detection_result", {}), ensure_ascii=False),
+                            json.dumps(log_data.get("tool_call_result", {}), ensure_ascii=False),
+                            log_data.get("approval_status", ""),
+                            bool(log_data.get("is_blocked")),
+                            log_data.get("blocking_reason", ""),
+                            json.dumps(log_data.get("extra_data", {}), ensure_ascii=False),
+                            str(ts)[:10],  # 分区键：isoformat 日期部分
+                        ),
+                    )
+        except OperationalError:
+            # 生产级改造：主库不可用 → 降级写本地 WAL 缓冲，恢复后后台补写
+            self._mark_readonly_and_buffer(log_data)
 
     def get_audit_logs_recent(self, limit: int = 50) -> List[Dict[str, Any]]:
         with self._get_conn() as conn:

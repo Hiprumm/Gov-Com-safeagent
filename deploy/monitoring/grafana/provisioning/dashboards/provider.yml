@@ -1,0 +1,16 @@
+# Grafana dashboard 自动装配（provisioning）
+# 用法：挂载本目录到容器 /etc/grafana/provisioning/dashboards/，
+#       并将 grafana/dashboards/ 挂载到 /var/lib/grafana/dashboards/
+apiVersion: 1
+
+providers:
+  - name: safeagent
+    orgId: 1
+    folder: SafeAgent
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 30
+    allowUiUpdates: true
+    options:
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: false

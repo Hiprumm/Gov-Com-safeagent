@@ -10,4 +10,8 @@ PyPDF2==3.0.1
 python-dotenv==1.0.1
 
 # PostgreSQL 存储后端驱动（设置 STORAGE_BACKEND=postgres 时使用；默认 sqlite 后端不依赖它）
-psycopg[binary]>=3.1
+# pool 组件：生产级连接池 + checkout 健康检查（等效 pool_pre_ping）
+psycopg[binary,pool]>=3.1
+
+# 生产级改造：Prometheus 指标暴露（/metrics）
+prometheus-client>=0.20.0

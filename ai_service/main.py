@@ -40,6 +40,10 @@ from audit.evaluation_metrics import EvaluationMetricsCalculator
 from gov_agent_graph.gov_agent import GovAgent
 from websocket.manager import ws_manager, handle_ws_events, push_approval_update, push_risk_alert
 from config import settings
+from log_setup import setup_logging
+
+# 可观测性（阶段7）：统一结构化日志装配（json/text，幂等），须早于业务 import 生效
+setup_logging(log_format=settings.LOG_FORMAT, level=settings.LOG_LEVEL)
 from auth import (
     DEMO_USERS,
     verify_password,
@@ -127,6 +131,14 @@ async def metrics_middleware(request: Request, call_next):
 # ======== 启动清理空会话 + 应用安全策略 ========
 @app.on_event("startup")
 async def startup_cleanup():
+    # 生产模式启动校验：强制鉴权/禁沙箱降级/密钥必须显式注入，不满足则拒绝启动
+    try:
+        settings.validate_production()
+        if settings.is_production():
+            print("[STARTUP] 生产模式（ENV=production）安全基线校验通过")
+    except RuntimeError as e:
+        print(f"[STARTUP][FATAL] {e}")
+        raise
     try:
         from storage import get_storage
         storage = get_storage()
@@ -632,3 +644,9 @@ app.include_router(auth.router)
 app.include_router(admin.router)
 app.include_router(config.router)
 app.include_router(governance.router)
+
+# ======== 可观测性（阶段7）：Prometheus /metrics（桥接 metrics_collector 快照） ========
+# METRICS_ENABLED=False 时不注册该端点（既有 /api/metrics JSON 快照端点不受影响）
+if settings.METRICS_ENABLED:
+    from routers import metrics as metrics_router
+    app.include_router(metrics_router.router)

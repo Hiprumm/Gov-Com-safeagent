@@ -49,8 +49,9 @@ public class AuditRepository {
                 Object parsed = tryJson(s);
                 if (parsed != null) { d.put(k, parsed); continue; }
             }
-            if (k.equals("is_blocked") && v instanceof Number n) {
-                d.put(k, n.intValue() != 0);
+            // is_blocked：SQLite 读出 0/1 整数，PG（BOOLEAN 列）读出 true/false，统一转布尔
+            if (k.equals("is_blocked") && (v instanceof Number || v instanceof Boolean)) {
+                d.put(k, v instanceof Boolean b ? b : ((Number) v).intValue() != 0);
                 continue;
             }
             d.put(k, v);
@@ -91,7 +92,8 @@ public class AuditRepository {
         if (agentId != null && !agentId.isBlank()) { q.append(" AND agent_id = :agentId"); params.addValue("agentId", agentId); }
         if (riskLevel != null && !riskLevel.isBlank()) { q.append(" AND risk_level = :risk"); params.addValue("risk", riskLevel); }
         if (actionType != null && !actionType.isBlank()) { q.append(" AND action_type = :act"); params.addValue("act", actionType); }
-        if (isBlocked != null) { q.append(" AND is_blocked = :blocked"); params.addValue("blocked", isBlocked ? 1 : 0); }
+        // is_blocked：PG 为 BOOLEAN 列需传布尔（sqlite-jdbc setBoolean 内部落 0/1，两边兼容）
+        if (isBlocked != null) { q.append(" AND is_blocked = :blocked"); params.addValue("blocked", isBlocked); }
         q.append(" ORDER BY timestamp DESC LIMIT ").append(limit);
         List<Map<String, Object>> rows = named.query(q.toString(), params, Rows.userRow());
         List<Map<String, Object>> out = new ArrayList<>();
@@ -127,7 +129,8 @@ public class AuditRepository {
             ps.setString(6, actionType);
             ps.setString(7, detailsJson);
             ps.setString(8, riskLevel == null ? "high" : riskLevel);
-            ps.setInt(9, 0);
+            // PG 的 is_blocked 为 BOOLEAN 列（setBoolean 在 sqlite-jdbc 中落 0/1，两边兼容）
+            ps.setBoolean(9, false);
             return ps;
         });
     }

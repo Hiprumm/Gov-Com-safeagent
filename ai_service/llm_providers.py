@@ -32,6 +32,37 @@ def _is_timeout(e: Exception) -> bool:
     return "timeout" in msg or "timed out" in msg
 
 
+# ----------------------------------------------------------------------
+# 降级审计（P0-5）：熔断/切换事件写审计链，不静默降级。
+# - circuit_open / failover_exhausted：状态迁移类，每次必写；
+# - fallback_switch：每次切换都写会刷屏，按事件类 60s 节流；
+# - 审计写入失败绝不影响主流程（可观测性不能反过来拖垮调用方）。
+# ----------------------------------------------------------------------
+_AUDIT_THROTTLE_SECONDS = 60.0
+_audit_last_emit: dict = {}
+_audit_lock = threading.Lock()
+
+
+def _audit_degradation(event: str, detail: str, throttle: bool = False) -> None:
+    """写一条 LLM 容灾降级审计事件（action_type=llm_degradation）。"""
+    now = time.time()
+    if throttle:
+        with _audit_lock:
+            last = _audit_last_emit.get(event, 0.0)
+            if now - last < _AUDIT_THROTTLE_SECONDS:
+                return
+            _audit_last_emit[event] = now
+    try:
+        from audit.audit_logger import AuditLogger
+        AuditLogger().create_log(
+            user_id="system", user_role="system", agent_id="llm_failover",
+            action_type="llm_degradation",
+            action_details={"event": event, "detail": detail[:500]},
+        )
+    except Exception:  # noqa: BLE001
+        logger.debug("降级审计写入失败（忽略）", exc_info=True)
+
+
 class FailoverChatModel:
     """带主备故障切换的对话模型包装（薄包装，不继承 BaseChatModel）。
 
@@ -61,14 +92,23 @@ class FailoverChatModel:
         with self._lock:
             self._fails = 0
 
-    def _primary_fail(self):
+    def _primary_fail(self, reason: str = ""):
+        circuit_opened = False
         with self._lock:
             self._fails += 1
             if self._fails >= self._max_fails:
                 self._cooldown_until = time.time() + self._cooldown
                 self._fails = 0
-                logger.warning("主模型连续失败 %d 次，进入 %ds 冷却期（直走备用模型）",
-                               self._max_fails, self._cooldown)
+                circuit_opened = True
+        if circuit_opened:
+            logger.warning("主模型连续失败 %d 次，进入 %ds 冷却期（直走备用模型）",
+                           self._max_fails, self._cooldown)
+            _audit_degradation(
+                "circuit_open",
+                f"主模型连续失败 {self._max_fails} 次，进入 {self._cooldown}s 冷却期（期间直走备用模型）")
+        # 切换事件（节流 60s）：主模型失败 → 本次调用改走备用
+        _audit_degradation("fallback_switch",
+                           f"主模型调用失败切换备用模型：{reason[:300]}", throttle=True)
 
     # --------------------------------------------------------------
     # 同步能力
@@ -87,7 +127,7 @@ class FailoverChatModel:
                 return result
             except Exception as e:  # noqa: BLE001
                 timeout = _is_timeout(e)
-                self._primary_fail()
+                self._primary_fail(str(e))
                 mc.record_llm(False, timeout, False, (time.perf_counter() - start) * 1000)
                 logger.warning("主模型调用失败（timeout=%s）：%s，切换备用模型", timeout, str(e)[:200])
                 switched = True
@@ -100,6 +140,9 @@ class FailoverChatModel:
         except Exception as e:  # noqa: BLE001
             timeout = _is_timeout(e)
             mc.record_llm(False, timeout, switched, (time.perf_counter() - start) * 1000)
+            _audit_degradation("failover_exhausted",
+                               f"主备模型均失败（invoke，timeout={timeout}）：{str(e)[:300]}",
+                               throttle=True)
             raise
 
     def stream(self, input, config=None, **kwargs):
@@ -129,7 +172,7 @@ class FailoverChatModel:
             mc.record_llm(True, False, False, (time.perf_counter() - start) * 1000)
         except Exception as e:  # noqa: BLE001
             timeout = _is_timeout(e)
-            self._primary_fail()
+            self._primary_fail(str(e))
             mc.record_llm(False, timeout, False, (time.perf_counter() - start) * 1000)
             if yielded_any:
                 # 已产出部分 token：无法无损重放，交给调用方既有降级（规则回复/空结果回退）
@@ -144,6 +187,9 @@ class FailoverChatModel:
                 mc.record_llm(True, False, True, (time.perf_counter() - start) * 1000)
             except Exception as e2:  # noqa: BLE001
                 mc.record_llm(False, _is_timeout(e2), True, (time.perf_counter() - start) * 1000)
+                _audit_degradation("failover_exhausted",
+                                   f"主备模型均失败（stream，timeout={_is_timeout(e2)}）：{str(e2)[:300]}",
+                                   throttle=True)
                 raise
 
     def batch(self, inputs, config=None, **kwargs):
@@ -166,7 +212,7 @@ class FailoverChatModel:
                 return result
             except Exception as e:  # noqa: BLE001
                 timeout = _is_timeout(e)
-                self._primary_fail()
+                self._primary_fail(str(e))
                 mc.record_llm(False, timeout, False, (time.perf_counter() - start) * 1000)
                 logger.warning("主模型异步调用失败（timeout=%s）：%s，切换备用模型", timeout, str(e)[:200])
                 switched = True
@@ -178,6 +224,9 @@ class FailoverChatModel:
         except Exception as e:  # noqa: BLE001
             timeout = _is_timeout(e)
             mc.record_llm(False, timeout, switched, (time.perf_counter() - start) * 1000)
+            _audit_degradation("failover_exhausted",
+                               f"主备模型均失败（ainvoke，timeout={timeout}）：{str(e)[:300]}",
+                               throttle=True)
             raise
 
     async def astream(self, input, config=None, **kwargs):
@@ -205,7 +254,7 @@ class FailoverChatModel:
             mc.record_llm(True, False, False, (time.perf_counter() - start) * 1000)
         except Exception as e:  # noqa: BLE001
             timeout = _is_timeout(e)
-            self._primary_fail()
+            self._primary_fail(str(e))
             mc.record_llm(False, timeout, False, (time.perf_counter() - start) * 1000)
             if yielded_any:
                 raise
@@ -216,6 +265,9 @@ class FailoverChatModel:
                 mc.record_llm(True, False, True, (time.perf_counter() - start) * 1000)
             except Exception as e2:  # noqa: BLE001
                 mc.record_llm(False, _is_timeout(e2), True, (time.perf_counter() - start) * 1000)
+                _audit_degradation("failover_exhausted",
+                                   f"主备模型均失败（astream，timeout={_is_timeout(e2)}）：{str(e2)[:300]}",
+                                   throttle=True)
                 raise
 
     async def abatch(self, inputs, config=None, **kwargs):

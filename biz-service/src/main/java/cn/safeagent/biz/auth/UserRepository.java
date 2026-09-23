@@ -142,6 +142,33 @@ public class UserRepository {
         }
     }
 
+    /** 强制 MFA 标记（1=必须绑定 TOTP 后方可登录；无记录返回 false 走现状逻辑） */
+    public boolean getForceMfa(String username) {
+        List<Map<String, Object>> rows = named.query(
+                "SELECT force_mfa FROM sys_users WHERE username = :u",
+                new MapSqlParameterSource("u", username), Rows.userRow());
+        if (rows.isEmpty()) return false;
+        Object v = rows.get(0).get("force_mfa");
+        return v != null && "1".equals(v.toString());
+    }
+
+    /** 设置强制 MFA 标记（seed 与管理操作用） */
+    public int markForceMfa(String username, boolean force) {
+        return named.update("UPDATE sys_users SET force_mfa = :v, updated_at = :now WHERE username = :username",
+                new MapSqlParameterSource("username", username)
+                        .addValue("v", force ? 1 : 0)
+                        .addValue("now", LocalDateTime.now().format(TS)));
+    }
+
+    /** 存量库启动迁移：为 sys_users 补充 force_mfa 列（幂等，重复执行安全；列定义与 Python 侧迁移一致） */
+    public void ensureForceMfaColumn() {
+        try {
+            jdbc.execute("ALTER TABLE sys_users ADD COLUMN force_mfa INTEGER NOT NULL DEFAULT 0");
+        } catch (Exception e) {
+            // 列已存在（重复执行 / 新装自带）则忽略
+        }
+    }
+
     // ==================== 组织 / 部门 ====================
 
     public List<String> listDepartments() {

@@ -23,6 +23,7 @@ import base64
 import hashlib
 import hmac
 import json
+import os
 import secrets
 import struct
 import threading
@@ -62,11 +63,10 @@ _LOCK = threading.Lock()
 
 
 def _load_jwt_secret() -> bytes:
-    """加载 JWT 签名密钥。
+    """加载 JWT 签名密钥（生产级改造：统一走 secrets_provider）。
 
-    优先级：.env 的 AUTH_JWT_SECRET → data/jwt_secret.key（持久化，权限 0600）→ 临时随机。
-    持久化可避免"未配置密钥时每次重启令全部令牌失效"（生产仍建议在 .env 显式配置密钥，
-    以便多副本共享同一密钥）。
+    优先级：环境变量/.env 的 AUTH_JWT_SECRET → KMS 适配器 → 演示模式
+    data/jwt_secret.key 落盘兜底（生产模式未注入直接报错，禁止随机生成）。
     """
     secret = str(getattr(settings, "AUTH_JWT_SECRET", "") or "")
     if secret:
@@ -75,36 +75,25 @@ def _load_jwt_secret() -> bytes:
             print(f"[AUTH][WARN] AUTH_JWT_SECRET 仅 {len(cleaned)} 字符，过短易被暴力枚举。"
                   f"生产环境请配置 ≥32 字符的强密钥（如 `openssl rand -hex 32`）。")
         return cleaned.encode("utf-8")
+    # 未显式配置：走 secrets_provider（env 已在上面读过，此处主要覆盖
+    # KMS 适配器与演示模式 data/ 落盘兜底）
     try:
-        import os
-        base = os.path.dirname(os.path.abspath(__file__))
-        path = os.path.join(base, "data", "jwt_secret.key")
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        if os.path.exists(path):
-            with open(path, "rb") as f:
-                data = f.read().strip()
-            if data:
-                print("[AUTH] 使用已持久化的签名密钥 data/jwt_secret.key"
-                      "（建议在 .env 配置 AUTH_JWT_SECRET 以便多实例共享）")
-                return data
-        gen = secrets.token_bytes(32)
-        with open(path, "wb") as f:
-            f.write(gen)
-        try:
-            os.chmod(path, 0o600)
-        except Exception:
-            pass
-        print("[AUTH][WARN] 未配置 AUTH_JWT_SECRET，已生成并持久化到 data/jwt_secret.key；"
-              "生产环境请在 .env 配置固定密钥。")
-        return gen
+        from secrets_provider import get_secret
+        val = get_secret("AUTH_JWT_SECRET", fallback_file=os.path.join("data", "jwt_secret.key"))
+        if val:
+            return val.encode("utf-8")
+    except RuntimeError:
+        # 生产模式未注入：向上抛出，由启动流程终止
+        raise
+    except Exception:  # noqa: BLE001 - provider 不可用时退回临时密钥（仅演示）
+        pass
+    generated = secrets.token_bytes(32)
+    try:
+        print("[AUTH][WARN] 未配置 AUTH_JWT_SECRET 且无法持久化，已使用临时密钥；"
+              "重启后所有令牌失效。")
     except Exception:
-        generated = secrets.token_bytes(32)
-        try:
-            print("[AUTH][WARN] 未配置 AUTH_JWT_SECRET 且无法持久化，已使用临时密钥；"
-                  "重启后所有令牌失效。")
-        except Exception:
-            pass
-        return generated
+        pass
+    return generated
 
 
 _JWT_SECRET: bytes = _load_jwt_secret()
@@ -123,16 +112,66 @@ def _hash(password: str, salt: bytes) -> str:
 
 
 def _seed_if_empty() -> None:
-    """库内无用户时，自动写入四个演示账号（避免冷启动无账号可登）。"""
+    """库内无用户时，自动写入四个演示账号（避免冷启动无账号可登）。
+
+    生产级改造（P0-2 鉴权与密钥管理）：
+    - ENV=production：每账号生成独立随机口令（secrets.token_urlsafe(16)），
+      打印一次并写入 data/initial_credentials.txt（0600），admin/operator/auditor
+      标记 force_mfa=1（首登强制走 MFA 注册流程）；
+    - 演示/开发模式：保留统一口令 admin123，并打印告警提醒上线前切换生产模式。
+    """
     try:
         if get_storage().count_users() > 0:
             return
     except Exception:
         return
+    production = False
+    try:
+        production = bool(settings.is_production())
+    except Exception:
+        production = str(getattr(settings, "ENV", "") or "").lower() == "production"
+    cred_lines = []
     for username, info in DEMO_USERS.items():
+        if production:
+            password = secrets.token_urlsafe(16)
+            cred_lines.append(f"{username} = {password}  ({info['role']})")
+        else:
+            password = "admin123"
         salt = secrets.token_bytes(16)
-        _insert_user(username, _hash("admin123", salt), salt.hex(),
+        _insert_user(username, _hash(password, salt), salt.hex(),
                      info["display_name"], info["role"], info["department"], info["position"])
+        if production and info["role"] in ("admin", "operator", "auditor"):
+            try:
+                get_storage().set_user_force_mfa(username, True)
+            except Exception:
+                pass  # 旧存储实现无 force_mfa 能力（演示模式）
+    if production and cred_lines:
+        _persist_initial_credentials(cred_lines)
+    else:
+        try:
+            print("[AUTH][WARN] 演示模式：初始账号口令统一为 admin123。"
+                  "生产部署请设置 ENV=production（自动生成随机口令并强制特权账号 MFA）。")
+        except Exception:
+            pass
+
+
+def _persist_initial_credentials(cred_lines: list) -> None:
+    """随机初始口令落盘一次（追加写 + 0600 权限），供运维首次登录分发；此后不再生成。"""
+    path = os.path.join("data", "initial_credentials.txt")
+    try:
+        os.makedirs("data", exist_ok=True)
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(f"# initial credentials generated at {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+            for line in cred_lines:
+                f.write(line + "\n")
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass  # Windows 无完整 chmod 语义
+        print("[AUTH] 生产模式初始口令已写入 data/initial_credentials.txt（仅此一次生成，"
+              "请立即分发并妥善保管，确认分发后建议删除该文件）。")
+    except Exception as e:  # noqa: BLE001
+        print(f"[AUTH][ERROR] 初始口令落盘失败：{e}——请立即检查 data/ 目录可写性。")
 
 
 def _insert_user(username, pw_hash, salt_hex, display_name, role,
@@ -317,8 +356,11 @@ def clear_login_failures(username: str) -> None:
 def authenticate(username: str, password: str) -> Dict:
     """统一登录校验：含锁定判定与失败计数。
 
-    返回 {ok: bool, reason: str, locked: bool, remain: int}
+    返回 {ok: bool, reason: str, locked: bool, remain: int, force_mfa?: bool}
     - reason: ok | empty | locked | invalid
+    - force_mfa: 口令正确但账号被标记强制 MFA 且尚未启用时为 True；
+      调用方应改走 MFA 注册流程（签发 mfa_ticket），不得直接签发访问令牌
+      （与 biz AuthService 的 mfa_enrollment_required 行为对齐）。
     """
     username = (username or "").strip()
     if not username or not password:
@@ -331,7 +373,18 @@ def authenticate(username: str, password: str) -> Dict:
         locked2, remain2 = login_locked(username)
         return {"ok": False, "reason": "invalid", "locked": locked2, "remain": remain2}
     clear_login_failures(username)
-    return {"ok": True, "reason": "ok", "locked": False, "remain": 0}
+    result = {"ok": True, "reason": "ok", "locked": False, "remain": 0}
+    # P0-2：特权账号强制 MFA——被标记且未完成 MFA 注册时不视为完全通过
+    try:
+        if get_storage().get_user_force_mfa(username):
+            info = get_storage().get_user_mfa(username) or {}
+            if not info.get("mfa_enabled"):
+                result["force_mfa"] = True
+    except AttributeError:
+        pass  # 旧存储实现无 force_mfa 能力（演示模式）
+    except Exception:
+        pass
+    return result
 
 
 def list_demo_accounts() -> list:

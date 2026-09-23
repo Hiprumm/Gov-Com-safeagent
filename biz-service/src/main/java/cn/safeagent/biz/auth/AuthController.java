@@ -1,11 +1,14 @@
 package cn.safeagent.biz.auth;
 
+import cn.safeagent.biz.audit.AuditRepository;
 import cn.safeagent.biz.common.exception.BizException;
 import cn.safeagent.biz.common.security.AuthContext;
 import cn.safeagent.biz.common.security.JwtService;
 import cn.safeagent.biz.common.util.LoginCipher;
 import cn.safeagent.biz.common.util.Totp;
 import jakarta.servlet.http.HttpServletRequest;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.web.bind.annotation.*;
 
 import java.util.LinkedHashMap;
@@ -20,16 +23,21 @@ import java.util.Map;
 @RequestMapping("/api/auth")
 public class AuthController {
 
+    private static final Logger log = LoggerFactory.getLogger(AuthController.class);
+
     private final AuthService auth;
     private final JwtService jwt;
     private final UserRepository users;
     private final LoginCipher cipher;
+    private final AuditRepository audit;
 
-    public AuthController(AuthService auth, JwtService jwt, UserRepository users, LoginCipher cipher) {
+    public AuthController(AuthService auth, JwtService jwt, UserRepository users, LoginCipher cipher,
+                          AuditRepository audit) {
         this.auth = auth;
         this.jwt = jwt;
         this.users = users;
         this.cipher = cipher;
+        this.audit = audit;
     }
 
     /** 登录口令传输加密公钥下发（公开，无需登录）。前端据此用 RSA-OAEP 加密口令后提交 */
@@ -61,6 +69,8 @@ public class AuthController {
         Map<String, Object> r = auth.login(username, password, devFp);
         if (Boolean.FALSE.equals(r.get("ok"))) {
             String reason = String.valueOf(r.get("reason"));
+            // 异常登录告警：失败/锁定均落共享库审计（生产与演示一致）
+            writeAuthAnomaly(username, reason, clientIp(req));
             if ("locked".equals(reason)) {
                 throw BizException.locked("账号已锁定，请 " + r.get("remain") + " 秒后重试");
             }
@@ -71,7 +81,10 @@ public class AuthController {
             Map<String, Object> out = new LinkedHashMap<>();
             out.put("success", true);
             out.put("mfa_required", true);
-            out.put("mfa_ticket", auth.createMfaTicket(username));
+            // 强制 MFA 未绑定时引导先注册 TOTP（增量字段，旧前端不受影响）；票据由 AuthService 复用 createMfaTicket 签发
+            out.put("mfa_enrollment_required", Boolean.TRUE.equals(r.get("mfa_enrollment_required")));
+            Object ticket = r.get("mfa_ticket");
+            out.put("mfa_ticket", ticket != null ? ticket : auth.createMfaTicket(username));
             out.put("username", username);
             return out;
         }
@@ -226,6 +239,25 @@ public class AuthController {
         return out;
     }
 
+    /** 异常登录告警：action_type=auth_anomaly，details 含 username/reason/ip（审计失败不阻断登录主流程） */
+    private void writeAuthAnomaly(String username, String reason, String ip) {
+        try {
+            audit.append("auth_anomaly", username, "locked".equals(reason) ? "high" : "medium",
+                    Map.of("username", username, "reason", reason, "ip", ip));
+        } catch (Exception e) {
+            log.warn("auth_anomaly 审计写入失败：username={}, reason={}", username, reason, e);
+        }
+    }
+
+    /** 反向代理场景取真实客户端 IP：X-Real-IP 优先，其次 X-Forwarded-For 首段，兜底 remoteAddr */
+    private static String clientIp(HttpServletRequest req) {
+        String v = req.getHeader("X-Real-IP");
+        if (v != null && !v.isBlank()) return v.trim();
+        String xff = req.getHeader("X-Forwarded-For");
+        if (xff != null && !xff.isBlank()) return xff.split(",")[0].trim();
+        return req.getRemoteAddr();
+    }
+
     private boolean verify(String password, Map<String, Object> row) {
         String saltHex = row.get("salt") == null ? "" : String.valueOf(row.get("salt"));
         byte[] salt;
@@ -237,6 +269,7 @@ public class AuthController {
     }
 
     private List<Map<String, Object>> demoAccounts() {
+        boolean production = AuthService.isProductionEnv();
         List<Map<String, Object>> usersList = users.listUsers();
         return usersList.stream()
                 .filter(u -> List.of("admin", "operator", "auditor", "user").contains(String.valueOf(u.get("username"))))
@@ -247,7 +280,8 @@ public class AuthController {
                     m.put("role", u.get("role"));
                     m.put("department", u.get("department"));
                     m.put("position", u.get("position"));
-                    m.put("password_hint", "admin123");
+                    // 生产模式不回显口令提示（口令为随机生成且已写入凭据文件）
+                    if (!production) m.put("password_hint", "admin123");
                     return m;
                 })
                 .toList();

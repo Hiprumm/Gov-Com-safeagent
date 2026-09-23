@@ -13,7 +13,23 @@ from contextlib import contextmanager
 
 from storage_base import StorageBackend
 
-DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "safeagent.db")
+def _resolve_db_path() -> str:
+    """库文件路径：优先 config.SQLITE_PATH（env/.env 可覆盖），留空用默认。
+
+    生产级改造（P0-1）：原实现硬编码 ai_service/data/safeagent.db，
+    导致 config 中声明的 SQLITE_PATH 形同虚设，容器部署无法挂载自定义卷。
+    """
+    try:
+        from config import settings
+        p = str(getattr(settings, "SQLITE_PATH", "") or "").strip()
+        if p:
+            return p
+    except Exception:
+        pass
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "safeagent.db")
+
+
+DB_PATH = _resolve_db_path()
 
 # 会话标题长度上限（缩略显示）
 AUTO_TITLE_MAX = 30
@@ -214,6 +230,49 @@ class Storage(StorageBackend):
                     updated_at TEXT
                 );
 
+                -- 生产级改造：API Key 多版本并存/过期/轮换（P0-2）
+                CREATE TABLE IF NOT EXISTS api_keys (
+                    key_id TEXT PRIMARY KEY,
+                    key_hash TEXT NOT NULL,
+                    version INTEGER NOT NULL DEFAULT 1,
+                    label TEXT DEFAULT '',
+                    status TEXT DEFAULT 'active',
+                    expires_at TEXT DEFAULT '',
+                    created_by TEXT DEFAULT '',
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_api_keys_status ON api_keys(status, version);
+
+                -- 生产级改造：检测规则版本化（热更新/回滚，P0-5）
+                CREATE TABLE IF NOT EXISTS rule_definitions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    version INTEGER NOT NULL,
+                    category TEXT NOT NULL,
+                    pattern TEXT NOT NULL,
+                    weight REAL DEFAULT 1.0,
+                    enabled INTEGER DEFAULT 1,
+                    changed_by TEXT DEFAULT '',
+                    change_note TEXT DEFAULT '',
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_rules_version ON rule_definitions(version, enabled);
+
+                -- 生产级改造：检测误报标记（待审核队列，P0-5）
+                CREATE TABLE IF NOT EXISTS detection_feedback (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    log_id TEXT NOT NULL DEFAULT '',
+                    session_id TEXT DEFAULT '',
+                    content_sample TEXT DEFAULT '',
+                    detected_as TEXT DEFAULT '',
+                    user_comment TEXT DEFAULT '',
+                    status TEXT DEFAULT 'pending',
+                    submitted_by TEXT DEFAULT '',
+                    created_at TEXT NOT NULL,
+                    reviewed_at TEXT DEFAULT '',
+                    reviewed_by TEXT DEFAULT ''
+                );
+                CREATE INDEX IF NOT EXISTS idx_feedback_status ON detection_feedback(status);
+
                 CREATE INDEX IF NOT EXISTS idx_api_calls_client ON api_call_logs(client_id);
                 CREATE INDEX IF NOT EXISTS idx_pipl_user ON pipl_records(username);
                 CREATE INDEX IF NOT EXISTS idx_pipl_created ON pipl_records(created_at DESC);
@@ -234,6 +293,9 @@ class Storage(StorageBackend):
                     conn.execute("ALTER TABLE sys_users ADD COLUMN totp_secret TEXT DEFAULT ''")
                 if "mfa_enabled" not in cols:
                     conn.execute("ALTER TABLE sys_users ADD COLUMN mfa_enabled INTEGER DEFAULT 0")
+                # 生产级改造：强制 MFA 标记列（admin/operator/auditor）
+                if "force_mfa" not in cols:
+                    conn.execute("ALTER TABLE sys_users ADD COLUMN force_mfa INTEGER DEFAULT 0")
             except Exception:
                 pass
             # 迁移：为历史库 sessions 补充 user_id 列（账户会话隔离，幂等）
