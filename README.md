@@ -130,6 +130,41 @@ python -m uvicorn main:app --host 0.0.0.0 --port 8080 --workers 2
 # 将 frontend/dist/ 部署到静态文件目录
 ```
 
+### 2.4 数据库初始化（快速开始）
+
+> 三段式架构中 AI 服务(8080)、SpringBoot biz(8300) 与网关(8090) **共享同一个 SQLite 库**，默认路径为 `ai_service/data/safeagent.db`。首次搭建前先初始化数据库，否则三类服务会因缺表/缺账户而不可用。
+
+**推荐方式：导入仓库内置的 `sql/init_all_tables.sql` 初始化脚本。**
+
+该脚本包含全部 19 张表的建表（结构 + 索引/触发器）与 5 个核心种子账户（口令统一 `admin123`），不含任何业务/审计数据，可安全用于全新环境。
+
+```bash
+# Linux / macOS
+cd Gov-Com-safeagent
+mkdir -p ai_service/data
+python -c "import sqlite3;c=sqlite3.connect('ai_service/data/safeagent.db');c.executescript(open('sql/init_all_tables.sql',encoding='utf-8').read());c.commit();c.close()"
+
+# Windows (PowerShell)
+cd Gov-Com-safeagent
+New-Item -Force -ItemType Directory ai_service/data
+& ai_service\.venv\Scripts\python.exe -c "import sqlite3;c=sqlite3.connect('ai_service/data/safeagent.db');c.executescript(open('sql/init_all_tables.sql',encoding='utf-8').read());c.commit();c.close()"
+```
+
+**种子账户（默认密码 `admin123`）：**
+
+| 用户名 | 显示名 | 角色 | 说明 |
+|---|---|---|---|
+| `admin` | 系统管理员 | admin | 全部权限 |
+| `operator` | 安全运维员 | operator | 检测 / 审批 / 工具 / 运行时 |
+| `auditor` | 合规审计员 | auditor | 看板 / 审计 / 审批查看 |
+| `user` | 业务用户 | user | 智能问答 / 风险看板 |
+| `dept_mgr` | 综合办负责人 | manager | 部门级数据范围 |
+
+> 说明：
+> - `SpringBoot biz` 首次启动时若发现用户表为空，也会**自动补齐** `admin/operator/auditor/user` 四个演示账户（口令 `admin123`），因此数据库初始化脚本为可选加速项。
+> - 导入脚本仅含结构 + 种子账户，`审计日志 / 会话 / 审批 / 评测` 等运行数据会在使用过程中由系统自动写入。
+> - 生产环境请务必在导入后修改默认密码，并妥善保管 JWT 密钥（`ai_service/data/jwt_secret.key`）。
+
 ---
 
 ## 3. 系统架构
