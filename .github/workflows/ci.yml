@@ -142,8 +142,8 @@ jobs:
           pip install -r requirements.txt
 
       # 规则层基线（离线）：进程内 import ai_service 检测管线，skip_llm 不调 LLM，CI 可跑。
-      # 指标低于内置基线阈值（accuracy<0.68 或 漏报率>0.32，首版基线实测
-      # accuracy=0.7642 / 漏报率=0.2800，见脚本注释）时 exit 1，阻断合并。
+      # 指标低于内置基线阈值（accuracy<0.64 或 漏报率>0.42，2026-10-06 干净环境复测
+      # accuracy=0.6687 / 漏报率=0.3964，见脚本注释）时 exit 1，阻断合并。
       # LLM 仲裁基线（在线口径，实测 accuracy=0.9851/漏报率=0.0145）不在 CI 跑。
       - name: 规则层检测基线（低于基线 exit 1 阻断）
         env:

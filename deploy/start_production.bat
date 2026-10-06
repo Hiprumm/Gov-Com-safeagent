@@ -1,22 +1,21 @@
 @echo off
 REM ============================================================
-REM SafeAgent ä¸€é”®ç”Ÿäº§å¯åŠ¨ (Windows) â€”â€” é˜¶æ®µ8 ç”Ÿäº§çº§æ”¹é€ 
+REM SafeAgent Ò»¼üÉú²úÆô¶¯ (Windows) ¡ª¡ª ½×¶Î8 Éú²ú¼¶¸ÄÔì
 REM
-REM ä½¿ç”¨æ–¹æ³•:
-REM   start_production.bat            ç”Ÿäº§æ¨¡å¼ï¼ˆé»˜è®¤ï¼‰ï¼šè£…é…å¯†é’¥â†’æ„å»ºâ†’å…¨æ ˆå¯åŠ¨â†’å¥åº·ç­‰å¾…
-REM   start_production.bat prod       åŒä¸Š
-REM   start_production.bat dev        å¼€å‘æ¨¡å¼ï¼ˆä»… AI åç«¯æœ¬åœ°ç›´è·‘ï¼Œä¸å»ºå®¹å™¨ï¼‰
-REM   start_production.bat stop       åœæ­¢æ‰€æœ‰æœåŠ¡
-REM   start_production.bat clean      æ¸…ç†å®¹å™¨/å·/é•œåƒï¼ˆâš  æ•°æ®å°†ä¸¢å¤±ï¼‰
-REM   start_production.bat status     æŸ¥çœ‹æœåŠ¡çŠ¶æ€
+REM Ê¹ÓÃ·½·¨:
+REM   start_production.bat            Éú²úÄ£Ê½£¨Ä¬ÈÏ£©£º×°ÅäÃÜÔ¿¡ú¹¹½¨¡úÈ«Õ»Æô¶¯¡ú½¡¿µµÈ´ı
+REM   start_production.bat prod       Í¬ÉÏ
+REM   start_production.bat dev        ¿ª·¢Ä£Ê½£¨½ö AI ºó¶Ë±¾µØÖ±ÅÜ£¬²»½¨ÈİÆ÷£©
+REM   start_production.bat stop       Í£Ö¹ËùÓĞ·şÎñ
+REM   start_production.bat clean      ÇåÀíÈİÆ÷/¾í/¾µÏñ£¨? Êı¾İ½«¶ªÊ§£©
+REM   start_production.bat status     ²é¿´·şÎñ×´Ì¬
 REM
-REM å¯†é’¥è¯´æ˜ï¼ˆä¸ start.sh --prod åŒä¸€å¥—è£…é…é€»è¾‘ï¼‰:
-REM   - deploy/.env            compose æ’å€¼ç”¨ï¼ˆENV/PG/å¯†é’¥æ³¨å…¥ï¼‰
-REM   - deploy/secrets/        æŒä¹…åŒ–å¯†é’¥æ–‡ä»¶ï¼›å·²å­˜åœ¨ä¸è½®æ¢ï¼ˆå¹‚ç­‰ï¼‰
-REM   - jwt_secret.key         Python(env) ä¸ Java(æ–‡ä»¶æŒ‚è½½) åŒæºï¼Œä»¤ç‰Œäº’è®¤
+REM ÃÜÔ¿ËµÃ÷£¨Óë start.sh --prod Í¬Ò»Ì××°ÅäÂß¼­£©:
+REM   - deploy/.env            compose ²åÖµÓÃ£¨ENV/PG/ÃÜÔ¿×¢Èë£©
+REM   - deploy/secrets/        ³Ö¾Ã»¯ÃÜÔ¿ÎÄ¼ş£»ÒÑ´æÔÚ²»ÂÖ»»£¨ÃİµÈ£©
+REM   - jwt_secret.key         Python(env) Óë Java(ÎÄ¼ş¹ÒÔØ) Í¬Ô´£¬ÁîÅÆ»¥ÈÏ
 REM ============================================================
 setlocal enabledelayedexpansion
-chcp 65001 >nul
 
 set MODE=%1
 if "%MODE%"=="" set MODE=prod
@@ -32,26 +31,26 @@ set COMPOSE_FILE=%DEPLOY_DIR%docker-compose.yml
 
 cd /d "%DEPLOY_DIR%"
 
-REM ======== å‘½ä»¤å¤„ç† ========
+REM ======== ÃüÁî´¦Àí ========
 if /i "%MODE%"=="stop"   goto do_stop
 if /i "%MODE%"=="clean"  goto do_clean
 if /i "%MODE%"=="status" goto do_status
 if /i "%MODE%"=="dev"    goto do_dev
 if /i "%MODE%"=="prod"   goto do_prod
 if /i "%MODE%"=="start"  goto do_prod
-echo ç”¨æ³•: start_production.bat [prod^|dev^|stop^|clean^|status]
+echo ÓÃ·¨: start_production.bat [prod^|dev^|stop^|clean^|status]
 exit /b 1
 
 :do_stop
-echo [STEP] åœæ­¢æ‰€æœ‰ Docker æœåŠ¡...
+echo [STEP] Í£Ö¹ËùÓĞ Docker ·şÎñ...
 docker compose -f "%COMPOSE_FILE%" down
-echo [INFO] æ‰€æœ‰æœåŠ¡å·²åœæ­¢
+echo [INFO] ËùÓĞ·şÎñÒÑÍ£Ö¹
 goto :end
 
 :do_clean
-echo [STEP] æ¸…ç†æ‰€æœ‰å®¹å™¨ã€å·ä¸é•œåƒï¼ˆâš  æ•°æ®å°†ä¸¢å¤±ï¼‰...
+echo [STEP] ÇåÀíËùÓĞÈİÆ÷¡¢¾íÓë¾µÏñ£¨? Êı¾İ½«¶ªÊ§£©...
 docker compose -f "%COMPOSE_FILE%" down -v --rmi all 2>nul
-echo [INFO] æ¸…ç†å®Œæˆ
+echo [INFO] ÇåÀíÍê³É
 goto :end
 
 :do_status
@@ -59,75 +58,104 @@ docker compose -f "%COMPOSE_FILE%" ps
 goto :end
 
 :do_dev
-echo [STEP] å¼€å‘æ¨¡å¼å¯åŠ¨ï¼ˆä»… AI åç«¯æœ¬åœ°ç›´è·‘ï¼‰...
+echo [STEP] ¿ª·¢Ä£Ê½Æô¶¯£¨½ö AI ºó¶Ë±¾µØÖ±ÅÜ£©...
 cd /d "%AI_DIR%"
 if not exist ".env" (
     if exist ".env.example" (
         copy .env.example .env >nul
-        echo [INFO] å·²ä» .env.example åˆ›å»º .envï¼Œè¯·ç¼–è¾‘å¡«å†™æ™ºè°±API Key
+        echo [INFO] ÒÑ´Ó .env.example ´´½¨ .env£¬Çë±à¼­ÌîĞ´ÖÇÆ×API Key
     )
 )
 pip install -r requirements.txt -q 2>nul
-echo [INFO] å¯åŠ¨å¼€å‘æœåŠ¡å™¨: http://localhost:8080
+echo [INFO] Æô¶¯¿ª·¢·şÎñÆ÷: http://localhost:8080
 python -m uvicorn main:app --host 0.0.0.0 --port 8080 --reload --log-level info
 goto :end
 
 REM ============================================================
-REM ç”Ÿäº§æ¨¡å¼ä¸»æµç¨‹
+REM Éú²úÄ£Ê½Ö÷Á÷³Ì
 REM ============================================================
 :do_prod
 echo.
 echo  ================================================
-echo   æ”¿ä¼å¤§æ¨¡å‹æ™ºèƒ½ä½“å®‰å…¨ç³»ç»Ÿ - SafeAgent v4.0
-echo   ç”Ÿäº§ä¸€é”®éƒ¨ç½²
+echo   ÕşÆó´óÄ£ĞÍÖÇÄÜÌå°²È«ÏµÍ³ - SafeAgent v4.0
+echo   Éú²úÒ»¼ü²¿Êğ
 echo  ================================================
 echo.
 
-REM ======== 1. æ£€æŸ¥ Docker ========
-echo [STEP] æ£€æŸ¥ Docker...
+REM ======== 1. ¼ì²é Docker£¨CLI ´æÔÚ + ÒıÇæÁ¬Í¨£»ÒıÇæÎ´ÔËĞĞÔò×Ô¶¯À­Æğ£© ========
+echo [STEP] ¼ì²é Docker...
 docker --version >nul 2>&1
 if errorlevel 1 (
-    echo [ERROR] æœªå®‰è£… Docker Desktopï¼Œè¯·å…ˆå®‰è£…:
+    echo [ERROR] Î´°²×° Docker Desktop£¬ÇëÏÈ°²×°:
     echo   https://docs.docker.com/desktop/install/windows-install/
     goto :fail
 )
 docker compose version >nul 2>&1
 if errorlevel 1 (
-    echo [ERROR] Docker Compose ä¸å¯ç”¨ï¼ŒDocker ç‰ˆæœ¬éœ€ä¸ä½äº 20.10
+    echo [ERROR] Docker Compose ²»¿ÉÓÃ£¬Docker °æ±¾Ğè²»µÍÓÚ 20.10
     goto :fail
 )
-echo [INFO] Docker å°±ç»ª
+docker info >nul 2>&1
+if not errorlevel 1 goto docker_ok
+echo [WARN] Docker ÒıÇæÎ´ÔËĞĞ£¬³¢ÊÔÆô¶¯ Docker Desktop...
+set "DD_EXE="
+set "DD_DIR="
+for /f "tokens=2*" %%a in ('reg query "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Docker Desktop" /v InstallLocation 2^>nul ^| findstr /I "InstallLocation"') do set "DD_DIR=%%b"
+if not defined DD_DIR for /f "tokens=2*" %%a in ('reg query "HKCU\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Docker Desktop" /v InstallLocation 2^>nul ^| findstr /I "InstallLocation"') do set "DD_DIR=%%b"
+if not defined DD_DIR set "DD_DIR=%ProgramFiles%\Docker\Docker"
+:dd_trim
+if "!DD_DIR:~-1!"==" " set "DD_DIR=!DD_DIR:~0,-1!" & goto dd_trim
+set "DD_EXE=!DD_DIR!\Docker Desktop.exe"
+if not exist "!DD_EXE!" (
+    echo [ERROR] Î´ÕÒµ½ Docker Desktop£¨ÒÑ³¢ÊÔ×¢²á±íÓëÄ¬ÈÏÂ·¾¶£©£¬ÇëÊÖ¶¯Æô¶¯ºóÖØÊÔ
+    goto :fail
+)
+start "" "!DD_EXE!"
+echo [INFO] µÈ´ı Docker ÒıÇæ¾ÍĞ÷£¨×î¶à 180s£©...
+set /a DTRY=0
+:docker_wait
+docker info >nul 2>&1
+if not errorlevel 1 goto docker_ok
+set /a DTRY+=1
+if !DTRY! GEQ 60 (
+    echo [ERROR] Docker ÒıÇæ 180s ÄÚÎ´¾ÍĞ÷£¬ÇëÊÖ¶¯Æô¶¯ Docker Desktop ºóÖØĞÂÔËĞĞ
+    goto :fail
+)
+ping -n 4 127.0.0.1 >nul
+goto docker_wait
+:docker_ok
+echo [INFO] Docker ¾ÍĞ÷
 
-REM ======== 2. è£…é…ç”Ÿäº§å¯†é’¥ï¼ˆå¹‚ç­‰ï¼‰ ========
+REM ======== 2. ×°ÅäÉú²úÃÜÔ¿£¨ÃİµÈ£© ========
 call :generate_prod_env
 if errorlevel 1 goto :fail
 
-REM ======== 3. æ„å»ºäº§ç‰©ï¼ˆå‰ç«¯ + biz jarï¼‰ ========
+REM ======== 3. ¹¹½¨²úÎï£¨Ç°¶Ë + biz jar£© ========
 call :build_artifacts
 if errorlevel 1 goto :fail
 
-REM ======== 4. å…¨æ ˆå¯åŠ¨ ========
-echo [STEP] å¯åŠ¨å…¨æ ˆæœåŠ¡ï¼ˆpostgres-AI-biz-gateway-nginx-ç›‘æ§-å¤‡ä»½ï¼‰...
+REM ======== 4. È«Õ»Æô¶¯ ========
+echo [STEP] Æô¶¯È«Õ»·şÎñ£¨postgres-AI-biz-gateway-nginx-¼à¿Ø-±¸·İ£©...
 cd /d "%DEPLOY_DIR%"
 docker compose -f "%COMPOSE_FILE%" --env-file "%ENV_FILE%" up -d --build
 if errorlevel 1 (
-    echo [ERROR] æœåŠ¡å¯åŠ¨å¤±è´¥ï¼Œæ’æŸ¥å‘½ä»¤:
+    echo [ERROR] ·şÎñÆô¶¯Ê§°Ü£¬ÅÅ²éÃüÁî:
     echo   docker compose -f "%COMPOSE_FILE%" logs --tail=50
     goto :fail
 )
 
-REM ======== 5. å¥åº·ç­‰å¾…ï¼ˆç½‘å…³ç¡®è®¤ ai/biz å‡ upï¼‰ ========
+REM ======== 5. ½¡¿µµÈ´ı£¨Íø¹ØÈ·ÈÏ ai/biz ¾ù up£© ========
 call :wait_healthy
 
-REM ======== 6. æ±‡æ€» ========
+REM ======== 6. »ã×Ü ========
 call :print_summary
 goto :end
 
 REM ============================================================
-REM å­ç¨‹åºï¼šå¯†é’¥ç”Ÿæˆ / env è£…é… / æ„å»º / å¥åº·ç­‰å¾… / æ±‡æ€»
+REM ×Ó³ÌĞò£ºÃÜÔ¿Éú³É / env ×°Åä / ¹¹½¨ / ½¡¿µµÈ´ı / »ã×Ü
 REM ============================================================
 
-REM ---- ç”Ÿæˆ %1 å­—èŠ‚éšæœº hexï¼ˆPowerShell CSPRNGï¼‰ï¼Œè¾“å‡ºå˜é‡ GEN_HEX ----
+REM ---- Éú³É %1 ×Ö½ÚËæ»ú hex£¨PowerShell CSPRNG£©£¬Êä³ö±äÁ¿ GEN_HEX ----
 :gen_hex
 setlocal
 set BYTES=%~1
@@ -141,7 +169,7 @@ if "%HEX%"=="" (
 endlocal & set GEN_HEX=%HEX%
 exit /b 0
 
-REM ---- å¯†é’¥æ–‡ä»¶å¹‚ç­‰åˆ›å»ºï¼šå­˜åœ¨ä¸”éç©ºåˆ™ä¸è½®æ¢ ----
+REM ---- ÃÜÔ¿ÎÄ¼şÃİµÈ´´½¨£º´æÔÚÇÒ·Ç¿ÕÔò²»ÂÖ»» ----
 :ensure_secret
 if exist "%~1" (
     for %%F in ("%~1") do if %%~zF GTR 0 exit /b 0
@@ -151,25 +179,25 @@ if errorlevel 1 exit /b 1
 > "%~1" echo %GEN_HEX%
 exit /b 0
 
-REM ---- è¯»æ–‡ä»¶é¦–è¡Œåˆ° READ_VAL ----
+REM ---- ¶ÁÎÄ¼şÊ×ĞĞµ½ READ_VAL ----
 :read_first_line
 set READ_VAL=
 if exist "%~1" set /p READ_VAL=< "%~1"
 exit /b 0
 
-REM ---- .env å¹‚ç­‰è¡¥ç¼ºï¼šå·²å­˜åœ¨çš„å˜é‡ä¸è¦†ç›– ----
+REM ---- .env ÃİµÈ²¹È±£ºÒÑ´æÔÚµÄ±äÁ¿²»¸²¸Ç ----
 :ensure_env_var
 findstr /B /C:"%~1=" "%ENV_FILE%" >nul 2>&1
 if errorlevel 1 >> "%ENV_FILE%" echo %~1=%~2
 exit /b 0
 
-REM ---- ç”Ÿäº§å¯†é’¥è£…é…ï¼šdeploy/.env + deploy/secrets/ ----
+REM ---- Éú²úÃÜÔ¿×°Åä£ºdeploy/.env + deploy/secrets/ ----
 :generate_prod_env
-echo [STEP] è£…é…ç”Ÿäº§å¯†é’¥ï¼ˆ%ENV_FILE%ï¼‰...
+echo [STEP] ×°ÅäÉú²úÃÜÔ¿£¨%ENV_FILE%£©...
 if not exist "%SECRETS_DIR%" mkdir "%SECRETS_DIR%"
 
 call :ensure_secret "%SECRETS_DIR%\jwt_secret.key"
-if errorlevel 1 ( echo [ERROR] å¯†é’¥ç”Ÿæˆå¤±è´¥ & exit /b 1 )
+if errorlevel 1 ( echo [ERROR] ÃÜÔ¿Éú³ÉÊ§°Ü & exit /b 1 )
 call :read_first_line "%SECRETS_DIR%\jwt_secret.key"
 set JWT_SECRET=!READ_VAL!
 
@@ -205,86 +233,86 @@ call :ensure_env_var GRADED_HMAC_KEY !HMAC_KEY!
 call :ensure_env_var ZKP_PROVING_KEY !ZKP_KEY!
 call :ensure_env_var AUDIT_RETENTION_DAYS 180
 call :ensure_env_var GRAFANA_ADMIN_PASSWORD !GRAFANA_PWD!
-echo [INFO] å¯†é’¥å°±ç»ªï¼ˆå·²å­˜åœ¨çš„ä¸è½®æ¢ï¼‰
+echo [INFO] ÃÜÔ¿¾ÍĞ÷£¨ÒÑ´æÔÚµÄ²»ÂÖ»»£©
 exit /b 0
 
-REM ---- æ„å»ºå‰ç«¯ + æ£€æŸ¥ biz jar ----
+REM ---- ¹¹½¨Ç°¶Ë + ¼ì²é biz jar ----
 :build_artifacts
-echo [STEP] æ„å»ºå‰ç«¯...
+echo [STEP] ¹¹½¨Ç°¶Ë...
 cd /d "%FRONTEND_DIR%"
 if not exist "node_modules" (
-    echo [INFO] å®‰è£…å‰ç«¯ä¾èµ–...
+    echo [INFO] °²×°Ç°¶ËÒÀÀµ...
     call npm install
-    if errorlevel 1 ( echo [ERROR] npm install å¤±è´¥ & exit /b 1 )
+    if errorlevel 1 ( echo [ERROR] npm install Ê§°Ü & exit /b 1 )
 )
 call npm run build
-if errorlevel 1 ( echo [ERROR] å‰ç«¯æ„å»ºå¤±è´¥ & exit /b 1 )
-echo [INFO] å‰ç«¯æ„å»ºå®Œæˆ
+if errorlevel 1 ( echo [ERROR] Ç°¶Ë¹¹½¨Ê§°Ü & exit /b 1 )
+echo [INFO] Ç°¶Ë¹¹½¨Íê³É
 
-echo [STEP] æ£€æŸ¥ biz-service jar...
+echo [STEP] ¼ì²é biz-service jar...
 if not exist "%PROJECT_DIR%\biz-service\target\biz-service-0.1.0.jar" (
-    echo [INFO] jar ä¸å­˜åœ¨ï¼Œæ‰§è¡Œ Maven æ‰“åŒ…ï¼ˆè·³è¿‡æµ‹è¯•ï¼‰...
+    echo [INFO] jar ²»´æÔÚ£¬Ö´ĞĞ Maven ´ò°ü£¨Ìø¹ı²âÊÔ£©...
     cd /d "%PROJECT_DIR%\biz-service"
     if exist "mvnw.cmd" (
         call mvnw.cmd -q -DskipTests package
     ) else (
         where mvn >nul 2>&1
         if errorlevel 1 (
-            echo [ERROR] biz jar ç¼ºå¤±ä¸”æ—  Mavenï¼Œè¯·å…ˆæ‰§è¡Œ: cd biz-service ç„¶å mvnw.cmd -DskipTests package
+            echo [ERROR] biz jar È±Ê§ÇÒÎŞ Maven£¬ÇëÏÈÖ´ĞĞ: cd biz-service È»ºó mvnw.cmd -DskipTests package
             exit /b 1
         )
         call mvn -q -DskipTests package
     )
     if not exist "target\biz-service-0.1.0.jar" (
-        echo [ERROR] Maven æ‰“åŒ…å¤±è´¥
+        echo [ERROR] Maven ´ò°üÊ§°Ü
         exit /b 1
     )
 )
-echo [INFO] biz jar å°±ç»ª
+echo [INFO] biz jar ¾ÍĞ÷
 cd /d "%DEPLOY_DIR%"
 exit /b 0
 
-REM ---- å¥åº·ç­‰å¾…ï¼šè½®è¯¢ç½‘å…³ 8090ï¼Œç›´åˆ° ai/biz å‡ upï¼ˆæœ€å¤š 300sï¼‰ ----
+REM ---- ½¡¿µµÈ´ı£ºÂÖÑ¯Íø¹Ø 8090£¬Ö±µ½ ai/biz ¾ù up£¨×î¶à 300s£© ----
 :wait_healthy
-echo [STEP] ç­‰å¾…æœåŠ¡å°±ç»ªï¼ˆæœ€å¤š 300sï¼‰...
+echo [STEP] µÈ´ı·şÎñ¾ÍĞ÷£¨×î¶à 300s£©...
 set /a TRIES=0
 :wait_loop
 powershell -NoProfile -Command "try{$j=Invoke-RestMethod 'http://localhost:8090/api/gateway/health' -UseBasicParsing -TimeoutSec 5;if($j.ai_health -eq 'up' -and $j.biz_health -eq 'up'){exit 0}}catch{};exit 1" >nul 2>&1
 if not errorlevel 1 (
-    echo [INFO] ç½‘å…³/AI/Biz å…¨é“¾è·¯å°±ç»ª
+    echo [INFO] Íø¹Ø/AI/Biz È«Á´Â·¾ÍĞ÷
     exit /b 0
 )
 set /a TRIES+=1
 if !TRIES! GEQ 100 (
-    echo [WARN] 300s å†…æœªè§‚å¯Ÿåˆ°å…¨é“¾è·¯ upï¼Œæ’æŸ¥å‘½ä»¤:
+    echo [WARN] 300s ÄÚÎ´¹Û²ìµ½È«Á´Â· up£¬ÅÅ²éÃüÁî:
     echo   docker compose -f "%COMPOSE_FILE%" logs --tail=50
     exit /b 1
 )
-timeout /t 3 /nobreak >nul
+ping -n 4 127.0.0.1 >nul
 goto wait_loop
 
-REM ---- éƒ¨ç½²æ±‡æ€» ----
+REM ---- ²¿Êğ»ã×Ü ----
 :print_summary
 echo.
 echo  ================================================
-echo   éƒ¨ç½²å®Œæˆ!
+echo   ²¿ÊğÍê³É!
 echo  ================================================
-echo   ç½‘é¡µå‰ç«¯:   http://localhost
-echo   ç»Ÿä¸€ç½‘å…³:   http://localhost:8090/api/gateway/health
+echo   ÍøÒ³Ç°¶Ë:   http://localhost
+echo   Í³Ò»Íø¹Ø:   http://localhost:8090/api/gateway/health
 echo  ------------------------------------------------
-echo   åˆå§‹å£ä»¤ï¼ˆç”Ÿäº§æ¨¡å¼é¦–å¯ç”Ÿæˆä¸€æ¬¡ï¼‰:
+echo   ³õÊ¼¿ÚÁî£¨Éú²úÄ£Ê½Ê×ÆôÉú³ÉÒ»´Î£©:
 echo     docker exec safeagent-biz cat /app/data/initial_credentials.txt
-echo   ç‰¹æƒè´¦å·é¦–ç™»å¼ºåˆ¶ MFA æ³¨å†Œï¼›å£ä»¤æ–‡ä»¶åˆ†å‘åå»ºè®®åˆ é™¤ã€‚
+echo   ÌØÈ¨ÕËºÅÊ×µÇÇ¿ÖÆ MFA ×¢²á£»¿ÚÁîÎÄ¼ş·Ö·¢ºó½¨ÒéÉ¾³ı¡£
 echo  ------------------------------------------------
-echo   åœæ­¢æœåŠ¡:   start_production.bat stop
-echo   æŸ¥çœ‹çŠ¶æ€:   start_production.bat status
-echo   æŸ¥çœ‹æ—¥å¿—:   docker compose -f "%COMPOSE_FILE%" logs -f
+echo   Í£Ö¹·şÎñ:   start_production.bat stop
+echo   ²é¿´×´Ì¬:   start_production.bat status
+echo   ²é¿´ÈÕÖ¾:   docker compose -f "%COMPOSE_FILE%" logs -f
 echo  ================================================
 echo.
 exit /b 0
 
 :fail
-echo [ERROR] å¯åŠ¨å¤±è´¥ï¼Œè¯·æ£€æŸ¥ä¸Šæ–¹æ—¥å¿—
+echo [ERROR] Æô¶¯Ê§°Ü£¬Çë¼ì²éÉÏ·½ÈÕÖ¾
 goto :end
 
 :end

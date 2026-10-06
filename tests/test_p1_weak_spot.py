@@ -2,7 +2,7 @@
 
 # P0-1 工程收敛注入：统一路径引导（原脚本逻辑根目录）
 import os as _os, sys as _sys
-_BASE_DIR = r"x:\ZuoYe\揭榜挂帅26\Gov-Com-safeagent\ai_service"
+_BASE_DIR = _os.path.join(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))), "ai_service")
 _sys.path.insert(0, _BASE_DIR)
 """P1 弱项优化专项测试：
 1. 第 8 轮基线 36 个漏报样本 → 新检测逻辑（rule_engine 新检测器 + memory_guard 加权）应拦截

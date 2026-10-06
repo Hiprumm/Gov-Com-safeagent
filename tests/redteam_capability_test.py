@@ -2,7 +2,7 @@
 
 # P0-1 工程收敛注入：统一路径引导（原脚本逻辑根目录）
 import os as _os, sys as _sys
-_BASE_DIR = r"x:\ZuoYe\揭榜挂帅26\Gov-Com-safeagent"
+_BASE_DIR = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
 _sys.path.insert(0, _BASE_DIR)
 """
 红队验证（P1 验收标准）：关闭检测层，攻击者能否拿到有害能力？

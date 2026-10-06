@@ -14,7 +14,7 @@
 import os
 import sys
 
-_BASE_DIR = r"x:\ZuoYe\揭榜挂帅26\Gov-Com-safeagent\ai_service"
+_BASE_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "ai_service")
 sys.path.insert(0, _BASE_DIR)
 
 from models.schemas import RiskLevel
