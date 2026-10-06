@@ -12,7 +12,6 @@ const steps = [
   <div class="px-4 sm:px-6 pb-0 pt-3 flex-shrink-0">
     <div class="bg-gradient-to-r from-accent/10 to-low/10 border border-accent/20 rounded-2xl p-3.5 animate-card-in">
       <div class="flex items-start gap-3">
-        <div class="text-xl leading-none mt-0.5 flex-shrink-0">🚀</div>
         <div class="flex-1 min-w-0">
           <div class="flex items-center gap-2 flex-wrap">
             <span class="text-sm font-bold text-primary">三步快速上手</span>

@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { ref } from 'vue'
 import axios from 'axios'
+import { Wrench } from 'lucide-vue-next'
 
 interface ToolRiskResult {
   risk_level: string
@@ -103,7 +104,7 @@ const getRiskText = (riskLevel: string) => {
               : 'border-border-default hover:border-hover'
           ]"
         >
-          <div class="text-2xl mb-2">🔧</div>
+          <Wrench class="w-6 h-6 mx-auto mb-2 text-secondary" />
           <div class="text-sm font-medium">{{ tool.desc }}</div>
         </button>
       </div>

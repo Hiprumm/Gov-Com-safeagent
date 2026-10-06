@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { ref, onMounted, onUnmounted } from 'vue'
 import axios from 'axios'
+import { Bell, PenLine, TriangleAlert, ShieldCheck } from 'lucide-vue-next'
 import { useWebSocket } from '@/composables/useWebSocket'
 
 interface Notice {
@@ -26,10 +27,10 @@ const levelCls = (lv: string) => {
   return m[lv] || 'text-accent'
 }
 const typeIcon = (t: string) => {
-  if (t === 'approval') return '🖋️'
-  if (t === 'risk_alert') return '🚨'
-  if (t === 'detection') return '🛡️'
-  return '🔔'
+  if (t === 'approval') return PenLine
+  if (t === 'risk_alert') return TriangleAlert
+  if (t === 'detection') return ShieldCheck
+  return Bell
 }
 const fmtTime = (iso: string) => {
   try {
@@ -86,7 +87,7 @@ onMounted(() => {
       class="p-1.5 rounded-lg hover:bg-hover transition-colors flex-shrink-0 active:scale-95 relative"
       title="通知中心"
     >
-      <span class="text-base leading-none">🔔</span>
+      <Bell class="w-5 h-5 text-secondary" />
       <span
         v-if="unread > 0"
         class="absolute -top-0.5 -right-0.5 min-w-[16px] h-4 px-1 rounded-full bg-critical text-white text-[10px] font-bold flex items-center justify-center tabular-nums"
@@ -117,7 +118,10 @@ onMounted(() => {
           class="px-4 py-2.5 border-b border-border-default/60 hover:bg-elevated/50 transition-colors"
         >
           <div class="flex items-start gap-2">
-            <span class="text-base leading-none mt-0.5">{{ typeIcon(n.type) }}</span>
+            <component
+              :is="typeIcon(n.type)"
+              class="w-4 h-4 text-secondary mt-0.5 flex-shrink-0"
+            />
             <div class="flex-1 min-w-0">
               <div class="flex items-center gap-2">
                 <span class="text-xs font-semibold text-primary truncate">{{ n.title }}</span>

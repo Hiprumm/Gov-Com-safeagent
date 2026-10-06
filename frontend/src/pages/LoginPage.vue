@@ -72,10 +72,6 @@ const backToPassword = () => {
       <Moon v-else class="w-5 h-5" />
     </button>
 
-    <!-- 装饰光斑 -->
-    <div class="pointer-events-none absolute -top-32 -left-32 w-96 h-96 rounded-full opacity-30 blur-3xl" style="background: radial-gradient(circle, #06B6D4, transparent 70%)"></div>
-    <div class="pointer-events-none absolute -bottom-32 -right-32 w-96 h-96 rounded-full opacity-30 blur-3xl" style="background: radial-gradient(circle, #3B82F6, transparent 70%)"></div>
-
     <div class="w-full max-w-md relative animate-card-in">
       <!-- 品牌头 -->
       <div class="mb-6 text-center">
@@ -125,7 +121,7 @@ const backToPassword = () => {
           <button
             @click="submit"
             :disabled="submitting"
-            class="w-full py-2.5 rounded-xl bg-gradient-to-r from-accent to-low text-white font-medium hover:opacity-90 transition-all active:scale-[0.98] disabled:opacity-50"
+            class="w-full py-2.5 rounded-xl bg-accent text-white font-medium hover:bg-accent/90 transition-colors active:scale-[0.98] disabled:opacity-50"
           >
             {{ submitting ? '登录中...' : '登 录' }}
           </button>
@@ -165,7 +161,7 @@ const backToPassword = () => {
             <button
               @click="submitMfa"
               :disabled="mfaSubmitting"
-              class="w-full py-2.5 rounded-xl bg-gradient-to-r from-accent to-low text-white font-medium hover:opacity-90 transition-all active:scale-[0.98] disabled:opacity-50"
+              class="w-full py-2.5 rounded-xl bg-accent text-white font-medium hover:bg-accent/90 transition-colors active:scale-[0.98] disabled:opacity-50"
             >
               {{ mfaSubmitting ? '验证中...' : '验 证 并 登 录' }}
             </button>

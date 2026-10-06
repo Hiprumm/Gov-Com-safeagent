@@ -515,7 +515,7 @@ const printReport = () => {
     <header :style="{ background: 'linear-gradient(135deg, #1e293b 0%, #0f172a 100%)', borderBottom: '1px solid #334155' }">
       <div class="max-w-7xl mx-auto px-4 py-5 flex items-center justify-between">
         <div class="flex items-center gap-3">
-          <div :style="{ width: '40px', height: '40px', background: 'linear-gradient(135deg, #3b82f6, #6366f1)', borderRadius: '10px', display: 'flex', alignItems: 'center', justifyContent: 'center' }">
+          <div :style="{ width: '40px', height: '40px', background: 'linear-gradient(135deg, #3b82f6, #2563eb)', borderRadius: '10px', display: 'flex', alignItems: 'center', justifyContent: 'center' }">
             <span :style="{ color: '#fff', fontSize: '20px', fontWeight: 'bold' }">评</span>
           </div>
           <div>
@@ -574,13 +574,12 @@ const printReport = () => {
       <!-- ========== Loading / Error ========== -->
       <div v-if="loading" :style="{ display: 'flex', justifyContent: 'center', alignItems: 'center', minHeight: '400px' }">
         <div :style="{ color: TEXT_DIM, fontSize: '16px' }">
-          <span :style="{ marginRight: '8px' }">⏳</span> 正在加载评测报告数据...
+          正在加载评测报告数据...
         </div>
       </div>
 
       <div v-else-if="error" :style="{ display: 'flex', justifyContent: 'center', alignItems: 'center', minHeight: '400px' }">
         <div :style="{ background: 'rgba(239,68,68,0.1)', border: '1px solid rgba(239,68,68,0.3)', borderRadius: '12px', padding: '32px', textAlign: 'center', maxWidth: '500px' }">
-          <div :style="{ fontSize: '40px', marginBottom: '12px' }">⚠️</div>
           <div :style="{ color: '#fca5a5', fontSize: '16px', fontWeight: 600, marginBottom: '8px' }">数据加载失败</div>
           <div :style="{ color: TEXT_DIM, fontSize: '14px' }">{{ error }}</div>
         </div>
@@ -637,7 +636,7 @@ const printReport = () => {
         <!-- ========== Chart Row 1: Confusion Matrix + Detection Rate ========== -->
         <div class="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-6">
           <div :style="{ background: CARD_BG, borderRadius: '14px', padding: '20px', border: '1px solid #334155', display: 'flex', flexDirection: 'column' }">
-            <h3 :style="{ color: TEXT_BRIGHT, fontSize: '15px', fontWeight: 600, marginBottom: '12px' }">📊 混淆矩阵</h3>
+            <h3 :style="{ color: TEXT_BRIGHT, fontSize: '15px', fontWeight: 600, marginBottom: '12px' }">混淆矩阵</h3>
             <v-chart :option="confusionMatrixOption" autoresize style="height:320px" />
             <div :style="{ color: TEXT_DIM, fontSize: '12px', textAlign: 'center', marginTop: '6px' }">
               TP:{{ metrics?.tp }} · TN:{{ metrics?.tn }} · FP:{{ metrics?.fp }} · FN:{{ metrics?.fn }}
@@ -645,14 +644,14 @@ const printReport = () => {
           </div>
 
           <div :style="{ background: CARD_BG, borderRadius: '14px', padding: '20px', border: '1px solid #334155', display: 'flex', flexDirection: 'column' }">
-            <h3 :style="{ color: TEXT_BRIGHT, fontSize: '15px', fontWeight: 600, marginBottom: '12px' }">📋 各类型检出率</h3>
+            <h3 :style="{ color: TEXT_BRIGHT, fontSize: '15px', fontWeight: 600, marginBottom: '12px' }">各类型检出率</h3>
             <v-chart :option="detectionRateOption" autoresize style="height:320px" />
           </div>
         </div>
 
         <!-- ========== Chart Row 2: 4 Gauge Charts ========== -->
         <div class="mb-6">
-          <h3 :style="{ color: TEXT_BRIGHT, fontSize: '15px', fontWeight: 600, marginBottom: '16px' }">📈 核心指标仪表盘</h3>
+          <h3 :style="{ color: TEXT_BRIGHT, fontSize: '15px', fontWeight: 600, marginBottom: '16px' }">核心指标仪表盘</h3>
           <div class="grid grid-cols-2 lg:grid-cols-4 gap-4">
             <div :style="{ background: CARD_BG, borderRadius: '14px', padding: '12px', border: '1px solid #334155' }">
               <v-chart :option="gaugeAccuracyOption" autoresize style="height:210px" />
@@ -672,19 +671,19 @@ const printReport = () => {
         <!-- ========== Chart Row 3: Risk Distribution + Adversarial Robustness ========== -->
         <div class="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-6">
           <div :style="{ background: CARD_BG, borderRadius: '14px', padding: '20px', border: '1px solid #334155', display: 'flex', flexDirection: 'column' }">
-            <h3 :style="{ color: TEXT_BRIGHT, fontSize: '15px', fontWeight: 600, marginBottom: '12px' }">🎯 样本分布</h3>
+            <h3 :style="{ color: TEXT_BRIGHT, fontSize: '15px', fontWeight: 600, marginBottom: '12px' }">样本分布</h3>
             <v-chart :option="riskDistributionOption" autoresize style="height:340px" />
           </div>
 
           <div :style="{ background: CARD_BG, borderRadius: '14px', padding: '20px', border: '1px solid #334155', display: 'flex', flexDirection: 'column' }">
-            <h3 :style="{ color: TEXT_BRIGHT, fontSize: '15px', fontWeight: 600, marginBottom: '12px' }">🛡️ 对抗鲁棒性雷达图</h3>
+            <h3 :style="{ color: TEXT_BRIGHT, fontSize: '15px', fontWeight: 600, marginBottom: '12px' }">对抗鲁棒性雷达图</h3>
             <v-chart :option="robustnessOption" autoresize style="height:340px" />
           </div>
         </div>
 
         <!-- ========== Classification detail table ========== -->
         <div :style="{ background: CARD_BG, borderRadius: '14px', padding: '20px', border: '1px solid #334155', marginBottom: '24px' }">
-          <h3 :style="{ color: TEXT_BRIGHT, fontSize: '15px', fontWeight: 600, marginBottom: '16px' }">📋 分类详情表</h3>
+          <h3 :style="{ color: TEXT_BRIGHT, fontSize: '15px', fontWeight: 600, marginBottom: '16px' }">分类详情表</h3>
           <div :style="{ overflowX: 'auto' }">
             <table :style="{ width: '100%', borderCollapse: 'collapse', fontSize: '14px' }">
               <thead>
